@@ -42,10 +42,11 @@ pub struct VisibleRow {
     pub node_id: NodeId,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OptionNode {
-    pub _id: usize,
-    pub _port_origin: String,
+    pub id: usize,
+    pub port_origin: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -59,6 +60,7 @@ pub struct OptionNode {
     pub child_ports: Vec<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PortNode {
     pub id: usize,
@@ -401,7 +403,6 @@ impl DependencyGraph {
                 let is_radio = group_type == "SINGLE" || group_type == "RADIO";
 
                 if is_radio {
-                    // Turn target radio option ON, turn off all sibling options in the same group
                     if !current_enabled {
                         let sibling_ids = self.port_nodes[parent_port].options.clone();
                         for opt_id in sibling_ids {

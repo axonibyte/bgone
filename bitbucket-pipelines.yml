@@ -11,92 +11,110 @@ definitions:
           - Cargo.lock
       path: .cargo_cache
 
-doMirror: &doMirror
-  name: Mirror repository
-  clone:
-    enabled: false
-  script:
-    - git clone --mirror git@bitbucket.org:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
-    - cd ${BITBUCKET_REPO_SLUG}.git
-    - git push --mirror git@github.com:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+  yaml-anchors:
+    # Shared build logic, parameterized by $TARGET (exported by each parallel step).
+    - &buildScript |
+      export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
+      VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+      curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
+      mkdir -p dist
+      echo "=========================================="
+      echo "Building target $TARGET (offline mode)"
+      echo "=========================================="
+      cross build --target "$TARGET" --offline --release || cross build --target "$TARGET" --release
+      if [[ "$TARGET" == *"windows"* ]]; then
+        cp "target/$TARGET/release/bgone.exe" "dist/bgone-v${VERSION}-${TARGET}.exe"
+      else
+        cp "target/$TARGET/release/bgone" "dist/bgone-v${VERSION}-${TARGET}"
+      fi
 
-doBuild: &doBuild
-  name: Build and test cross-platform artifacts
-  services:
-    - docker
-  caches:
-    - cargo
-  script:
-    # 1. Force Cargo Home into BITBUCKET_CLONE_DIR so Docker mounts are allowed
-    - export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
+  steps:
+    - step: &doMirror
+        name: Mirror repository
+        clone:
+          enabled: false
+        script:
+          - git clone --mirror git@bitbucket.org:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+          - cd ${BITBUCKET_REPO_SLUG}.git
+          - git push --mirror git@github.com:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
 
-    # 2. Dynamically extract package version from Cargo.toml
-    - VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-    - echo "Building bgone version v$VERSION"
+    - step: &doFetchAndTest
+        name: Fetch dependencies and run tests
+        caches:
+          - cargo
+        script:
+          - export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
+          - cargo fetch
+          - cargo test --release
+        artifacts:
+          - .cargo_cache/**
 
-    # 3. Run native tests first
-    - cargo test --release
+    - step: &doParallelBuild
+        # name and script are overridden per-target below
+        name: Build (cross)
+        services:
+          - docker
+        artifacts:
+          - dist/*
 
-    # 4. Install 'cross'
-    - curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
-
-    # 5. Define build targets
-    - mkdir -p dist
-    - >-
-      TARGETS=(
-        "x86_64-unknown-linux-gnu"
-        "aarch64-unknown-linux-gnu"
-        "x86_64-pc-windows-gnu"
-        "x86_64-unknown-freebsd"
-        "aarch64-unknown-freebsd"
-      )
-
-    # 6. Cross-compile each target and apply versioned filenames
-    - >-
-      for TARGET in "${TARGETS[@]}"; do
-        echo "=========================================="
-        echo "Building target: $TARGET"
-        echo "=========================================="
-        cross build --target "$TARGET" --release
-
-        if [[ "$TARGET" == *"windows"* ]]; then
-          cp "target/$TARGET/release/bgone.exe" "dist/bgone-v${VERSION}-${TARGET}.exe"
-        else
-          cp "target/$TARGET/release/bgone" "dist/bgone-v${VERSION}-${TARGET}"
-        fi
-      done
-  artifacts:
-    - dist/*
-
-doDeploy: &doDeploy
-  name: Deploy multi-target artifacts
-  clone:
-    enabled: false
-  script:
-    - >-
-      for f in dist/*; do
-        if [[ -f "$f" && "$f" != *.sha256 ]]; then
-          echo "Uploading $f..."
-          sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
-          curl -v -X POST "https://${BB_PUB_USER}:${BB_PUB_SECRET}@api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
-              --form files=@"${f}" --form files=@"${f}.sha256"
-        fi
-      done
+    - step: &doDeploy
+        name: Deploy multi-target artifacts
+        clone:
+          enabled: false
+        script:
+          - |
+            for f in dist/*; do
+              if [[ -f "$f" && "$f" != *.sha256 ]]; then
+                echo "Uploading $f..."
+                sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
+                curl -sf -u "${BB_PUB_USER}:${BB_PUB_SECRET}" \
+                  -X POST "https://api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
+                  --form files=@"${f}" --form files=@"${f}.sha256"
+              fi
+            done
 
 pipelines:
   branches:
     main:
-      - step:
-          <<: *doMirror
-      - step:
-          <<: *doBuild
-      - step:
-          <<: *doDeploy
+      - step: *doMirror
+      - step: *doFetchAndTest
+      - parallel:
+          steps:
+            - step:
+                <<: *doParallelBuild
+                name: Build x86_64-unknown-linux-gnu
+                script:
+                  - export TARGET=x86_64-unknown-linux-gnu
+                  - *buildScript
+            - step:
+                <<: *doParallelBuild
+                name: Build aarch64-unknown-linux-gnu
+                script:
+                  - export TARGET=aarch64-unknown-linux-gnu
+                  - *buildScript
+            - step:
+                <<: *doParallelBuild
+                name: Build x86_64-pc-windows-gnu
+                script:
+                  - export TARGET=x86_64-pc-windows-gnu
+                  - *buildScript
+            - step:
+                <<: *doParallelBuild
+                name: Build x86_64-unknown-freebsd
+                script:
+                  - export TARGET=x86_64-unknown-freebsd
+                  - *buildScript
+            - step:
+                <<: *doParallelBuild
+                name: Build aarch64-unknown-freebsd
+                script:
+                  - export TARGET=aarch64-unknown-freebsd
+                  - *buildScript
+      - step: *doDeploy
+
     dev:
-      - step:
-          <<: *doMirror
-      - step:
-          <<: *doBuild
+      - step: *doMirror
+      - step: *doFetchAndTest
+
     '**':
-      - step:
-          <<: *doMirror
+      - step: *doMirror
