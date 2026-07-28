@@ -1,0 +1,87 @@
+image: rust:latest
+
+options:
+  docker: true
+
+doMirror: &doMirror
+  name: Mirror repository
+  clone:
+    enabled: false
+  script:
+    - git clone --mirror git@bitbucket.org:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+    - cd ${BITBUCKET_REPO_SLUG}.git
+    - git push --mirror git@github.com:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
+
+doBuild: &doBuild
+  name: Build and test cross-platform artifacts
+  services:
+    - docker
+  caches:
+    - cargo
+  script:
+    # 1. Run native tests first
+    - cargo test --release
+
+    # 2. Install 'cross' for multi-arch cross-compilation
+    - curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
+
+    # 3. Define build targets
+    - mkdir -p dist
+    - >-
+      TARGETS=(
+        "x86_64-unknown-linux-gnu"
+        "aarch64-unknown-linux-gnu"
+        "x86_64-pc-windows-gnu"
+        "x86_64-unknown-freebsd"
+        "aarch64-unknown-freebsd"
+      )
+
+    # 4. Compile each target and collect artifacts
+    - >-
+      for TARGET in "${TARGETS[@]}"; do
+        echo "=========================================="
+        echo "Building target: $TARGET"
+        echo "=========================================="
+        cross build --target "$TARGET" --release
+
+        if [[ "$TARGET" == *"windows"* ]]; then
+          cp "target/$TARGET/release/bgone.exe" "dist/bgone-$TARGET.exe"
+        else
+          cp "target/$TARGET/release/bgone" "dist/bgone-$TARGET"
+        fi
+      done
+  artifacts:
+    - dist/*
+
+doDeploy: &doDeploy
+  name: Deploy multi-target artifacts
+  clone:
+    enabled: false
+  script:
+    - >-
+      for f in dist/*; do
+        if [ -f "$f" ]; then
+          echo "Uploading $f..."
+          sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
+          curl -v -X POST "https://${BB_PUB_USER}:${BB_PUB_SECRET}@api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
+              --form files=@"${f}" --form files=@"${f}.sha256"
+        fi
+      done
+
+pipelines:
+  branches:
+    main:
+      - step:
+          <<: *doMirror
+      - step:
+          <<: *doBuild
+      - step:
+          <<: *doDeploy
+    dev:
+      - step:
+          <<: *doMirror
+      - step:
+          <<: *doBuild
+    '**':
+      - step:
+          <<: *doMirror
