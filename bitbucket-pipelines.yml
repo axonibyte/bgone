@@ -89,7 +89,7 @@ pipelines:
                   - bash ci/build-target.sh aarch64-unknown-freebsd
       - step: *doDeploy
 
-    {feature/**,bugfix/**,release/**,hotfix/**}:
+    '{feature/**,bugfix/**,release/**,hotfix/**}':
       - step: *doMirror
       - step: *doFetchAndTest
 
