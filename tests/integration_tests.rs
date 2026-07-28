@@ -111,7 +111,8 @@ fn test_exporter_writes_valid_options_files() {
     ).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let graph = DependencyGraph::load_from_db(&conn, "www/apache24", &sys_opts).unwrap();
+    let graph =
+        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &sys_opts).unwrap();
 
     // Export options
     let stats =
@@ -156,10 +157,12 @@ fn test_exporter_dry_run_creates_no_files() {
     ).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let graph = DependencyGraph::load_from_db(&conn, "sysutils/tmux", &sys_opts).unwrap();
+    let graph =
+        DependencyGraph::load_from_db(&conn, &["sysutils/tmux".to_string()], &sys_opts).unwrap();
 
     // Run export in dry-run mode
-    let stats = exporter::export_options(&graph, &options_dir, true, None).unwrap();
+    let stats =
+        exporter::export_options(&graph, &options_dir, true, None::<&std::path::PathBuf>).unwrap();
 
     assert_eq!(stats.files_written, 1);
     assert!(
@@ -259,7 +262,8 @@ fn test_graph_radio_group_mutual_exclusion() {
     ).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let mut graph = DependencyGraph::load_from_db(&conn, "databases/db", &sys_opts).unwrap();
+    let mut graph =
+        DependencyGraph::load_from_db(&conn, &["databases/db".to_string()], &sys_opts).unwrap();
 
     // Verify initial states
     assert!(graph.option_nodes[0].enabled); // ENGINE_A
@@ -294,7 +298,8 @@ fn test_graph_search_filtering() {
     ).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let mut graph = DependencyGraph::load_from_db(&conn, "net/curl", &sys_opts).unwrap();
+    let mut graph =
+        DependencyGraph::load_from_db(&conn, &["net/curl".to_string()], &sys_opts).unwrap();
 
     // Expand all nodes
     graph.expand_all();
@@ -322,9 +327,65 @@ fn test_unknown_port_returns_error() {
     db::init_db(&conn, true).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let result = DependencyGraph::load_from_db(&conn, "nonexistent/port", &sys_opts);
+    let result = DependencyGraph::load_from_db(&conn, &["nonexistent/port".to_string()], &sys_opts);
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Port 'nonexistent/port' not found"));
+    assert!(err.contains("No matching ports found"));
+}
+
+#[test]
+fn test_graph_glob_pattern_resolution() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    conn.execute(
+        "INSERT INTO ports (origin, name, version, comment) VALUES
+         ('www/py-django', 'py-django', '4.2', 'Web Framework'),
+         ('www/py-requests', 'py-requests', '2.31', 'HTTP Library')",
+        [],
+    )
+    .unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/py-*".to_string()];
+    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts).unwrap();
+
+    assert_eq!(graph.root_port_ids.len(), 2);
+    assert!(graph.root_origin.contains("2 ports matched"));
+}
+
+#[test]
+fn test_multiple_ports_with_one_unknown() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    conn.execute(
+        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
+        [],
+    ).unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
+
+    // Loads successfully by resolving all valid matches and skipping non-existent origins
+    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts).unwrap();
+
+    assert_eq!(graph.root_port_ids.len(), 1);
+}
+
+#[test]
+fn test_pattern_matching_zero_ports_returns_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["nonexistent/*".to_string()];
+
+    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts);
+
+    // Bails when zero ports match across all provided patterns
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("No matching ports found for pattern(s): 'nonexistent/*'"));
 }

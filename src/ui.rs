@@ -1,7 +1,7 @@
 use crate::graph::{DependencyGraph, RowKind};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,7 +9,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Terminal,
 };
 use std::io::stdout;
@@ -40,6 +43,9 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
     let mut input_mode = InputMode::Normal;
 
     loop {
+        let total_rows = graph.visible_rows.len();
+        let selected_index = list_state.selected().unwrap_or(0);
+
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -155,13 +161,25 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
 
             f.render_stateful_widget(tree_list, chunks[1], &mut list_state);
 
+            // Render Right-Hand Scrollbar
+            let mut scrollbar_state = ScrollbarState::new(total_rows.saturating_sub(1))
+                .position(selected_index);
+
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("?"))
+                .end_symbol(Some("?"));
+
+            f.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
+
+            // Footer / Status Bar Rendering
             let footer_content = match input_mode {
                 InputMode::Normal => format!(
-                    " [/] Search: '{}' | [s] Save | [q] Discard | [Space] Select | {}",
-                    graph.search_query, status_msg
+                    " [Enter] Expand | [e/c] Subtree | [E/C] All | [/] Search | [s] Save | [q] Discard | {}",
+                    status_msg
                 ),
                 InputMode::Search => format!(
-                    " SEARCH: {}_ (Press [Enter] to confirm, [Esc] to clear)",
+                    " SEARCH: {}_ (Press [Enter] to lock, [Esc] to clear)",
                     graph.search_query
                 ),
             };
@@ -183,7 +201,7 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                let total_rows = graph.visible_rows.len();
+                let page_size = (terminal.size()?.height.saturating_sub(8)) as usize;
 
                 match input_mode {
                     InputMode::Search => match key.code {
@@ -207,104 +225,130 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
                         }
                         _ => {}
                     },
-                    InputMode::Normal => match key.code {
-                        KeyCode::Char('/') => {
-                            input_mode = InputMode::Search;
-                        }
+                    InputMode::Normal => {
+                        let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
-                            action = TuiAction::SaveAndQuit;
-                            break;
-                        }
+                        match key.code {
+                            KeyCode::Char('/') => {
+                                input_mode = InputMode::Search;
+                            }
 
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            action = TuiAction::QuitWithoutSaving;
-                            break;
-                        }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                action = TuiAction::SaveAndQuit;
+                                break;
+                            }
 
-                        KeyCode::Up => {
-                            let i = match list_state.selected() {
-                                Some(i) => {
-                                    if i == 0 {
-                                        0
-                                    } else {
-                                        i - 1
-                                    }
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                action = TuiAction::QuitWithoutSaving;
+                                break;
+                            }
+
+                            // Navigation: Top & Bottom
+                            KeyCode::Home | KeyCode::Char('g')
+                                if has_ctrl || key.code == KeyCode::Home =>
+                            {
+                                list_state.select(Some(0));
+                                status_msg = String::from("Jumped to top");
+                            }
+
+                            KeyCode::End | KeyCode::Char('G')
+                                if has_ctrl || key.code == KeyCode::End =>
+                            {
+                                let last = total_rows.saturating_sub(1);
+                                list_state.select(Some(last));
+                                status_msg = String::from("Jumped to bottom");
+                            }
+
+                            // Navigation: Fast Scroll (Ctrl + Up/Down)
+                            KeyCode::Up if has_ctrl => {
+                                let i = selected_index.saturating_sub(5);
+                                list_state.select(Some(i));
+                            }
+
+                            KeyCode::Down if has_ctrl => {
+                                let i = (selected_index + 5).min(total_rows.saturating_sub(1));
+                                list_state.select(Some(i));
+                            }
+
+                            // Navigation: Single Up / Down
+                            KeyCode::Up => {
+                                let i = selected_index.saturating_sub(1);
+                                list_state.select(Some(i));
+                            }
+
+                            KeyCode::Down => {
+                                let i = (selected_index + 1).min(total_rows.saturating_sub(1));
+                                list_state.select(Some(i));
+                            }
+
+                            // Navigation: Page Up / Page Down
+                            KeyCode::PageUp => {
+                                let i = selected_index.saturating_sub(page_size);
+                                list_state.select(Some(i));
+                                status_msg = format!("Page Up (-{} rows)", page_size);
+                            }
+
+                            KeyCode::PageDown => {
+                                let i =
+                                    (selected_index + page_size).min(total_rows.saturating_sub(1));
+                                list_state.select(Some(i));
+                                status_msg = format!("Page Down (+{} rows)", page_size);
+                            }
+
+                            // Tree Operations
+                            KeyCode::Char('e') => {
+                                if let Some(selected) = list_state.selected() {
+                                    graph.expand_subtree(selected);
+                                    status_msg = format!("Expanded subtree at row {}", selected);
                                 }
-                                None => 0,
-                            };
-                            list_state.select(Some(i));
-                        }
+                            }
 
-                        KeyCode::Down => {
-                            let i = match list_state.selected() {
-                                Some(i) => {
-                                    if i >= total_rows.saturating_sub(1) {
-                                        total_rows.saturating_sub(1)
-                                    } else {
-                                        i + 1
-                                    }
+                            KeyCode::Char('c') => {
+                                if let Some(selected) = list_state.selected() {
+                                    graph.collapse_subtree(selected);
+                                    status_msg = format!("Collapsed subtree at row {}", selected);
                                 }
-                                None => 0,
-                            };
-                            list_state.select(Some(i));
-                        }
-
-                        KeyCode::Char('e') => {
-                            if let Some(selected) = list_state.selected() {
-                                graph.expand_subtree(selected);
-                                status_msg = format!("Action: Expand Subtree at row {}", selected);
                             }
-                        }
 
-                        KeyCode::Char('c') => {
-                            if let Some(selected) = list_state.selected() {
-                                graph.collapse_subtree(selected);
-                                status_msg =
-                                    format!("Action: Collapse Subtree at row {}", selected);
+                            KeyCode::Char('E') => {
+                                graph.expand_all();
+                                status_msg = String::from("Expanded all subtrees");
                             }
-                        }
 
-                        KeyCode::Char('E') => {
-                            graph.expand_all();
-                            status_msg = String::from("Action: Expand All (Global)");
-                        }
-
-                        KeyCode::Char('C') => {
-                            graph.collapse_all();
-                            status_msg = String::from("Action: Collapse All (Global)");
-                        }
-
-                        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
-                            if let Some(selected) = list_state.selected() {
-                                graph.toggle_expand(selected);
-                                status_msg =
-                                    format!("Action: Toggled single node at row {}", selected);
+                            KeyCode::Char('C') => {
+                                graph.collapse_all();
+                                status_msg = String::from("Collapsed all subtrees");
                             }
-                        }
 
-                        KeyCode::Char(' ') => {
-                            if let Some(selected) = list_state.selected() {
-                                if let Some(row) = graph.visible_rows.get(selected) {
-                                    match &row.kind {
-                                        RowKind::Option { name, .. } => {
-                                            let opt_name = name.clone();
-                                            graph.toggle_option(selected);
-                                            status_msg =
-                                                format!("Action: Selected option '{}'", opt_name);
+                            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                                if let Some(selected) = list_state.selected() {
+                                    graph.toggle_expand(selected);
+                                    status_msg = format!("Toggled node at row {}", selected);
+                                }
+                            }
+
+                            KeyCode::Char(' ') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(row) = graph.visible_rows.get(selected) {
+                                        match &row.kind {
+                                            RowKind::Option { name, .. } => {
+                                                let opt_name = name.clone();
+                                                graph.toggle_option(selected);
+                                                status_msg =
+                                                    format!("Toggled option '{}'", opt_name);
+                                            }
+                                            _ => {
+                                                status_msg =
+                                                    String::from("Cannot toggle non-option row");
+                                            }
                                         }
-                                        _ => {
-                                            status_msg = String::from(
-                                                "Status: Cannot toggle non-option row",
-                                            );
-                                        }
                                     }
                                 }
                             }
-                        }
 
-                        _ => {}
-                    },
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

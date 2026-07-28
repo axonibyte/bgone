@@ -80,7 +80,7 @@ pub struct DependencyGraph {
     pub root_origin: String,
     pub port_nodes: Vec<PortNode>,
     pub option_nodes: Vec<OptionNode>,
-    pub root_port_id: usize,
+    pub root_port_ids: Vec<usize>,
     pub visible_rows: Vec<VisibleRow>,
 
     pub global_mode: Mode,
@@ -92,28 +92,66 @@ pub struct DependencyGraph {
 impl DependencyGraph {
     pub fn load_from_db(
         conn: &Connection,
-        root_origin: &str,
+        patterns: &[String],
         sys_opts: &SystemOptions,
     ) -> Result<Self> {
-        // Check if the target port exists in the SQLite cache
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ports WHERE origin = ?1)",
-            params![root_origin],
-            |row| row.get(0),
-        )?;
+        let mut resolved_origins = Vec::new();
+        let mut seen = HashSet::new();
 
-        if !exists {
+        // 1. Resolve origins/patterns using SQLite GLOB with LIKE fallback
+        for pat in patterns {
+            let mut stmt =
+                conn.prepare("SELECT origin FROM ports WHERE origin GLOB ?1 ORDER BY origin")?;
+            let rows = stmt.query_map(params![pat], |row| row.get::<_, String>(0))?;
+
+            let mut matched = false;
+            for r in rows {
+                if let Ok(origin) = r {
+                    matched = true;
+                    if seen.insert(origin.clone()) {
+                        resolved_origins.push(origin);
+                    }
+                }
+            }
+
+            if !matched {
+                let like_pat = pat.replace('*', "%").replace('?', "_");
+                let mut stmt_like =
+                    conn.prepare("SELECT origin FROM ports WHERE origin LIKE ?1 ORDER BY origin")?;
+                let rows_like =
+                    stmt_like.query_map(params![like_pat], |row| row.get::<_, String>(0))?;
+                for r in rows_like {
+                    if let Ok(origin) = r {
+                        if seen.insert(origin.clone()) {
+                            resolved_origins.push(origin);
+                        }
+                    }
+                }
+            }
+        }
+
+        if resolved_origins.is_empty() {
             bail!(
-                "Port '{}' not found in database. Run 'bgone index' to index your ports tree.",
-                root_origin
+                "No matching ports found for pattern(s): '{}'. Run 'bgone index' to index your ports tree.",
+                patterns.join("', '")
             );
         }
 
+        let header_title = if resolved_origins.len() == 1 {
+            resolved_origins[0].clone()
+        } else {
+            format!(
+                "{} ports matched ({})",
+                resolved_origins.len(),
+                patterns.join(", ")
+            )
+        };
+
         let mut graph = Self {
-            root_origin: root_origin.to_string(),
+            root_origin: header_title,
             port_nodes: Vec::new(),
             option_nodes: Vec::new(),
-            root_port_id: 0,
+            root_port_ids: Vec::new(),
             visible_rows: Vec::new(),
             global_mode: Mode::None,
             last_global_seq: 0,
@@ -121,9 +159,14 @@ impl DependencyGraph {
             search_query: String::new(),
         };
 
-        let mut visited = HashSet::new();
-        graph.root_port_id =
-            graph.load_port_recursive(conn, root_origin, 0, None, sys_opts, &mut visited)?;
+        // 2. Load all resolved origins as root nodes in the dependency graph
+        for origin in &resolved_origins {
+            let mut visited = HashSet::new();
+            let root_id =
+                graph.load_port_recursive(conn, origin, 0, None, sys_opts, &mut visited)?;
+            graph.root_port_ids.push(root_id);
+        }
+
         graph.rebuild_visible_rows();
 
         Ok(graph)
@@ -454,8 +497,10 @@ impl DependencyGraph {
             return;
         }
 
-        let root_id = self.root_port_id;
-        self.flatten_port(root_id);
+        let root_ids = self.root_port_ids.clone();
+        for root_id in root_ids {
+            self.flatten_port(root_id);
+        }
 
         // Apply active search filter
         if !self.search_query.is_empty() {

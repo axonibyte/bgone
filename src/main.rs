@@ -38,8 +38,9 @@ struct Cli {
     #[arg(short = 'f', long)]
     force_reset: bool,
 
-    /// Target port origin (e.g. www/apache24)
-    origin: Option<String>,
+    /// Target port origin(s) or glob pattern(s) (e.g. www/apache24 "www/py-*")
+    #[arg(value_name = "ORIGIN")]
+    origins: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -80,13 +81,13 @@ fn main() -> Result<()> {
             );
         }
         None => {
-            if let Some(target) = cli.origin {
+            if !cli.origins.is_empty() {
                 println!("[*] Loading existing system options...");
                 let sys_opts =
                     reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
 
                 let mut dep_graph =
-                    match graph::DependencyGraph::load_from_db(&conn, &target, &sys_opts) {
+                    match graph::DependencyGraph::load_from_db(&conn, &cli.origins, &sys_opts) {
                         Ok(g) => g,
                         Err(e) => {
                             eprintln!("[!] Error: {e}");
@@ -116,7 +117,7 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                println!("Usage: bgone <ORIGIN> [OPTIONS] or bgone index --ports-dir <PATH>");
+                println!("Usage: bgone <ORIGIN_OR_PATTERN...> [OPTIONS] or bgone index --ports-dir <PATH>");
             }
         }
     }
