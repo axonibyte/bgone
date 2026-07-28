@@ -44,8 +44,8 @@ pub struct VisibleRow {
 
 #[derive(Debug, Clone)]
 pub struct OptionNode {
-    pub id: usize,
-    pub port_origin: String,
+    pub _id: usize,
+    pub _port_origin: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -408,7 +408,7 @@ impl DependencyGraph {
                             let sibling = &mut self.option_nodes[opt_id];
                             if sibling.group_type == group_type && sibling.group_name == group_name
                             {
-                                sibling.enabled = (opt_id == id);
+                                sibling.enabled = opt_id == id;
                             }
                         }
                     }

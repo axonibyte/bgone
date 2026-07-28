@@ -9,7 +9,7 @@ definitions:
       key:
         files:
           - Cargo.lock
-      path: ~/.cargo
+      path: .cargo_cache
 
 doMirror: &doMirror
   name: Mirror repository
@@ -27,13 +27,20 @@ doBuild: &doBuild
   caches:
     - cargo
   script:
-    # 1. Run native tests first
+    # 1. Force Cargo Home into BITBUCKET_CLONE_DIR so Docker mounts are allowed
+    - export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
+
+    # 2. Dynamically extract package version from Cargo.toml
+    - VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+    - echo "Building bgone version v$VERSION"
+
+    # 3. Run native tests first
     - cargo test --release
 
-    # 2. Install 'cross' for multi-arch cross-compilation
+    # 4. Install 'cross'
     - curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
 
-    # 3. Define build targets
+    # 5. Define build targets
     - mkdir -p dist
     - >-
       TARGETS=(
@@ -44,7 +51,7 @@ doBuild: &doBuild
         "aarch64-unknown-freebsd"
       )
 
-    # 4. Compile each target and collect artifacts
+    # 6. Cross-compile each target and apply versioned filenames
     - >-
       for TARGET in "${TARGETS[@]}"; do
         echo "=========================================="
@@ -53,9 +60,9 @@ doBuild: &doBuild
         cross build --target "$TARGET" --release
 
         if [[ "$TARGET" == *"windows"* ]]; then
-          cp "target/$TARGET/release/bgone.exe" "dist/bgone-$TARGET.exe"
+          cp "target/$TARGET/release/bgone.exe" "dist/bgone-v${VERSION}-${TARGET}.exe"
         else
-          cp "target/$TARGET/release/bgone" "dist/bgone-$TARGET"
+          cp "target/$TARGET/release/bgone" "dist/bgone-v${VERSION}-${TARGET}"
         fi
       done
   artifacts:
@@ -68,7 +75,7 @@ doDeploy: &doDeploy
   script:
     - >-
       for f in dist/*; do
-        if [ -f "$f" ]; then
+        if [[ -f "$f" && "$f" != *.sha256 ]]; then
           echo "Uploading $f..."
           sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
           curl -v -X POST "https://${BB_PUB_USER}:${BB_PUB_SECRET}@api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
