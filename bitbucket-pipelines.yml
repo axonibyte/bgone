@@ -24,16 +24,16 @@ definitions:
           - cargo
         script:
           - export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
-          - cargo fetch
-          - cargo test --release
-        artifacts:
-          - .cargo_cache/**
+          - cargo fetch --locked
+          - cargo test --release --locked
 
     # All per-target build logic lives in ci/build-target.sh. No docker:
     # Bitbucket's daemon forbids volume mounts outside $BITBUCKET_CLONE_DIR,
     # which breaks `cross`, so FreeBSD targets are linked with zig instead.
     - step: &doBuild
         name: Build (see ci/build-target.sh)
+        caches:
+          - cargo
         artifacts:
           - dist/*
 
@@ -47,9 +47,11 @@ definitions:
               if [[ -f "$f" && "$f" != *.sha256 ]]; then
                 echo "Uploading $f..."
                 sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
-                curl -sf -u "${BB_PUB_USER}:${BB_PUB_SECRET}" \
+                curl -sS --fail-with-body \
+                  -u "${BB_PUB_USER}:${BB_PUB_SECRET}" \
                   -X POST "https://api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
                   --form files=@"${f}" --form files=@"${f}.sha256"
+                echo "Uploaded $f + checksum"
               fi
             done
 

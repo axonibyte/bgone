@@ -21,8 +21,8 @@ install_zigbuild() {
 }
 
 build() { # build [extra cargo args...]  tries offline first, falls back to online
-    cargo build --target "$TARGET" --release "$@" --offline ||
-    cargo build --target "$TARGET" --release "$@"
+    cargo build --target "$TARGET" --release --locked "$@" --offline ||
+    cargo build --target "$TARGET" --release --locked "$@"
 }
 
 case "$TARGET" in
@@ -31,7 +31,10 @@ case "$TARGET" in
         ;;
 
     aarch64-unknown-linux-gnu)
-        apt_install gcc-aarch64-linux-gnu
+        # libc6-dev-arm64-cross is only a Recommends of the gcc package,
+        # so with --no-install-recommends it must be named explicitly 
+        # without it the cross-gcc has no target libc headers/CRT.
+        apt_install gcc-aarch64-linux-gnu libc6-dev-arm64-cross
         rustup target add "$TARGET"
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
         build
@@ -48,14 +51,14 @@ case "$TARGET" in
         # Tier 2: prebuilt std exists; stable toolchain + zig linker.
         install_zigbuild
         rustup target add "$TARGET"
-        cargo zigbuild --target "$TARGET" --release
+        cargo zigbuild --target "$TARGET" --release --locked
         ;;
 
     aarch64-unknown-freebsd)
         # Tier 3: no prebuilt std, so compile it with nightly -Z build-std.
         install_zigbuild
         rustup toolchain install nightly --profile minimal --component rust-src
-        cargo +nightly zigbuild --target "$TARGET" --release -Z build-std=std,panic_abort
+        cargo +nightly zigbuild --target "$TARGET" --release --locked -Z build-std=std,panic_abort
         ;;
 
     *)
