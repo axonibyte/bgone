@@ -112,7 +112,8 @@ fn test_exporter_writes_valid_options_files() {
 
     let sys_opts = SystemOptions::default();
     let graph =
-        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &sys_opts).unwrap();
+        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &sys_opts, false)
+            .unwrap();
 
     // Export options
     let stats =
@@ -158,7 +159,8 @@ fn test_exporter_dry_run_creates_no_files() {
 
     let sys_opts = SystemOptions::default();
     let graph =
-        DependencyGraph::load_from_db(&conn, &["sysutils/tmux".to_string()], &sys_opts).unwrap();
+        DependencyGraph::load_from_db(&conn, &["sysutils/tmux".to_string()], &sys_opts, false)
+            .unwrap();
 
     // Run export in dry-run mode
     let stats =
@@ -263,7 +265,8 @@ fn test_graph_radio_group_mutual_exclusion() {
 
     let sys_opts = SystemOptions::default();
     let mut graph =
-        DependencyGraph::load_from_db(&conn, &["databases/db".to_string()], &sys_opts).unwrap();
+        DependencyGraph::load_from_db(&conn, &["databases/db".to_string()], &sys_opts, false)
+            .unwrap();
 
     // Verify initial states
     assert!(graph.option_nodes[0].enabled); // ENGINE_A
@@ -299,7 +302,7 @@ fn test_graph_search_filtering() {
 
     let sys_opts = SystemOptions::default();
     let mut graph =
-        DependencyGraph::load_from_db(&conn, &["net/curl".to_string()], &sys_opts).unwrap();
+        DependencyGraph::load_from_db(&conn, &["net/curl".to_string()], &sys_opts, false).unwrap();
 
     // Expand all nodes
     graph.expand_all();
@@ -327,7 +330,8 @@ fn test_unknown_port_returns_error() {
     db::init_db(&conn, true).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let result = DependencyGraph::load_from_db(&conn, &["nonexistent/port".to_string()], &sys_opts);
+    let result =
+        DependencyGraph::load_from_db(&conn, &["nonexistent/port".to_string()], &sys_opts, false);
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -349,14 +353,76 @@ fn test_graph_glob_pattern_resolution() {
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/py-*".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts).unwrap();
+    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
 
     assert_eq!(graph.root_port_ids.len(), 2);
     assert!(graph.root_origin.contains("2 ports matched"));
 }
 
 #[test]
-fn test_multiple_ports_with_one_unknown() {
+fn test_pattern_matching_zero_ports_returns_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["nonexistent/*".to_string()];
+
+    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false);
+
+    // Bails when zero ports match across all provided patterns
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("No matching ports found for pattern(s): 'nonexistent/*'"));
+}
+
+#[test]
+fn test_mixed_delimiter_ports_file_parsing() {
+    let temp = TempDir::new("file_parsing");
+    let ports_file = temp.path.join("my_ports.txt");
+
+    // File containing mixed commas, tabs, spaces, newlines, full comments, and inline comments
+    let file_content = r#"
+# Core infrastructure
+www/apache24, databases/postgresql16-server  lang/python311 # inline comment
+
+# Wildcards
+www/py-*, net/curl
+"#;
+    fs::write(&ports_file, file_content).unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    conn.execute(
+        "INSERT INTO ports (origin, name, version, comment) VALUES
+         ('www/apache24', 'apache', '2.4', 'Server'),
+         ('databases/postgresql16-server', 'pg', '16.0', 'DB'),
+         ('lang/python311', 'python', '3.11', 'Lang'),
+         ('www/py-django', 'django', '4.2', 'Web'),
+         ('net/curl', 'curl', '8.0', 'Tool')",
+        [],
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(&ports_file).unwrap();
+    let targets: Vec<String> = content
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .flat_map(|line| line.split(|c: char| c == ',' || c.is_whitespace()))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    let sys_opts = SystemOptions::default();
+    let graph = DependencyGraph::load_from_db(&conn, &targets, &sys_opts, false).unwrap();
+
+    // Should resolve all 5 matching ports cleanly
+    assert_eq!(graph.root_port_ids.len(), 5);
+}
+
+#[test]
+fn test_multiple_ports_with_one_unknown_returns_error() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
@@ -368,24 +434,42 @@ fn test_multiple_ports_with_one_unknown() {
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
 
-    // Loads successfully by resolving all valid matches and skipping non-existent origins
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts).unwrap();
+    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false);
 
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("No matching ports found for pattern(s): 'invalid/unknown'"));
+}
+
+#[test]
+fn test_ignore_missing_flag_warns_and_continues() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    conn.execute(
+        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
+        [],
+    ).unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
+
+    // With ignore_missing = true, valid port loads cleanly and doesn't bail out
+    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, true).unwrap();
     assert_eq!(graph.root_port_ids.len(), 1);
 }
 
 #[test]
-fn test_pattern_matching_zero_ports_returns_error() {
+fn test_ignore_missing_flag_still_bails_if_zero_total_ports_match() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let patterns = vec!["nonexistent/*".to_string()];
+    let patterns = vec!["invalid/port1".to_string(), "invalid/port2".to_string()];
 
-    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts);
-
-    // Bails when zero ports match across all provided patterns
+    // With ignore_missing = true, if 0 total ports match, it MUST still bail out
+    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, true);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("No matching ports found for pattern(s): 'nonexistent/*'"));
+    assert!(err.contains("No matching ports found for pattern(s)"));
 }

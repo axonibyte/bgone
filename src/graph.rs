@@ -94,17 +94,20 @@ impl DependencyGraph {
         conn: &Connection,
         patterns: &[String],
         sys_opts: &SystemOptions,
+        ignore_missing: bool,
     ) -> Result<Self> {
         let mut resolved_origins = Vec::new();
         let mut seen = HashSet::new();
+        let mut unmatched_patterns = Vec::new();
 
         // 1. Resolve origins/patterns using SQLite GLOB with LIKE fallback
         for pat in patterns {
+            let mut matched = false;
+
             let mut stmt =
                 conn.prepare("SELECT origin FROM ports WHERE origin GLOB ?1 ORDER BY origin")?;
             let rows = stmt.query_map(params![pat], |row| row.get::<_, String>(0))?;
 
-            let mut matched = false;
             for r in rows {
                 if let Ok(origin) = r {
                     matched = true;
@@ -122,19 +125,40 @@ impl DependencyGraph {
                     stmt_like.query_map(params![like_pat], |row| row.get::<_, String>(0))?;
                 for r in rows_like {
                     if let Ok(origin) = r {
+                        matched = true;
                         if seen.insert(origin.clone()) {
                             resolved_origins.push(origin);
                         }
                     }
                 }
             }
+
+            if !matched {
+                unmatched_patterns.push(pat.clone());
+            }
         }
 
+        // Always fail if 0 total ports were matched, regardless of ignore_missing
         if resolved_origins.is_empty() {
             bail!(
+            "No matching ports found for pattern(s): '{}'. Run 'bgone index' to index your ports tree.",
+            patterns.join("', '")
+        );
+        }
+
+        // Handle unmatched patterns when at least 1 total port resolved
+        if !unmatched_patterns.is_empty() {
+            if ignore_missing {
+                eprintln!(
+                    "[!] Warning: No matching ports found for pattern(s): '{}'",
+                    unmatched_patterns.join("', '")
+                );
+            } else {
+                bail!(
                 "No matching ports found for pattern(s): '{}'. Run 'bgone index' to index your ports tree.",
-                patterns.join("', '")
+                unmatched_patterns.join("', '")
             );
+            }
         }
 
         let header_title = if resolved_origins.len() == 1 {
