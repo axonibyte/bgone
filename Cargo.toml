@@ -17,6 +17,7 @@ petgraph = "0.6"
 # Database & Async Runtime
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1.38", features = ["full"] }
+rayon = "1.10"
 
 # CLI Parsing & Utilities
 clap = { version = "4.5", features = ["derive"] }

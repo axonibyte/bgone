@@ -1,3 +1,4 @@
+use crate::reader::SystemOptions;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
@@ -84,10 +85,15 @@ pub struct DependencyGraph {
     pub global_mode: Mode,
     pub last_global_seq: u64,
     pub current_seq: u64,
+    pub search_query: String,
 }
 
 impl DependencyGraph {
-    pub fn load_from_db(conn: &Connection, root_origin: &str) -> Result<Self> {
+    pub fn load_from_db(
+        conn: &Connection,
+        root_origin: &str,
+        sys_opts: &SystemOptions,
+    ) -> Result<Self> {
         let mut graph = Self {
             root_origin: root_origin.to_string(),
             port_nodes: Vec::new(),
@@ -97,10 +103,12 @@ impl DependencyGraph {
             global_mode: Mode::None,
             last_global_seq: 0,
             current_seq: 0,
+            search_query: String::new(),
         };
 
         let mut visited = HashSet::new();
-        graph.root_port_id = graph.load_port_recursive(conn, root_origin, 0, None, &mut visited)?;
+        graph.root_port_id =
+            graph.load_port_recursive(conn, root_origin, 0, None, sys_opts, &mut visited)?;
         graph.rebuild_visible_rows();
 
         Ok(graph)
@@ -112,6 +120,7 @@ impl DependencyGraph {
         origin: &str,
         depth: usize,
         parent_option: Option<usize>,
+        sys_opts: &SystemOptions,
         visited: &mut HashSet<String>,
     ) -> Result<usize> {
         let port_id = self.port_nodes.len();
@@ -151,13 +160,15 @@ impl DependencyGraph {
         }
 
         for (opt_name, default_state, description, group_type, group_name) in option_data {
+            let initial_enabled = sys_opts.get_state(origin, &opt_name, default_state);
+
             let opt_id = self.option_nodes.len();
             let opt_node = OptionNode {
                 id: opt_id,
                 port_origin: origin.to_string(),
                 name: opt_name.clone(),
                 description,
-                enabled: default_state,
+                enabled: initial_enabled,
                 group_type,
                 group_name,
                 is_expanded: false,
@@ -192,6 +203,7 @@ impl DependencyGraph {
                         &dep_origin,
                         depth + 2,
                         Some(opt_id),
+                        sys_opts,
                         visited,
                     )?;
                     self.option_nodes[opt_id].child_ports.push(child_id);
@@ -429,6 +441,25 @@ impl DependencyGraph {
 
         let root_id = self.root_port_id;
         self.flatten_port(root_id);
+
+        // Apply active search filter
+        if !self.search_query.is_empty() {
+            let query = self.search_query.to_lowercase();
+            self.visible_rows.retain(|row| match &row.kind {
+                RowKind::Port { origin } => origin.to_lowercase().contains(&query),
+                RowKind::Option {
+                    name,
+                    description,
+                    group_name,
+                    ..
+                } => {
+                    name.to_lowercase().contains(&query)
+                        || description.to_lowercase().contains(&query)
+                        || group_name.to_lowercase().contains(&query)
+                }
+                RowKind::Info { .. } => true,
+            });
+        }
     }
 
     fn flatten_port(&mut self, port_id: usize) {

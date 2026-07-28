@@ -1,6 +1,8 @@
 mod db;
+mod exporter;
 mod graph;
 mod indexer;
+mod reader;
 mod ui;
 
 use anyhow::Result;
@@ -16,8 +18,24 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Discard previous database cache and rebuild schema
+    /// Path to the SQLite cache database
+    #[arg(short = 'd', long, default_value = "bgone_cache.db")]
+    db_path: PathBuf,
+
+    /// Directory to output FreeBSD option files
+    #[arg(short, long, default_value = "/var/db/ports")]
+    options_dir: PathBuf,
+
+    /// Optional path to export/read a global make.conf snippet
     #[arg(short, long)]
+    make_conf: Option<PathBuf>,
+
+    /// Perform a dry-run without writing files to disk
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Discard previous database cache and rebuild schema
+    #[arg(short = 'f', long)]
     force_reset: bool,
 
     /// Target port origin (e.g. www/apache24)
@@ -40,7 +58,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut conn = Connection::open("bgone_cache.db")?;
+    let mut conn = Connection::open(&cli.db_path)?;
 
     let force_reset =
         cli.force_reset || matches!(&cli.command, Some(Commands::Index { force: true, .. }));
@@ -48,7 +66,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Some(Commands::Index { ports_dir, .. }) => {
-            println!("[*] Indexing ports tree at {:?}...", ports_dir);
+            println!("[*] Indexing ports tree at {:?} with Rayon...", ports_dir);
             let start = Instant::now();
 
             let stats = indexer::index_ports_dir(&mut conn, ports_dir)?;
@@ -63,10 +81,35 @@ fn main() -> Result<()> {
         }
         None => {
             if let Some(target) = cli.origin {
-                let mut dep_graph = graph::DependencyGraph::load_from_db(&conn, &target)?;
-                ui::run_tui(&mut dep_graph)?;
+                println!("[*] Loading existing system options...");
+                let sys_opts =
+                    reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
+
+                let mut dep_graph =
+                    graph::DependencyGraph::load_from_db(&conn, &target, &sys_opts)?;
+                let action = ui::run_tui(&mut dep_graph)?;
+
+                match action {
+                    ui::TuiAction::SaveAndQuit => {
+                        println!("[*] Exporting options...");
+                        let stats = exporter::export_options(
+                            &dep_graph,
+                            &cli.options_dir,
+                            cli.dry_run,
+                            cli.make_conf.as_ref(),
+                        )?;
+
+                        println!(
+                            "[+] Successfully processed {} options across {} files.",
+                            stats.options_saved, stats.files_written
+                        );
+                    }
+                    ui::TuiAction::QuitWithoutSaving => {
+                        println!("[!] Exited without saving changes.");
+                    }
+                }
             } else {
-                println!("Usage: bgone <ORIGIN> or bgone index --ports-dir <PATH> [--force]");
+                println!("Usage: bgone <ORIGIN> [OPTIONS] or bgone index --ports-dir <PATH>");
             }
         }
     }

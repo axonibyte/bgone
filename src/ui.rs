@@ -14,7 +14,18 @@ use ratatui::{
 };
 use std::io::stdout;
 
-pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
+pub enum TuiAction {
+    SaveAndQuit,
+    QuitWithoutSaving,
+}
+
+#[derive(PartialEq)]
+enum InputMode {
+    Normal,
+    Search,
+}
+
+pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -25,6 +36,8 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
     list_state.select(Some(0));
 
     let mut status_msg = String::from("Ready");
+    let action;
+    let mut input_mode = InputMode::Normal;
 
     loop {
         terminal.draw(|f| {
@@ -38,7 +51,11 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
                 .split(f.size());
 
             let header = Paragraph::new(format!(" Target: {}", graph.root_origin))
-                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -54,7 +71,11 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
                     let line = match &row.kind {
                         RowKind::Port { origin } => {
                             let prefix = if row.has_children {
-                                if row.is_expanded { "[-] " } else { "[+] " }
+                                if row.is_expanded {
+                                    "[-] "
+                                } else {
+                                    "[+] "
+                                }
                             } else {
                                 "    "
                             };
@@ -68,16 +89,28 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
                             group_name,
                         } => {
                             let prefix = if row.has_children {
-                                if row.is_expanded { "[-] " } else { "[+] " }
+                                if row.is_expanded {
+                                    "[-] "
+                                } else {
+                                    "[+] "
+                                }
                             } else {
                                 "    "
                             };
 
                             let is_radio = group_type == "SINGLE" || group_type == "RADIO";
                             let control = if is_radio {
-                                if *enabled { "(*)" } else { "( )" }
+                                if *enabled {
+                                    "(*)"
+                                } else {
+                                    "( )"
+                                }
                             } else {
-                                if *enabled { "[X]" } else { "[ ]" }
+                                if *enabled {
+                                    "[X]"
+                                } else {
+                                    "[ ]"
+                                }
                             };
 
                             let category_badge = if !group_name.is_empty() {
@@ -87,7 +120,10 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
                             };
 
                             if description.is_empty() {
-                                format!("{}{}{} {}{}", indent, prefix, control, category_badge, name)
+                                format!(
+                                    "{}{}{} {}{}",
+                                    indent, prefix, control, category_badge, name
+                                )
                             } else {
                                 format!(
                                     "{}{}{} {}{} - {}",
@@ -119,12 +155,28 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
 
             f.render_stateful_widget(tree_list, chunks[1], &mut list_state);
 
-            let footer = Paragraph::new(format!(
-                " [e/c] Subtree Expand/Collapse | [Shift+E/C] Global | [Enter] Single Toggle | [Space] Select | {}",
-                status_msg
-            ))
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL));
+            let footer_content = match input_mode {
+                InputMode::Normal => format!(
+                    " [/] Search: '{}' | [s] Save | [q] Discard | [Space] Select | {}",
+                    graph.search_query, status_msg
+                ),
+                InputMode::Search => format!(
+                    " SEARCH: {}_ (Press [Enter] to confirm, [Esc] to clear)",
+                    graph.search_query
+                ),
+            };
+
+            let footer_style = if input_mode == InputMode::Search {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let footer = Paragraph::new(footer_content)
+                .style(footer_style)
+                .block(Block::default().borders(Borders::ALL));
 
             f.render_widget(footer, chunks[2]);
         })?;
@@ -133,88 +185,126 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 let total_rows = graph.visible_rows.len();
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-
-                    KeyCode::Up => {
-                        let i = match list_state.selected() {
-                            Some(i) => {
-                                if i == 0 {
-                                    0
-                                } else {
-                                    i - 1
-                                }
-                            }
-                            None => 0,
-                        };
-                        list_state.select(Some(i));
-                    }
-
-                    KeyCode::Down => {
-                        let i = match list_state.selected() {
-                            Some(i) => {
-                                if i >= total_rows.saturating_sub(1) {
-                                    total_rows.saturating_sub(1)
-                                } else {
-                                    i + 1
-                                }
-                            }
-                            None => 0,
-                        };
-                        list_state.select(Some(i));
-                    }
-
-                    KeyCode::Char('e') => {
-                        if let Some(selected) = list_state.selected() {
-                            graph.expand_subtree(selected);
-                            status_msg = format!("Action: Expand Subtree at row {}", selected);
+                match input_mode {
+                    InputMode::Search => match key.code {
+                        KeyCode::Esc => {
+                            graph.search_query.clear();
+                            graph.rebuild_visible_rows();
+                            input_mode = InputMode::Normal;
+                            status_msg = String::from("Cleared search filter");
                         }
-                    }
-
-                    KeyCode::Char('c') => {
-                        if let Some(selected) = list_state.selected() {
-                            graph.collapse_subtree(selected);
-                            status_msg = format!("Action: Collapse Subtree at row {}", selected);
+                        KeyCode::Enter => {
+                            input_mode = InputMode::Normal;
+                            status_msg = format!("Filter locked: '{}'", graph.search_query);
                         }
-                    }
-
-                    KeyCode::Char('E') => {
-                        graph.expand_all();
-                        status_msg = String::from("Action: Expand All (Global)");
-                    }
-
-                    KeyCode::Char('C') => {
-                        graph.collapse_all();
-                        status_msg = String::from("Action: Collapse All (Global)");
-                    }
-
-                    KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
-                        if let Some(selected) = list_state.selected() {
-                            graph.toggle_expand(selected);
-                            status_msg = format!("Action: Toggled single node at row {}", selected);
+                        KeyCode::Backspace => {
+                            graph.search_query.pop();
+                            graph.rebuild_visible_rows();
                         }
-                    }
+                        KeyCode::Char(c) => {
+                            graph.search_query.push(c);
+                            graph.rebuild_visible_rows();
+                        }
+                        _ => {}
+                    },
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('/') => {
+                            input_mode = InputMode::Search;
+                        }
 
-                    KeyCode::Char(' ') => {
-                        if let Some(selected) = list_state.selected() {
-                            if let Some(row) = graph.visible_rows.get(selected) {
-                                match &row.kind {
-                                    RowKind::Option { name, .. } => {
-                                        let opt_name = name.clone();
-                                        graph.toggle_option(selected);
-                                        status_msg =
-                                            format!("Action: Selected option '{}'", opt_name);
-                                    }
-                                    _ => {
-                                        status_msg =
-                                            String::from("Status: Cannot toggle non-option row");
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            action = TuiAction::SaveAndQuit;
+                            break;
+                        }
+
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            action = TuiAction::QuitWithoutSaving;
+                            break;
+                        }
+
+                        KeyCode::Up => {
+                            let i = match list_state.selected() {
+                                Some(i) => {
+                                    if i == 0 {
+                                        0
+                                    } else {
+                                        i - 1
                                     }
                                 }
+                                None => 0,
+                            };
+                            list_state.select(Some(i));
+                        }
+
+                        KeyCode::Down => {
+                            let i = match list_state.selected() {
+                                Some(i) => {
+                                    if i >= total_rows.saturating_sub(1) {
+                                        total_rows.saturating_sub(1)
+                                    } else {
+                                        i + 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            list_state.select(Some(i));
+                        }
+
+                        KeyCode::Char('e') => {
+                            if let Some(selected) = list_state.selected() {
+                                graph.expand_subtree(selected);
+                                status_msg = format!("Action: Expand Subtree at row {}", selected);
                             }
                         }
-                    }
 
-                    _ => {}
+                        KeyCode::Char('c') => {
+                            if let Some(selected) = list_state.selected() {
+                                graph.collapse_subtree(selected);
+                                status_msg =
+                                    format!("Action: Collapse Subtree at row {}", selected);
+                            }
+                        }
+
+                        KeyCode::Char('E') => {
+                            graph.expand_all();
+                            status_msg = String::from("Action: Expand All (Global)");
+                        }
+
+                        KeyCode::Char('C') => {
+                            graph.collapse_all();
+                            status_msg = String::from("Action: Collapse All (Global)");
+                        }
+
+                        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                            if let Some(selected) = list_state.selected() {
+                                graph.toggle_expand(selected);
+                                status_msg =
+                                    format!("Action: Toggled single node at row {}", selected);
+                            }
+                        }
+
+                        KeyCode::Char(' ') => {
+                            if let Some(selected) = list_state.selected() {
+                                if let Some(row) = graph.visible_rows.get(selected) {
+                                    match &row.kind {
+                                        RowKind::Option { name, .. } => {
+                                            let opt_name = name.clone();
+                                            graph.toggle_option(selected);
+                                            status_msg =
+                                                format!("Action: Selected option '{}'", opt_name);
+                                        }
+                                        _ => {
+                                            status_msg = String::from(
+                                                "Status: Cannot toggle non-option row",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        _ => {}
+                    },
                 }
             }
         }
@@ -224,5 +314,5 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    Ok(())
+    Ok(action)
 }
