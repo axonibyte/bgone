@@ -3,6 +3,14 @@ image: rust:latest
 options:
   docker: true
 
+definitions:
+  caches:
+    cargo:
+      key:
+        files:
+          - Cargo.lock
+      path: ~/.cargo
+
 doMirror: &doMirror
   name: Mirror repository
   clone:
