@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Some(Commands::Index { ports_dir, .. }) => {
-            println!("[*] Indexing ports tree at {:?} with Rayon...", ports_dir);
+            println!("[*] Indexing ports tree at {:?}...", ports_dir);
             let start = Instant::now();
 
             let stats = indexer::index_ports_dir(&mut conn, ports_dir)?;
