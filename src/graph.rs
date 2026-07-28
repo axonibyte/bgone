@@ -1,5 +1,5 @@
 use crate::reader::SystemOptions;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
@@ -75,6 +75,7 @@ pub struct PortNode {
     pub options: Vec<usize>,
 }
 
+#[derive(Debug)]
 pub struct DependencyGraph {
     pub root_origin: String,
     pub port_nodes: Vec<PortNode>,
@@ -94,6 +95,20 @@ impl DependencyGraph {
         root_origin: &str,
         sys_opts: &SystemOptions,
     ) -> Result<Self> {
+        // Check if the target port exists in the SQLite cache
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ports WHERE origin = ?1)",
+            params![root_origin],
+            |row| row.get(0),
+        )?;
+
+        if !exists {
+            bail!(
+                "Port '{}' not found in database. Run 'bgone index' to index your ports tree.",
+                root_origin
+            );
+        }
+
         let mut graph = Self {
             root_origin: root_origin.to_string(),
             port_nodes: Vec::new(),

@@ -86,7 +86,14 @@ fn main() -> Result<()> {
                     reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
 
                 let mut dep_graph =
-                    graph::DependencyGraph::load_from_db(&conn, &target, &sys_opts)?;
+                    match graph::DependencyGraph::load_from_db(&conn, &target, &sys_opts) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("[!] Error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
                 let action = ui::run_tui(&mut dep_graph)?;
 
                 match action {

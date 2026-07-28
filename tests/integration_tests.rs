@@ -315,3 +315,16 @@ fn test_graph_search_filtering() {
     graph.rebuild_visible_rows();
     assert_eq!(graph.visible_rows.len(), total_unfiltered_rows);
 }
+
+#[test]
+fn test_unknown_port_returns_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    let sys_opts = SystemOptions::default();
+    let result = DependencyGraph::load_from_db(&conn, "nonexistent/port", &sys_opts);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("Port 'nonexistent/port' not found"));
+}
