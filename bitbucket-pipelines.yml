@@ -48,7 +48,7 @@ definitions:
                 echo "Uploading $f..."
                 sha256sum "$f" | awk '{ print $1 }' > "${f}.sha256"
                 curl -sS --fail-with-body \
-                  -u "${BB_PUB_USER}:${BB_PUB_SECRET}" \
+                  -H "Authorization: Bearer ${BB_PUB_SECRET}" \
                   -X POST "https://api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" \
                   --form files=@"${f}" --form files=@"${f}.sha256"
                 echo "Uploaded $f + checksum"
