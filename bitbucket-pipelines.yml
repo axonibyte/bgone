@@ -1,8 +1,5 @@
 image: rust:latest
 
-options:
-  docker: true
-
 definitions:
   caches:
     cargo:
@@ -10,23 +7,6 @@ definitions:
         files:
           - Cargo.lock
       path: .cargo_cache
-
-  yaml-anchors:
-    # Shared build logic, parameterized by $TARGET (exported by each parallel step).
-    - &buildScript |
-      export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
-      VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-      curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
-      mkdir -p dist
-      echo "=========================================="
-      echo "Building target $TARGET (offline mode)"
-      echo "=========================================="
-      cross build --target "$TARGET" --offline --release || cross build --target "$TARGET" --release
-      if [[ "$TARGET" == *"windows"* ]]; then
-        cp "target/$TARGET/release/bgone.exe" "dist/bgone-v${VERSION}-${TARGET}.exe"
-      else
-        cp "target/$TARGET/release/bgone" "dist/bgone-v${VERSION}-${TARGET}"
-      fi
 
   steps:
     - step: &doMirror
@@ -49,11 +29,11 @@ definitions:
         artifacts:
           - .cargo_cache/**
 
-    - step: &doParallelBuild
-        # name and script are overridden per-target below
-        name: Build (cross)
-        services:
-          - docker
+    # All per-target build logic lives in ci/build-target.sh. No docker:
+    # Bitbucket's daemon forbids volume mounts outside $BITBUCKET_CLONE_DIR,
+    # which breaks `cross`, so FreeBSD targets are linked with zig instead.
+    - step: &doBuild
+        name: Build (see ci/build-target.sh)
         artifacts:
           - dist/*
 
@@ -81,35 +61,30 @@ pipelines:
       - parallel:
           steps:
             - step:
-                <<: *doParallelBuild
+                <<: *doBuild
                 name: Build x86_64-unknown-linux-gnu
                 script:
-                  - export TARGET=x86_64-unknown-linux-gnu
-                  - *buildScript
+                  - bash ci/build-target.sh x86_64-unknown-linux-gnu
             - step:
-                <<: *doParallelBuild
+                <<: *doBuild
                 name: Build aarch64-unknown-linux-gnu
                 script:
-                  - export TARGET=aarch64-unknown-linux-gnu
-                  - *buildScript
+                  - bash ci/build-target.sh aarch64-unknown-linux-gnu
             - step:
-                <<: *doParallelBuild
+                <<: *doBuild
                 name: Build x86_64-pc-windows-gnu
                 script:
-                  - export TARGET=x86_64-pc-windows-gnu
-                  - *buildScript
+                  - bash ci/build-target.sh x86_64-pc-windows-gnu
             - step:
-                <<: *doParallelBuild
+                <<: *doBuild
                 name: Build x86_64-unknown-freebsd
                 script:
-                  - export TARGET=x86_64-unknown-freebsd
-                  - *buildScript
+                  - bash ci/build-target.sh x86_64-unknown-freebsd
             - step:
-                <<: *doParallelBuild
+                <<: *doBuild
                 name: Build aarch64-unknown-freebsd
                 script:
-                  - export TARGET=aarch64-unknown-freebsd
-                  - *buildScript
+                  - bash ci/build-target.sh aarch64-unknown-freebsd
       - step: *doDeploy
 
     dev:
