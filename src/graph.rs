@@ -3,6 +3,38 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
+/// Row a `Shift + Down` should land on: the next sibling of `from`, or — when
+/// `from` is the last child of its parent — the following "uncle", i.e. the next
+/// row shallower than `from`. Returns `from` unchanged when neither exists.
+///
+/// Both cases reduce to "the first following row at equal or shallower depth",
+/// because a shallower row always separates two different parents' children.
+pub fn next_sibling_index(depths: &[usize], from: usize) -> usize {
+    let depth = match depths.get(from) {
+        Some(&d) => d,
+        None => return from,
+    };
+
+    depths
+        .iter()
+        .enumerate()
+        .skip(from + 1)
+        .find(|(_, &d)| d <= depth)
+        .map(|(i, _)| i)
+        .unwrap_or(from)
+}
+
+/// Mirror of [`next_sibling_index`] for `Shift + Up`: the previous sibling, or
+/// the parent when `from` is the first child.
+pub fn prev_sibling_index(depths: &[usize], from: usize) -> usize {
+    let depth = match depths.get(from) {
+        Some(&d) => d,
+        None => return from,
+    };
+
+    (0..from).rev().find(|&i| depths[i] <= depth).unwrap_or(from)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Expand,
@@ -51,6 +83,8 @@ pub struct OptionNode {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    /// State this option had when the tree was loaded, used to detect unsaved edits.
+    pub initial_enabled: bool,
     pub group_type: String,
     pub group_name: String,
     pub is_expanded: bool,
@@ -251,6 +285,7 @@ impl DependencyGraph {
                 name: opt_name.clone(),
                 description,
                 enabled: initial_enabled,
+                initial_enabled,
                 group_type,
                 group_name,
                 is_expanded: false,
@@ -457,7 +492,9 @@ impl DependencyGraph {
         self.rebuild_visible_rows();
     }
 
-    pub fn toggle_expand(&mut self, row_index: usize) {
+    /// Expands or collapses a single row, leaving its descendants' own
+    /// expansion state untouched.
+    pub fn set_node_expanded(&mut self, row_index: usize, expanded: bool) {
         if let Some(row) = self.visible_rows.get(row_index) {
             self.current_seq += 1;
             let seq = self.current_seq;
@@ -466,13 +503,13 @@ impl DependencyGraph {
                 NodeId::Port(id) => {
                     if let Some(p) = self.port_nodes.get_mut(id) {
                         p.last_single_seq = seq;
-                        p.is_expanded = !p.is_expanded;
+                        p.is_expanded = expanded;
                     }
                 }
                 NodeId::Option(id) => {
                     if let Some(o) = self.option_nodes.get_mut(id) {
                         o.last_single_seq = seq;
-                        o.is_expanded = !o.is_expanded;
+                        o.is_expanded = expanded;
                     }
                 }
                 NodeId::Info => {}
@@ -481,13 +518,31 @@ impl DependencyGraph {
         self.rebuild_visible_rows();
     }
 
+    pub fn expand_node(&mut self, row_index: usize) {
+        self.set_node_expanded(row_index, true);
+    }
+
+    pub fn collapse_node(&mut self, row_index: usize) {
+        self.set_node_expanded(row_index, false);
+    }
+
+    /// True when any option differs from the state it was loaded with. Toggling
+    /// an option back to where it started clears this again.
+    pub fn is_dirty(&self) -> bool {
+        self.option_nodes
+            .iter()
+            .any(|opt| opt.enabled != opt.initial_enabled)
+    }
+
     pub fn toggle_option(&mut self, row_index: usize) {
         if let Some(row) = self.visible_rows.get(row_index) {
             if let NodeId::Option(id) = row.node_id {
-                let (parent_port, group_type, group_name, current_enabled) = {
+                let (parent_port, origin, name, group_type, group_name, current_enabled) = {
                     let opt = &self.option_nodes[id];
                     (
                         opt.parent_port,
+                        opt.port_origin.clone(),
+                        opt.name.clone(),
                         opt.group_type.clone(),
                         opt.group_name.clone(),
                         opt.enabled,
@@ -497,22 +552,51 @@ impl DependencyGraph {
                 let is_radio = group_type == "SINGLE" || group_type == "RADIO";
 
                 if is_radio {
+                    // Radios only turn on; the rest of the group turns off.
                     if !current_enabled {
                         let sibling_ids = self.port_nodes[parent_port].options.clone();
-                        for opt_id in sibling_ids {
-                            let sibling = &mut self.option_nodes[opt_id];
-                            if sibling.group_type == group_type && sibling.group_name == group_name
-                            {
-                                sibling.enabled = opt_id == id;
-                            }
+                        let updates: Vec<(String, String, bool)> = sibling_ids
+                            .iter()
+                            .map(|&opt_id| &self.option_nodes[opt_id])
+                            .filter(|s| s.group_type == group_type && s.group_name == group_name)
+                            .map(|s| (s.port_origin.clone(), s.name.clone(), s.id == id))
+                            .collect();
+
+                        for (origin, name, enabled) in updates {
+                            self.set_option_state(&origin, &name, enabled);
                         }
                     }
-                } else if let Some(o) = self.option_nodes.get_mut(id) {
-                    o.enabled = !o.enabled;
+                } else {
+                    self.set_option_state(&origin, &name, !current_enabled);
                 }
             }
         }
         self.rebuild_visible_rows();
+    }
+
+    /// Writes an option's state to *every* node describing that option.
+    ///
+    /// The same port can appear in the tree more than once (as several roots'
+    /// dependency, or as both an explicit target and a dependency), so each
+    /// occurrence carries its own `OptionNode`. Keeping them in lockstep means a
+    /// toggle anywhere is reflected everywhere on the next redraw.
+    pub fn set_option_state(&mut self, port_origin: &str, option_name: &str, enabled: bool) {
+        for opt in &mut self.option_nodes {
+            if opt.port_origin == port_origin && opt.name == option_name {
+                opt.enabled = enabled;
+            }
+        }
+    }
+
+    /// All option nodes matching a `(port origin, option name)` pair — one per
+    /// occurrence of that port in the tree.
+    #[allow(dead_code)]
+    pub fn option_instances(&self, port_origin: &str, option_name: &str) -> Vec<usize> {
+        self.option_nodes
+            .iter()
+            .filter(|o| o.port_origin == port_origin && o.name == option_name)
+            .map(|o| o.id)
+            .collect()
     }
 
     pub fn rebuild_visible_rows(&mut self) {

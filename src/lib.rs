@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod db;
 pub mod exporter;
 pub mod graph;

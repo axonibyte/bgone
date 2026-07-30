@@ -1,42 +1,21 @@
+mod common;
+
+use common::TempDir;
+
 use rusqlite::Connection;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bgone::cli::parse_ports_file;
 use bgone::db;
 use bgone::exporter;
-use bgone::graph::{DependencyGraph, RowKind};
+use bgone::graph::{
+    next_sibling_index, prev_sibling_index, DependencyGraph, NodeId, RowKind,
+};
 use bgone::indexer;
 use bgone::reader::SystemOptions;
-
-static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-/// RAII wrapper to guarantee test directories and files are cleaned up on completion or panic.
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(prefix: &str) -> Self {
-        let count = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "bgone_test_{}_{}_{}",
-            prefix,
-            std::process::id(),
-            count
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("Failed to create temporary test directory");
-        Self { path }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+use bgone::ui::{
+    next_focus, prev_focus, recenter_offset, tree_op, Focus, RecenterPosition, TreeOp,
+};
 
 // ============================================================================
 // 1. READER TESTS (Existing Options & make.conf)
@@ -404,15 +383,7 @@ www/py-*, net/curl
     )
     .unwrap();
 
-    let content = fs::read_to_string(&ports_file).unwrap();
-    let targets: Vec<String> = content
-        .lines()
-        .map(|line| line.split('#').next().unwrap_or(""))
-        .flat_map(|line| line.split(|c: char| c == ',' || c.is_whitespace()))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
+    let targets = parse_ports_file(&ports_file).unwrap();
 
     let sys_opts = SystemOptions::default();
     let graph = DependencyGraph::load_from_db(&conn, &targets, &sys_opts, false).unwrap();
@@ -457,6 +428,480 @@ fn test_ignore_missing_flag_warns_and_continues() {
     // With ignore_missing = true, valid port loads cleanly and doesn't bail out
     let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, true).unwrap();
     assert_eq!(graph.root_port_ids.len(), 1);
+}
+
+// ============================================================================
+// 5. DUPLICATE PORT TESTS (Shared option state across repeated occurrences)
+// ============================================================================
+
+/// Two roots that both depend on `devel/shared`, which itself carries options.
+fn shared_dependency_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    conn.execute(
+        "INSERT INTO ports (origin, name, version, comment) VALUES
+         ('www/root1', 'root1', '1.0', 'First root'),
+         ('www/root2', 'root2', '1.0', 'Second root'),
+         ('devel/shared', 'shared', '1.0', 'Shared dependency')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
+         VALUES ('www/root1', 'USE_SHARED', 1, 'Pull in shared', 'DEFINE', ''),
+                ('www/root2', 'ALSO_SHARED', 1, 'Pull in shared', 'DEFINE', ''),
+                ('devel/shared', 'THREADS', 0, 'Threading support', 'DEFINE', ''),
+                ('devel/shared', 'ENGINE_A', 1, 'Engine A', 'SINGLE', 'ENGINE'),
+                ('devel/shared', 'ENGINE_B', 0, 'Engine B', 'SINGLE', 'ENGINE')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO option_deps (port_origin, option_name, dep_origin, dep_type) VALUES
+         ('www/root1', 'USE_SHARED', 'devel/shared', 'RUN'),
+         ('www/root2', 'ALSO_SHARED', 'devel/shared', 'RUN')",
+        [],
+    )
+    .unwrap();
+
+    conn
+}
+
+/// Index of the visible row holding `opt_name` for `origin`, skipping the first
+/// `skip` matches so a specific occurrence of a duplicated port can be targeted.
+fn find_option_row(graph: &DependencyGraph, origin: &str, opt_name: &str, skip: usize) -> usize {
+    graph
+        .visible_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| match row.node_id {
+            NodeId::Option(id) => {
+                let opt = &graph.option_nodes[id];
+                opt.port_origin == origin && opt.name == opt_name
+            }
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .nth(skip)
+        .unwrap_or_else(|| panic!("no visible row #{skip} for {origin}/{opt_name}"))
+}
+
+fn states_of(graph: &DependencyGraph, origin: &str, opt_name: &str) -> Vec<bool> {
+    graph
+        .option_instances(origin, opt_name)
+        .into_iter()
+        .map(|id| graph.option_nodes[id].enabled)
+        .collect()
+}
+
+#[test]
+fn test_duplicate_dependency_shares_checkbox_state() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    // devel/shared hangs off both roots, so it is present twice
+    let instances = graph.option_instances("devel/shared", "THREADS");
+    assert_eq!(
+        instances.len(),
+        2,
+        "expected devel/shared to appear under both roots"
+    );
+    assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![false; 2]);
+
+    // Toggling the first occurrence must move the second one too
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 0);
+    graph.toggle_option(row);
+    assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![true; 2]);
+
+    // ...and so must toggling it back from the *second* occurrence
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 1);
+    graph.toggle_option(row);
+    assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![false; 2]);
+}
+
+#[test]
+fn test_duplicate_dependency_shares_radio_state() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    assert_eq!(states_of(&graph, "devel/shared", "ENGINE_A"), vec![true; 2]);
+    assert_eq!(states_of(&graph, "devel/shared", "ENGINE_B"), vec![false; 2]);
+
+    // Switching the radio on one occurrence flips both sides of the group everywhere
+    let row = find_option_row(&graph, "devel/shared", "ENGINE_B", 1);
+    graph.toggle_option(row);
+
+    assert_eq!(states_of(&graph, "devel/shared", "ENGINE_A"), vec![false; 2]);
+    assert_eq!(states_of(&graph, "devel/shared", "ENGINE_B"), vec![true; 2]);
+}
+
+#[test]
+fn test_explicit_target_shares_state_with_its_dependency_copy() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+
+    // devel/shared is both an explicitly requested port and a dependency of www/root1
+    let patterns = vec!["www/root1".to_string(), "devel/shared".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    assert_eq!(graph.option_instances("devel/shared", "THREADS").len(), 2);
+
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 0);
+    graph.toggle_option(row);
+
+    assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![true; 2]);
+}
+
+#[test]
+fn test_duplicate_rows_render_the_same_state_immediately() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 0);
+    graph.toggle_option(row);
+
+    // toggle_option rebuilds the rows, so both checkboxes are already redrawn
+    let rendered: Vec<bool> = graph
+        .visible_rows
+        .iter()
+        .filter_map(|row| match (&row.kind, &row.node_id) {
+            (RowKind::Option { name, enabled, .. }, NodeId::Option(_)) if name == "THREADS" => {
+                Some(*enabled)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(rendered, vec![true, true]);
+}
+
+#[test]
+fn test_exporter_writes_duplicated_port_options_once() {
+    let temp = TempDir::new("exporter_duplicates");
+    let options_dir = temp.path.join("ports");
+    let make_conf_path = temp.path.join("make.conf");
+
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 0);
+    graph.toggle_option(row);
+
+    let stats =
+        exporter::export_options(&graph, &options_dir, false, Some(&make_conf_path)).unwrap();
+
+    // 3 files (root1, root2, shared); 5 distinct options, not 8 nodes
+    assert_eq!(stats.files_written, 3);
+    assert_eq!(stats.options_saved, 5);
+
+    let content = fs::read_to_string(options_dir.join("devel_shared").join("options")).unwrap();
+    assert_eq!(content.matches("WITH_THREADS=true").count(), 1);
+    assert!(!content.contains("WITHOUT_THREADS=true"));
+
+    let make_content = fs::read_to_string(&make_conf_path).unwrap();
+    assert_eq!(make_content.matches("OPTIONS_SET+=THREADS").count(), 1);
+}
+
+// ============================================================================
+// 6. UI KEY TESTS (Scope escalation, focus cycle, Ctrl+L recenter)
+// ============================================================================
+
+#[test]
+fn test_single_row_keys_ignore_repetition() {
+    // = and - always act on the row under the cursor, however many times they
+    // are pressed
+    for repeat in [false, true] {
+        assert_eq!(tree_op('=', repeat), Some(TreeOp::ExpandNode));
+        assert_eq!(tree_op('-', repeat), Some(TreeOp::CollapseNode));
+    }
+}
+
+#[test]
+fn test_double_tap_escalates_from_section_to_whole_tree() {
+    // First press acts on the section under the cursor...
+    assert_eq!(tree_op('+', false), Some(TreeOp::ExpandSection));
+    assert_eq!(tree_op('_', false), Some(TreeOp::CollapseSection));
+
+    // ...and an immediately following press of the same key widens it
+    assert_eq!(tree_op('+', true), Some(TreeOp::ExpandAll));
+    assert_eq!(tree_op('_', true), Some(TreeOp::CollapseAll));
+}
+
+#[test]
+fn test_tree_op_ignores_unrelated_keys() {
+    for c in ['a', ' ', 'q', ']', '[', '5'] {
+        assert_eq!(tree_op(c, false), None, "key {c:?} should not touch the tree");
+        assert_eq!(tree_op(c, true), None, "key {c:?} should not touch the tree");
+    }
+}
+
+#[test]
+fn test_focus_cycles_through_the_list_and_both_buttons() {
+    assert_eq!(next_focus(Focus::List), Focus::Ok);
+    assert_eq!(next_focus(Focus::Ok), Focus::Cancel);
+    assert_eq!(next_focus(Focus::Cancel), Focus::List);
+
+    // Shift+Tab walks it backwards
+    assert_eq!(prev_focus(Focus::List), Focus::Cancel);
+    assert_eq!(prev_focus(Focus::Cancel), Focus::Ok);
+    assert_eq!(prev_focus(Focus::Ok), Focus::List);
+
+    // Round trips
+    for f in [Focus::List, Focus::Ok, Focus::Cancel] {
+        assert_eq!(prev_focus(next_focus(f)), f);
+        assert_eq!(next_focus(next_focus(next_focus(f))), f);
+    }
+}
+
+// ============================================================================
+// 7. SIBLING NAVIGATION TESTS (Shift + Up / Down)
+// ============================================================================
+
+#[test]
+fn test_next_sibling_skips_over_descendants() {
+    //  0: port          depth 0
+    //  1:   option      depth 1  <- cursor
+    //  2:     dep port  depth 2
+    //  3:       option  depth 3
+    //  4:   option      depth 1  <- next sibling
+    let depths = [0, 1, 2, 3, 1];
+    assert_eq!(next_sibling_index(&depths, 1), 4);
+}
+
+#[test]
+fn test_next_sibling_falls_through_to_the_following_uncle() {
+    //  0: port          depth 0
+    //  1:   option      depth 1
+    //  2:     dep port  depth 2  <- cursor, last child of its parent
+    //  3: port          depth 0  <- following uncle
+    let depths = [0, 1, 2, 0];
+    assert_eq!(next_sibling_index(&depths, 2), 3);
+}
+
+#[test]
+fn test_next_sibling_stays_put_at_the_end_of_the_tree() {
+    let depths = [0, 1, 2];
+    assert_eq!(next_sibling_index(&depths, 2), 2);
+    assert_eq!(next_sibling_index(&depths, 0), 0);
+}
+
+#[test]
+fn test_prev_sibling_skips_over_descendants() {
+    //  0: port          depth 0
+    //  1:   option      depth 1  <- previous sibling
+    //  2:     dep port  depth 2
+    //  3:   option      depth 1  <- cursor
+    let depths = [0, 1, 2, 1];
+    assert_eq!(prev_sibling_index(&depths, 3), 1);
+}
+
+#[test]
+fn test_prev_sibling_falls_through_to_the_parent() {
+    //  0: port          depth 0  <- parent
+    //  1:   option      depth 1  <- cursor, first child
+    let depths = [0, 1];
+    assert_eq!(prev_sibling_index(&depths, 1), 0);
+}
+
+#[test]
+fn test_prev_sibling_stays_put_at_the_top_of_the_tree() {
+    let depths = [0, 1, 1];
+    assert_eq!(prev_sibling_index(&depths, 0), 0);
+}
+
+#[test]
+fn test_sibling_navigation_handles_degenerate_input() {
+    assert_eq!(next_sibling_index(&[], 0), 0);
+    assert_eq!(prev_sibling_index(&[], 0), 0);
+    assert_eq!(next_sibling_index(&[0], 5), 5);
+    assert_eq!(prev_sibling_index(&[0], 5), 5);
+}
+
+#[test]
+fn test_sibling_navigation_walks_a_real_tree() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    let depths: Vec<usize> = graph.visible_rows.iter().map(|r| r.depth).collect();
+
+    // From the first root, the next sibling is the second root
+    let second_root = next_sibling_index(&depths, 0);
+    assert!(matches!(
+        &graph.visible_rows[second_root].kind,
+        RowKind::Port { origin } if origin == "www/root2"
+    ));
+
+    // ...and stepping back returns to the first
+    assert_eq!(prev_sibling_index(&depths, second_root), 0);
+
+    // Row 1 is www/root1's only option; it has no sibling, so Shift+Down falls
+    // through to the following uncle, which is the second root
+    assert_eq!(next_sibling_index(&depths, 1), second_root);
+}
+
+// ============================================================================
+// 8. UNSAVED CHANGES TESTS (Quit confirmation)
+// ============================================================================
+
+#[test]
+fn test_graph_is_clean_when_first_loaded() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string()];
+    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+
+    assert!(!graph.is_dirty(), "a freshly loaded tree has nothing to save");
+}
+
+#[test]
+fn test_toggling_an_option_marks_the_graph_dirty() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 0);
+    graph.toggle_option(row);
+    assert!(graph.is_dirty());
+
+    // Toggling back to the loaded value clears it again, so an undone edit
+    // never raises the confirmation box
+    graph.toggle_option(row);
+    assert!(!graph.is_dirty());
+}
+
+#[test]
+fn test_toggling_a_duplicate_occurrence_marks_the_graph_dirty() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    // Edit the second occurrence of the shared port
+    let row = find_option_row(&graph, "devel/shared", "THREADS", 1);
+    graph.toggle_option(row);
+
+    assert!(graph.is_dirty());
+    assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![true; 2]);
+}
+
+#[test]
+fn test_radio_switch_marks_the_graph_dirty() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    graph.expand_all();
+
+    let row = find_option_row(&graph, "devel/shared", "ENGINE_B", 0);
+    graph.toggle_option(row);
+
+    assert!(graph.is_dirty());
+}
+
+// ============================================================================
+// 9. SINGLE-ROW EXPANSION TESTS (= / -)
+// ============================================================================
+
+#[test]
+fn test_expand_and_collapse_node_affect_only_the_target_row() {
+    let conn = shared_dependency_db();
+    let sys_opts = SystemOptions::default();
+    let patterns = vec!["www/root1".to_string()];
+    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+
+    // Row 0 is the root port, expanded by default; row 1 is its option
+    graph.collapse_node(0);
+    assert!(!graph.visible_rows[0].is_expanded);
+    assert_eq!(
+        graph.visible_rows.len(),
+        1,
+        "collapsing the root should hide its options"
+    );
+
+    graph.expand_node(0);
+    assert!(graph.visible_rows[0].is_expanded);
+    assert!(graph.visible_rows.len() > 1);
+
+    // Expanding the option reveals the dependency port, but does not expand
+    // that port's own options
+    graph.expand_node(1);
+    let dep_row = graph
+        .visible_rows
+        .iter()
+        .position(|r| matches!(&r.kind, RowKind::Port { origin } if origin == "devel/shared"))
+        .expect("dependency port should be visible");
+    assert!(!graph.visible_rows[dep_row].is_expanded);
+}
+
+#[test]
+fn test_recenter_positions_cursor_middle_top_and_bottom() {
+    // 40-row list, cursor on row 20, 10 visible rows
+    assert_eq!(
+        recenter_offset(20, 10, 40, RecenterPosition::Middle),
+        15,
+        "middle should leave half a screen above the cursor"
+    );
+    assert_eq!(recenter_offset(20, 10, 40, RecenterPosition::Top), 20);
+    assert_eq!(recenter_offset(20, 10, 40, RecenterPosition::Bottom), 11);
+}
+
+#[test]
+fn test_recenter_cycle_follows_emacs_order() {
+    // Emacs recenter-top-bottom: middle -> top -> bottom -> middle
+    let mut pos = RecenterPosition::Middle;
+    pos = pos.next();
+    assert_eq!(pos, RecenterPosition::Top);
+    pos = pos.next();
+    assert_eq!(pos, RecenterPosition::Bottom);
+    pos = pos.next();
+    assert_eq!(pos, RecenterPosition::Middle);
+}
+
+#[test]
+fn test_recenter_clamps_near_the_edges_of_the_list() {
+    // Cannot scroll above the first row
+    for pos in [
+        RecenterPosition::Middle,
+        RecenterPosition::Top,
+        RecenterPosition::Bottom,
+    ] {
+        assert_eq!(recenter_offset(0, 10, 40, pos), 0);
+    }
+    assert_eq!(recenter_offset(2, 10, 40, RecenterPosition::Middle), 0);
+
+    // Near the end, the offset never runs past the final row
+    assert_eq!(recenter_offset(39, 10, 40, RecenterPosition::Top), 39);
+    assert_eq!(recenter_offset(39, 10, 40, RecenterPosition::Bottom), 30);
+
+    // Degenerate viewports do not panic
+    assert_eq!(recenter_offset(5, 0, 40, RecenterPosition::Middle), 5);
+    assert_eq!(recenter_offset(5, 1, 40, RecenterPosition::Bottom), 5);
+    assert_eq!(recenter_offset(5, 1, 40, RecenterPosition::Middle), 5);
 }
 
 #[test]
