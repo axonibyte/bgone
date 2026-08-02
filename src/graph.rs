@@ -2,7 +2,7 @@ use crate::describe::{load_cached, PortDetails};
 use crate::reader::SystemOptions;
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Row a `Shift + Down` should land on: the next sibling of `from`, or — when
 /// `from` is the last child of its parent — the following "uncle", i.e. the next
@@ -277,6 +277,10 @@ pub struct DependencyGraph {
     /// Port origin -> `PKGNAME`-ish label ("nginx-1.24.0"), for the header the
     /// ports framework writes into an options file. Only ever informational.
     pub pkg_names: HashMap<String, String>,
+    /// Named sets of ports whose option choices are kept in step. Comes from the
+    /// config file and is written back to it; members not in the current list
+    /// are carried along untouched.
+    pub groups: BTreeMap<String, Vec<String>>,
 
     pub global_mode: Mode,
     pub last_global_seq: u64,
@@ -382,6 +386,7 @@ impl DependencyGraph {
             live: Vec::new(),
             visible_rows: Vec::new(),
             pkg_names: HashMap::new(),
+            groups: BTreeMap::new(),
             global_mode: Mode::None,
             last_global_seq: 0,
             current_seq: 0,
@@ -886,37 +891,21 @@ impl DependencyGraph {
     pub fn toggle_option(&mut self, row_index: usize) {
         if let Some(row) = self.visible_rows.get(row_index) {
             if let NodeId::Option(id) = row.node_id {
-                let (parent_port, origin, name, group_type, group_name, current_enabled) = {
+                let (origin, name, group_type, current_enabled) = {
                     let opt = &self.option_nodes[id];
                     (
-                        opt.parent_port,
                         opt.port_origin.clone(),
                         opt.name.clone(),
                         opt.group_type.clone(),
-                        opt.group_name.clone(),
                         opt.enabled,
                     )
                 };
 
+                // Radios only ever turn on; the rest of the group turns off in
+                // response. Pressing one that is already on does nothing.
                 let is_radio = group_type == "SINGLE" || group_type == "RADIO";
-
-                if is_radio {
-                    // Radios only turn on; the rest of the group turns off.
-                    if !current_enabled {
-                        let sibling_ids = self.ports[parent_port].options.clone();
-                        let updates: Vec<(String, String, bool)> = sibling_ids
-                            .iter()
-                            .map(|&opt_id| &self.option_nodes[opt_id])
-                            .filter(|s| s.group_type == group_type && s.group_name == group_name)
-                            .map(|s| (s.port_origin.clone(), s.name.clone(), s.id == id))
-                            .collect();
-
-                        for (origin, name, enabled) in updates {
-                            self.set_option_state(&origin, &name, enabled);
-                        }
-                    }
-                } else {
-                    self.set_option_state(&origin, &name, !current_enabled);
+                if !(is_radio && current_enabled) {
+                    self.apply_choice(&origin, &name, !current_enabled || is_radio);
                 }
             }
         }
@@ -925,6 +914,75 @@ impl DependencyGraph {
         self.rebuild_visible_rows();
     }
 
+    /// Records a choice the user made, on the port they made it on and on every
+    /// port grouped with it.
+    ///
+    /// Groups exist because families like `lang/php8*-extensions` are meant to
+    /// be configured alike and drift apart when maintained by hand, so a choice
+    /// made on one member is a choice made on all of them. A member that has no
+    /// option by that name is left alone rather than guessed at.
+    pub fn apply_choice(&mut self, origin: &str, name: &str, enabled: bool) {
+        let mut targets = vec![origin.to_string()];
+        for members in self.groups.values() {
+            if members.iter().any(|m| m == origin) {
+                for member in members {
+                    if !targets.contains(member) {
+                        targets.push(member.clone());
+                    }
+                }
+            }
+        }
+
+        for target in targets {
+            // Members outside the current list keep whatever they had; the group
+            // still names them, and they will follow along when next loaded.
+            if let Some(port_id) = self.port_index(&target) {
+                self.set_choice_on(port_id, name, enabled);
+            }
+        }
+    }
+
+    /// Applies a choice to one port, resolved against *that* port's own option
+    /// set — its radio grouping may differ from the port the choice came from.
+    fn set_choice_on(&mut self, port_id: usize, name: &str, enabled: bool) {
+        let Some(opt_id) = self.ports[port_id]
+            .options
+            .iter()
+            .copied()
+            .find(|&id| self.option_nodes[id].name == name)
+        else {
+            return;
+        };
+
+        let (group_type, group_name) = {
+            let opt = &self.option_nodes[opt_id];
+            (opt.group_type.clone(), opt.group_name.clone())
+        };
+
+        if group_type == "SINGLE" || group_type == "RADIO" {
+            if !enabled {
+                return;
+            }
+            let siblings: Vec<usize> = self.ports[port_id]
+                .options
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let s = &self.option_nodes[id];
+                    s.group_type == group_type && s.group_name == group_name
+                })
+                .collect();
+            for id in siblings {
+                self.option_nodes[id].enabled = id == opt_id;
+            }
+        } else {
+            self.option_nodes[opt_id].enabled = enabled;
+        }
+    }
+
+    /// Sets one option directly, without radio handling and without reaching
+    /// any group. [`apply_choice`](Self::apply_choice) is what a user action
+    /// goes through; this is the primitive underneath it.
     pub fn set_option_state(&mut self, port_origin: &str, option_name: &str, enabled: bool) {
         for opt in &mut self.option_nodes {
             if opt.port_origin == port_origin && opt.name == option_name {

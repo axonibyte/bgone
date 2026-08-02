@@ -1770,3 +1770,301 @@ fn test_ignore_missing_flag_still_bails_if_zero_total_ports_match() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("No matching ports found for pattern(s)"));
 }
+
+// ============================================================================
+// 10. GROUPS (option choices kept in step across a family of ports)
+// ============================================================================
+
+/// A database where three ports share an option name, one of them also has a
+/// radio group, and one lacks the shared option entirely.
+fn group_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+        "www/unrelated",
+    ] {
+        let name = origin.split('/').nth(1).unwrap();
+        conn.execute(
+            "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
+            rusqlite::params![origin, name],
+        )
+        .unwrap();
+    }
+
+    let mut add = |origin: &str, opt: &str, default: i32, gt: &str, gn: &str| {
+        conn.execute(
+            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
+             VALUES (?1, ?2, ?3, '', ?4, ?5)",
+            rusqlite::params![origin, opt, default, gt, gn],
+        )
+        .unwrap();
+    };
+
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+    ] {
+        add(origin, "SOAP", 0, "DEFINE", "");
+    }
+    // Only php83 has this one, so the others must be left alone
+    add("lang/php83-extensions", "ONLY_ON_83", 0, "DEFINE", "");
+
+    // A radio group php83 and php84 both have, but php84 has an extra member
+    for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
+        add(origin, "MYSQL", 1, "SINGLE", "DB");
+        add(origin, "PGSQL", 0, "SINGLE", "DB");
+    }
+    add("lang/php84-extensions", "SQLITE", 0, "SINGLE", "DB");
+
+    add("www/unrelated", "SOAP", 0, "DEFINE", "");
+    conn
+}
+
+fn load_grouped(conn: &Connection, groups: &[(&str, &[&str])]) -> DependencyGraph {
+    let targets: Vec<String> = vec![
+        "lang/php83-extensions".to_string(),
+        "lang/php84-extensions".to_string(),
+        "lang/php85-extensions".to_string(),
+        "www/unrelated".to_string(),
+    ];
+    let mut graph =
+        DependencyGraph::load_from_db(conn, &targets, &SystemOptions::default(), false).unwrap();
+    for (name, members) in groups {
+        graph.groups.insert(
+            name.to_string(),
+            members.iter().map(|m| m.to_string()).collect(),
+        );
+    }
+    graph.expand_all();
+    graph
+}
+
+fn enabled_of(graph: &DependencyGraph, origin: &str, opt: &str) -> Option<bool> {
+    graph
+        .option_nodes
+        .iter()
+        .find(|o| o.port_origin == origin && o.name == opt)
+        .map(|o| o.enabled)
+}
+
+/// The whole point: setting an option on one member sets it on the rest.
+#[test]
+fn test_toggling_a_member_sets_the_option_across_the_group() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[(
+            "php-extensions",
+            &[
+                "lang/php83-extensions",
+                "lang/php84-extensions",
+                "lang/php85-extensions",
+            ],
+        )],
+    );
+
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+    ] {
+        assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(false));
+    }
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "SOAP");
+    graph.toggle_option(row);
+
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+    ] {
+        assert_eq!(
+            enabled_of(&graph, origin, "SOAP"),
+            Some(true),
+            "{origin} did not follow"
+        );
+    }
+
+    // A port outside the group is untouched
+    assert_eq!(enabled_of(&graph, "www/unrelated", "SOAP"), Some(false));
+
+    // ...and turning it back off propagates too
+    let row = find_option_row(&graph, "lang/php84-extensions", "SOAP");
+    graph.toggle_option(row);
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+    ] {
+        assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(false));
+    }
+}
+
+/// Members do not have identical option sets, and an option only one of them
+/// defines must not be invented on the others.
+#[test]
+fn test_an_option_only_one_member_has_stays_there() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[(
+            "php-extensions",
+            &["lang/php83-extensions", "lang/php84-extensions"],
+        )],
+    );
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "ONLY_ON_83");
+    graph.toggle_option(row);
+
+    assert_eq!(
+        enabled_of(&graph, "lang/php83-extensions", "ONLY_ON_83"),
+        Some(true)
+    );
+    assert_eq!(
+        enabled_of(&graph, "lang/php84-extensions", "ONLY_ON_83"),
+        None,
+        "the option must not be conjured onto a member that lacks it"
+    );
+}
+
+/// A radio pick has to resolve against each member's own siblings, which are not
+/// necessarily the same set as the port the choice was made on.
+#[test]
+fn test_a_radio_pick_resolves_against_each_members_own_siblings() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[(
+            "php-extensions",
+            &["lang/php83-extensions", "lang/php84-extensions"],
+        )],
+    );
+
+    // MYSQL is the default on both; php84 additionally offers SQLITE
+    assert_eq!(
+        enabled_of(&graph, "lang/php84-extensions", "MYSQL"),
+        Some(true)
+    );
+    assert_eq!(
+        enabled_of(&graph, "lang/php84-extensions", "SQLITE"),
+        Some(false)
+    );
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "PGSQL");
+    graph.toggle_option(row);
+
+    for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
+        assert_eq!(enabled_of(&graph, origin, "PGSQL"), Some(true), "{origin}");
+        assert_eq!(
+            enabled_of(&graph, origin, "MYSQL"),
+            Some(false),
+            "{origin} kept two radio members on"
+        );
+    }
+    assert_eq!(
+        enabled_of(&graph, "lang/php84-extensions", "SQLITE"),
+        Some(false),
+        "php84's extra radio member must be off as well"
+    );
+}
+
+/// Pressing Space on a radio that is already selected does nothing, in a group
+/// exactly as outside one.
+#[test]
+fn test_reselecting_a_radio_changes_nothing() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[(
+            "php-extensions",
+            &["lang/php83-extensions", "lang/php84-extensions"],
+        )],
+    );
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "MYSQL");
+    graph.toggle_option(row);
+
+    for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
+        assert_eq!(enabled_of(&graph, origin, "MYSQL"), Some(true));
+        assert_eq!(enabled_of(&graph, origin, "PGSQL"), Some(false));
+    }
+    assert!(!graph.is_dirty(), "nothing actually changed");
+}
+
+/// A port can belong to more than one group, and a choice reaches the union.
+#[test]
+fn test_a_port_in_two_groups_reaches_both() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[
+            ("a", &["lang/php83-extensions", "lang/php84-extensions"]),
+            ("b", &["lang/php83-extensions", "lang/php85-extensions"]),
+        ],
+    );
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "SOAP");
+    graph.toggle_option(row);
+
+    for origin in [
+        "lang/php83-extensions",
+        "lang/php84-extensions",
+        "lang/php85-extensions",
+    ] {
+        assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(true), "{origin}");
+    }
+}
+
+/// A group naming a port that is not in the current list is not an error; the
+/// membership simply waits for it.
+#[test]
+fn test_a_member_outside_the_current_list_is_skipped() {
+    let conn = group_db();
+    let mut graph = load_grouped(
+        &conn,
+        &[(
+            "php-extensions",
+            &[
+                "lang/php83-extensions",
+                "lang/php84-extensions",
+                "lang/php99-nonexistent",
+            ],
+        )],
+    );
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "SOAP");
+    graph.toggle_option(row);
+
+    assert_eq!(
+        enabled_of(&graph, "lang/php84-extensions", "SOAP"),
+        Some(true)
+    );
+    assert!(graph.port_index("lang/php99-nonexistent").is_none());
+    // ...and the group still names it, ready for a run that includes it
+    assert!(graph.groups["php-extensions"].contains(&"lang/php99-nonexistent".to_string()));
+}
+
+/// With no groups configured, toggling behaves exactly as it did before groups
+/// existed.
+#[test]
+fn test_without_groups_a_toggle_touches_only_its_own_port() {
+    let conn = group_db();
+    let mut graph = load_grouped(&conn, &[]);
+
+    let row = find_option_row(&graph, "lang/php83-extensions", "SOAP");
+    graph.toggle_option(row);
+
+    assert_eq!(
+        enabled_of(&graph, "lang/php83-extensions", "SOAP"),
+        Some(true)
+    );
+    for origin in ["lang/php84-extensions", "lang/php85-extensions"] {
+        assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(false), "{origin}");
+    }
+}

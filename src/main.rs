@@ -1,14 +1,10 @@
-mod cli;
-mod db;
-mod describe;
-mod exporter;
-mod graph;
-mod indexer;
-mod reader;
-mod ui;
+// The modules live in the library crate; the binary is a thin front end over
+// it. Declaring them here as well would compile everything twice and report
+// anything only the tests use as dead code.
+use bgone::{cli, db, describe, exporter, graph, indexer, reader, ui};
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use cli::{Cli, Commands};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -56,7 +52,7 @@ fn describe_working_set(conn: &mut Connection, dep_graph: &graph::DependencyGrap
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let (cli, config) = cli::parse_with_config()?;
     let mut conn = Connection::open(&cli.db_path)?;
 
     let force_reset =
@@ -124,8 +120,11 @@ fn main() -> Result<()> {
                     describe_working_set(&mut conn, &dep_graph);
                     dep_graph = load(&conn);
                 }
+                if let Some(config) = &config {
+                    dep_graph.groups = config.groups.clone();
+                }
 
-                let action = ui::run_tui(&mut dep_graph)?;
+                let action = ui::run_tui(&mut dep_graph, cli.config.clone())?;
 
                 match action {
                     ui::TuiAction::SaveAndQuit => {

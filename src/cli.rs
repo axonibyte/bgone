@@ -1,5 +1,7 @@
+use crate::config::Config;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,21 @@ KEYBINDINGS:
    / or Ctrl + F      Filter rows by name, description or group
                       (Enter keeps the filter, Esc clears it)
 
+ GROUPS
+   Ports in a group keep their option choices in step: setting an option on
+   one member sets it on every member that has one by that name. That is what
+   stops a family like lang/php8*-extensions drifting apart.
+
+   Ctrl + G           Add the port under the cursor to a group, or start a new
+                      one. Works from an option row too, acting on the port
+                      that row belongs to.
+   Ctrl + G  twice    Manage groups and membership, and save them to the config
+                      file. A terminal cannot tell Ctrl + Shift + G from
+                      Ctrl + G, so scope escalates by repetition here as well.
+
+   Groups are stored in the --config file and are only remembered once saved.
+   Saving with no --config given asks where to put one.
+
  BUTTONS AND EXITING
    Tab / Shift + Tab  Move the highlight between the list and the
                       < OK > and < Cancel > buttons along the bottom
@@ -66,6 +83,15 @@ KEYBINDINGS:
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    /// Read settings from a TOML config file.
+    ///
+    /// Anything the file sets overrides the built-in default; anything given
+    /// explicitly on the command line overrides the file. Settings the file
+    /// leaves out are simply unspecified. There is no default config file, and
+    /// none is looked for unless this is given.
+    #[arg(long, value_name = "FILE", global = true)]
+    pub config: Option<PathBuf>,
 
     /// Path to the SQLite cache database
     #[arg(short = 'd', long, default_value = "bgone_cache.db", global = true)]
@@ -123,7 +149,101 @@ pub enum Commands {
     },
 }
 
+/// Parses the command line, then lets a `--config` file fill in anything that
+/// was not given explicitly.
+///
+/// Parsed through `ArgMatches` rather than `Cli::parse()` because the whole
+/// precedence rule turns on telling a value that was *passed* from one that was
+/// *defaulted*, and only the matches carry that. Returns the resolved arguments
+/// and the config itself, which the caller still needs for its groups.
+pub fn parse_with_config() -> Result<(Cli, Option<Config>)> {
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
+
+    let config = match &cli.config {
+        Some(path) => Some(Config::load(path)?),
+        None => None,
+    };
+
+    if let Some(config) = &config {
+        cli.apply_config(&matches, config);
+    }
+
+    Ok((cli, config))
+}
+
+/// Resolves an argument list against an already-loaded config.
+///
+/// The same resolution [`parse_with_config`] performs, minus reading the file
+/// and minus the exit-on-`--help` behaviour of `get_matches`, so precedence can
+/// be exercised directly.
+pub fn resolve_from<I, T>(args: I, config: Option<&Config>) -> Result<Cli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Cli::command().try_get_matches_from(args)?;
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    if let Some(config) = config {
+        cli.apply_config(&matches, config);
+    }
+    Ok(cli)
+}
+
+/// True when `id` was given on the command line rather than left to its default.
+///
+/// `ArgAction::SetTrue` gives a flag an implicit default, so an unpassed flag
+/// reports `DefaultValue` rather than nothing — which is what lets flags and
+/// valued arguments share this one test.
+fn was_passed(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
 impl Cli {
+    /// Applies `config` to every argument the command line did not set.
+    fn apply_config(&mut self, matches: &ArgMatches, config: &Config) {
+        // Each argument resolves on its own, so a config supplying `file` and a
+        // command line supplying origins leaves both in play — `collect_targets`
+        // merges them afterwards exactly as it always has.
+        macro_rules! fill {
+            ($field:ident, $id:literal) => {
+                if !was_passed(matches, $id) {
+                    if let Some(value) = config.$field.clone() {
+                        self.$field = value;
+                    }
+                }
+            };
+            (opt $field:ident, $id:literal) => {
+                if !was_passed(matches, $id) {
+                    if let Some(value) = config.$field.clone() {
+                        self.$field = Some(value);
+                    }
+                }
+            };
+        }
+
+        fill!(db_path, "db_path");
+        fill!(options_dir, "options_dir");
+        fill!(opt make_conf, "make_conf");
+        fill!(opt file, "file");
+        fill!(origins, "origins");
+        fill!(dry_run, "dry_run");
+        fill!(no_describe, "no_describe");
+        fill!(force_reset, "force_reset");
+        fill!(ignore_missing, "ignore_missing");
+
+        // `ports_dir` belongs to the subcommand, so its source lives there too
+        if let (Some(Commands::Index { ports_dir, .. }), Some(sub)) =
+            (self.command.as_mut(), matches.subcommand_matches("index"))
+        {
+            if !was_passed(sub, "ports_dir") {
+                if let Some(value) = config.ports_dir.clone() {
+                    *ports_dir = value;
+                }
+            }
+        }
+    }
+
     /// Collects every requested target, merging positional origins with the
     /// contents of `--file` (if one was supplied).
     pub fn collect_targets(&self) -> Result<Vec<String>> {

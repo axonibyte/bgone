@@ -177,6 +177,8 @@ Arguments:
   [ORIGIN]...  Target port origin(s) or glob pattern(s) (e.g. www/apache24 "www/py-*")
 
 Options:
+      --config <FILE>       Read settings from a TOML config file
+      --no-describe         Skip asking the ports tree about the targeted ports
   -d, --db-path <PATH>      Path to SQLite cache DB [default: bgone_cache.db]
   -o, --options-dir <PATH>  Directory to read/write FreeBSD option files [default: /var/db/ports]
   -m, --make-conf <PATH>    Optional path to read/export global make.conf overrides
@@ -234,6 +236,60 @@ Colour carries **provenance**:
 | yellow | Something else pulled it in |
 | yellow, in `required by` | That parent needs this port only because an option is on |
 
+### Configuration file
+
+`--config` points at a TOML file holding anything you would otherwise type. There
+is no default config and none is looked for; without the flag `bgone` behaves
+exactly as it did before config files existed.
+
+```toml
+# Where poudriere reads options from for the HEAD tree
+options_dir = "/usr/local/etc/poudriere.d/HEAD-options"
+file        = "/usr/local/etc/poudriere.d/port-list"
+ports_dir   = "/usr/local/etc/poudriere.d/ports/HEAD"
+ignore_missing = true
+
+[groups]
+php-extensions = ["lang/php83-extensions", "lang/php84-extensions"]
+```
+
+Keys mirror the long option names with dashes turned into underscores, so
+`--options-dir` is `options_dir`. `ports_dir` belongs to `bgone index` but is
+written at the top level like the rest.
+
+Precedence runs **defaults → config → arguments you actually typed**. A setting
+the file leaves out is simply unspecified; the file is a delta over the defaults,
+never a full description of a run, and omitting something is never itself an
+error. A key that is *misspelled*, on the other hand, is refused by name — a
+setting that silently does nothing is much harder to notice than a failure at
+startup.
+
+### Groups
+
+A group is a set of ports whose option choices are kept in step. Families like
+`lang/php8*-extensions` are meant to be configured alike and drift apart when
+maintained one at a time; setting an option on any member of a group sets it on
+every member that has an option by that name.
+
+| Key | Action |
+| --- | --- |
+| **`Ctrl + G`** | Add the port under the cursor to a group, or start a new one |
+| **`Ctrl + G`** twice | Manage groups and membership; save them to the config |
+
+A member with no option by that name is left alone rather than guessed at, and a
+radio choice is resolved against each member's *own* group of alternatives, which
+need not match the port the choice was made on. A group may name a port that is
+not in the current list — it is skipped for now and kept for a run that includes
+it.
+
+Groups live in the `[groups]` table of the config and are only remembered once
+saved. Saving with no `--config` given asks where to put one. A save rewrites
+only that table, so comments and settings you put in the file by hand survive it.
+
+> `Ctrl + Shift + G` is deliberately not used. A terminal sends byte `0x07` for
+> both it and `Ctrl + G`, so the Shift cannot be recovered — the same reason
+> `+`/`_` escalate by repetition rather than by a modifier.
+
 ### Using `bgone` with `poudriere`
 
 `poudriere` keeps port options under `${POUDRIERE_ETC}/poudriere.d/`, in a directory whose
@@ -283,6 +339,8 @@ did not mean to keep it.
 | **`++`** / **`__`** | Open / close the whole list (press the key twice) |
 | **`Enter`** (on a relationship row) | Jump to that port's entry in the list |
 | **`Backspace`** | Retrace the last jump |
+| **`Ctrl + G`** | Add the port under the cursor to a group |
+| **`Ctrl + G`** twice | Manage groups and membership; save them to the config |
 | **`Tab`** / **`Shift + Tab`** | Move focus between the list and the `OK` / `Cancel` buttons |
 | **`Left` / `Right`** | Move between buttons while the button row has focus |
 | **`Enter`** (elsewhere) | Press the focused button (`OK` while the list has focus) |
