@@ -2,6 +2,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Strips the assignment operator following a variable name, leaving the
+/// whitespace-separated values. Returns `None` when what follows the name is
+/// not an assignment, so that `OPTIONS_SET_FORCE=...` is not mistaken for
+/// `OPTIONS_SET`.
+fn assignment_values(rest: &str) -> Option<&str> {
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    if !trimmed.starts_with(['=', '+', ':', '?']) {
+        return None;
+    }
+    Some(trimmed.trim_start_matches(['=', '+', ':', '?', ' ', '\t']))
+}
+
 #[derive(Debug, Default)]
 pub struct SystemOptions {
     /// Port origin (e.g. "www/apache24") -> (option_name -> enabled)
@@ -22,15 +34,16 @@ impl SystemOptions {
                     if line.starts_with('#') || line.is_empty() {
                         continue;
                     }
-                    if let Some(rest) = line.strip_prefix("OPTIONS_SET") {
-                        let clean = rest
-                            .trim_start_matches(|c| c == '+' || c == ':' || c == '=' || c == ' ');
+                    if let Some(clean) =
+                        line.strip_prefix("OPTIONS_SET").and_then(assignment_values)
+                    {
                         for opt in clean.split_whitespace() {
                             sys_opts.global_overrides.insert(opt.to_string(), true);
                         }
-                    } else if let Some(rest) = line.strip_prefix("OPTIONS_UNSET") {
-                        let clean = rest
-                            .trim_start_matches(|c| c == '+' || c == ':' || c == '=' || c == ' ');
+                    } else if let Some(clean) = line
+                        .strip_prefix("OPTIONS_UNSET")
+                        .and_then(assignment_values)
+                    {
                         for opt in clean.split_whitespace() {
                             sys_opts.global_overrides.insert(opt.to_string(), false);
                         }
@@ -65,7 +78,27 @@ impl SystemOptions {
                         if line.starts_with('#') || line.is_empty() {
                             continue;
                         }
-                        if let Some(opt) = line
+                        // The format `make config` and poudriere write. Values
+                        // are one-per-line in practice, but `OPTIONS_FILE_SET+=
+                        // FOO BAR` is equally valid make, so split on whitespace.
+                        if let Some(clean) = line
+                            .strip_prefix("OPTIONS_FILE_SET")
+                            .and_then(assignment_values)
+                        {
+                            for opt in clean.split_whitespace() {
+                                map.insert(opt.to_string(), true);
+                            }
+                        } else if let Some(clean) = line
+                            .strip_prefix("OPTIONS_FILE_UNSET")
+                            .and_then(assignment_values)
+                        {
+                            for opt in clean.split_whitespace() {
+                                map.insert(opt.to_string(), false);
+                            }
+                        // Files written by bgone before it emitted the format
+                        // above. The ports framework never honoured these, but
+                        // they still record what the user picked.
+                        } else if let Some(opt) = line
                             .strip_prefix("WITH_")
                             .and_then(|s| s.strip_suffix("=true"))
                         {

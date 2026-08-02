@@ -16,11 +16,22 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use bgone::cli::{parse_ports_file, parse_ports_list, Cli, Commands};
+use bgone::cli::{parse_ports_file, parse_ports_list, resolve_from, Cli, Commands};
+use bgone::config::{save_groups, Config, Groups};
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(std::iter::once("bgone").chain(args.iter().copied()))
         .unwrap_or_else(|e| panic!("failed to parse {:?}: {e}", args))
+}
+
+/// Resolves an argument list against a config parsed from TOML.
+fn resolve(args: &[&str], toml: &str) -> Cli {
+    let config = Config::parse(toml).unwrap_or_else(|e| panic!("bad test config: {e}"));
+    resolve_from(
+        std::iter::once("bgone").chain(args.iter().copied()),
+        Some(&config),
+    )
+    .unwrap_or_else(|e| panic!("failed to resolve {args:?}: {e}"))
 }
 
 fn run(args: &[&str]) -> Output {
@@ -104,7 +115,18 @@ fn test_short_switches_parse() {
 #[test]
 fn test_long_switches_parse_identically_to_short() {
     let short = parse(&[
-        "-d", "a.db", "-o", "b", "-m", "c", "-n", "-r", "-i", "-f", "d", "www/nginx",
+        "-d",
+        "a.db",
+        "-o",
+        "b",
+        "-m",
+        "c",
+        "-n",
+        "-r",
+        "-i",
+        "-f",
+        "d",
+        "www/nginx",
     ]);
     let long = parse(&[
         "--db-path",
@@ -256,6 +278,36 @@ fn test_ports_list_ignores_fully_commented_and_blank_content() {
 // 4. BINARY BEHAVIOUR (non-interactive paths only)
 // ============================================================================
 
+/// Every key the footer advertises must be explained by `--help`.
+///
+/// The other direction is checked by hand below; this one is checked
+/// mechanically because the footer is a single line that is easy to edit
+/// without remembering that the help text exists.
+#[test]
+fn test_every_key_on_the_footer_is_explained_in_help() {
+    let help = stdout_of(&run(&["--help"]));
+
+    for hint in bgone::ui::FOOTER_ACTION_KEYS
+        .lines()
+        .flat_map(|row| row.split('|'))
+    {
+        let key = hint.split_whitespace().next().unwrap_or_default();
+        // How the footer's shorthand is spelled out in the help text
+        let spelled = match key {
+            "^S" => "Ctrl + S",
+            "^L" => "Ctrl + L",
+            "^R" => "Ctrl + R",
+            "^G" => "Ctrl + G",
+            "Bksp" => "Backspace",
+            other => other,
+        };
+        assert!(
+            help.contains(spelled),
+            "footer advertises {key:?} but --help never explains {spelled:?}"
+        );
+    }
+}
+
 #[test]
 fn test_help_documents_every_switch() {
     let out = run(&["--help"]);
@@ -290,6 +342,7 @@ fn test_help_documents_every_switch() {
         "+  /  _",
         "++ /  __",
         "o  /  c",
+        "Backspace",
     ] {
         assert!(help.contains(binding), "`--help` is missing {binding}");
     }
@@ -298,11 +351,20 @@ fn test_help_documents_every_switch() {
     for explanation in [
         "Just the row under the cursor",
         "That row and everything nested inside it",
-        "The whole tree",
+        "The whole list",
     ] {
         assert!(
             help.contains(explanation),
             "`--help` lists the expansion keys without explaining {explanation:?}"
+        );
+    }
+
+    // Relationships are references rather than nesting, so the keys that follow
+    // them have to be discoverable from --help
+    for explanation in ["jump to that port's own entry", "Go back the way you came"] {
+        assert!(
+            help.contains(explanation),
+            "`--help` does not explain how to follow a relationship: {explanation:?}"
         );
     }
 
@@ -436,12 +498,7 @@ fn test_missing_ports_file_exits_with_an_error() {
     let db = temp.join("cache.db");
     let missing = temp.join("nope.txt");
 
-    let out = run(&[
-        "-d",
-        db.to_str().unwrap(),
-        "-f",
-        missing.to_str().unwrap(),
-    ]);
+    let out = run(&["-d", db.to_str().unwrap(), "-f", missing.to_str().unwrap()]);
 
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr_of(&out).contains("Error reading ports file"));
@@ -468,4 +525,221 @@ fn port_count(db: &Path) -> i64 {
     let conn = Connection::open(db).unwrap();
     conn.query_row("SELECT COUNT(*) FROM ports", [], |r| r.get(0))
         .unwrap()
+}
+
+// ============================================================================
+// 5. CONFIG FILE (delta over defaults, under explicit arguments)
+// ============================================================================
+
+/// The three-way rule: a default applies when nothing else speaks, the config
+/// beats the default, and an explicitly-passed argument beats the config.
+#[test]
+fn test_config_sits_between_defaults_and_explicit_arguments() {
+    // Nothing set anywhere: the built-in default stands
+    assert_eq!(resolve(&[], "").options_dir, PathBuf::from("/var/db/ports"));
+
+    // Config speaks, the command line does not
+    assert_eq!(
+        resolve(&[], r#"options_dir = "/from/config""#).options_dir,
+        PathBuf::from("/from/config")
+    );
+
+    // Both speak: the command line wins
+    assert_eq!(
+        resolve(&["-o", "/from/cli"], r#"options_dir = "/from/config""#).options_dir,
+        PathBuf::from("/from/cli")
+    );
+}
+
+/// Flags go through the same rule. They only work because `ArgAction::SetTrue`
+/// gives them an implicit default, so an unpassed flag is distinguishable from
+/// one passed as false.
+#[test]
+fn test_a_boolean_flag_follows_the_same_precedence() {
+    assert!(!resolve(&[], "").ignore_missing, "default is off");
+    assert!(resolve(&[], "ignore_missing = true").ignore_missing);
+    assert!(
+        resolve(&["-i"], "ignore_missing = false").ignore_missing,
+        "passing the flag beats a config that turns it off"
+    );
+}
+
+/// A config is a delta: whatever it omits keeps whatever it would otherwise
+/// have had, and omission is never itself an error.
+#[test]
+fn test_a_partial_config_leaves_everything_else_alone() {
+    let cli = resolve(&[], r#"ignore_missing = true"#);
+
+    assert!(cli.ignore_missing);
+    assert_eq!(cli.options_dir, PathBuf::from("/var/db/ports"));
+    assert_eq!(cli.db_path, PathBuf::from("bgone_cache.db"));
+    assert!(cli.make_conf.is_none());
+    assert!(cli.file.is_none());
+    assert!(!cli.dry_run);
+    assert!(!cli.no_describe);
+    assert!(cli.origins.is_empty());
+
+    // ...and an entirely empty config changes nothing at all
+    assert_eq!(resolve(&[], "").options_dir, resolve(&[], "").options_dir);
+}
+
+/// `origins` and `--file` are separate arguments, so a config supplying one and
+/// a command line supplying the other leaves both in play.
+#[test]
+fn test_config_origins_and_command_line_file_both_apply() {
+    let cli = resolve(&["-f", "/cli/list"], r#"origins = ["www/nginx"]"#);
+    assert_eq!(cli.origins, vec!["www/nginx"]);
+    assert_eq!(cli.file, Some(PathBuf::from("/cli/list")));
+
+    // Explicit origins replace the config's rather than appending to them
+    let cli = resolve(&["www/apache24"], r#"origins = ["www/nginx"]"#);
+    assert_eq!(cli.origins, vec!["www/apache24"]);
+}
+
+/// `ports_dir` belongs to the subcommand, so its precedence has to be resolved
+/// against the subcommand's own matches.
+#[test]
+fn test_config_reaches_the_index_subcommands_ports_dir() {
+    let from_config = resolve(&["index"], r#"ports_dir = "/from/config""#);
+    match from_config.command {
+        Some(Commands::Index { ports_dir, .. }) => {
+            assert_eq!(ports_dir, PathBuf::from("/from/config"))
+        }
+        _ => panic!("expected the index subcommand"),
+    }
+
+    let explicit = resolve(
+        &["index", "--ports-dir", "/from/cli"],
+        r#"ports_dir = "/from/config""#,
+    );
+    match explicit.command {
+        Some(Commands::Index { ports_dir, .. }) => {
+            assert_eq!(ports_dir, PathBuf::from("/from/cli"))
+        }
+        _ => panic!("expected the index subcommand"),
+    }
+}
+
+/// A misspelled key does nothing, which is much harder to notice than a
+/// failure, so it is refused and the message names both the key and the
+/// alternatives.
+#[test]
+fn test_an_unknown_config_key_is_refused_by_name() {
+    let err = Config::parse(r#"options_dirr = "/typo""#)
+        .expect_err("an unknown key must not be accepted")
+        .to_string();
+    assert!(err.contains("options_dirr"), "message was: {err}");
+    assert!(err.contains("options_dir"), "message was: {err}");
+}
+
+/// Naming a config that is not there is a mistake worth reporting rather than a
+/// silent fall back to defaults.
+#[test]
+fn test_a_missing_config_file_is_an_error() {
+    let out = run(&["--config", "/nonexistent/bgone.toml", "www/nginx"]);
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("Could not read config file"), "stderr: {err}");
+}
+
+// ============================================================================
+// 6. CONFIG WRITE-BACK (a file a person maintains)
+// ============================================================================
+
+fn groups_of(pairs: &[(&str, &[&str])]) -> Groups {
+    pairs
+        .iter()
+        .map(|(name, members)| {
+            (
+                name.to_string(),
+                members.iter().map(|m| m.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Saving a group must not cost the user their comments, their key order, or
+/// any setting unrelated to groups.
+#[test]
+fn test_saving_groups_leaves_the_rest_of_the_file_alone() {
+    let temp = TempDir::new("config_save");
+    let path = temp.path.join("bgone.toml");
+
+    let original = "\
+# Where poudriere reads options from for the HEAD tree
+options_dir = \"/usr/local/etc/poudriere.d/HEAD-options\"
+
+# The list I actually build
+file = \"/usr/local/etc/poudriere.d/port-list\"
+ignore_missing = true
+";
+    std::fs::write(&path, original).unwrap();
+
+    save_groups(
+        &path,
+        &groups_of(&[(
+            "php-extensions",
+            &["lang/php83-extensions", "lang/php84-extensions"],
+        )]),
+    )
+    .unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("# Where poudriere reads options from for the HEAD tree"),
+        "comments were lost:\n{written}"
+    );
+    assert!(written.contains("# The list I actually build"));
+    assert!(written.contains(r#"options_dir = "/usr/local/etc/poudriere.d/HEAD-options""#));
+    assert!(written.contains("ignore_missing = true"));
+    assert!(written.contains("[groups]"));
+
+    // ...and it still loads, with everything intact
+    let reloaded = Config::parse(&written).unwrap();
+    assert_eq!(reloaded.ignore_missing, Some(true));
+    assert_eq!(
+        reloaded.groups["php-extensions"],
+        vec!["lang/php83-extensions", "lang/php84-extensions"]
+    );
+}
+
+/// Saving when there is no config yet creates one holding just the groups.
+#[test]
+fn test_saving_groups_creates_a_config_from_nothing() {
+    let temp = TempDir::new("config_create");
+    let path = temp.path.join("new.toml");
+
+    save_groups(&path, &groups_of(&[("db", &["databases/redis"])])).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    let reloaded = Config::parse(&written).unwrap();
+    assert_eq!(reloaded.groups["db"], vec!["databases/redis"]);
+    assert!(reloaded.options_dir.is_none(), "nothing else invented");
+}
+
+/// Re-saving replaces the groups rather than accumulating them, and dropping the
+/// last group takes the table with it.
+#[test]
+fn test_saving_replaces_the_groups_table() {
+    let temp = TempDir::new("config_replace");
+    let path = temp.path.join("bgone.toml");
+
+    save_groups(
+        &path,
+        &groups_of(&[("a", &["www/one"]), ("b", &["www/two"])]),
+    )
+    .unwrap();
+    save_groups(&path, &groups_of(&[("a", &["www/one", "www/three"])])).unwrap();
+
+    let reloaded = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(reloaded.groups.len(), 1, "the dropped group must be gone");
+    assert_eq!(reloaded.groups["a"], vec!["www/one", "www/three"]);
+
+    save_groups(&path, &Groups::new()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !written.contains("[groups]"),
+        "an empty table should not linger:\n{written}"
+    );
+    assert!(Config::parse(&written).unwrap().groups.is_empty());
 }
