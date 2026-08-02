@@ -403,17 +403,17 @@ RUN_DEPENDS=  ${LOCALBASE}/bin/nowhere:devel/nonexistent
 // missing one that does is what keeps `config-conditional` re-prompting.
 // ============================================================================
 
-/// A slave port keeps its options in the master's Makefile, so the sweep, which
-/// reads only the port's own directory, finds none of them.
+/// A slave port keeps its options in the master's Makefile, and the sweep now
+/// follows `MASTERDIR` to find them.
 ///
-/// Measured against the tree: 1,127 ports set `MASTERDIR`, and 1,043 of them
-/// (93%) come out of indexing with no options at all. `describe-json` supplies
-/// the names and defaults for whichever of them get targeted. What it cannot
-/// supply is descriptions or `SINGLE`/`MULTI`/`RADIO` grouping, so a slave port
-/// is configured as a flat list even where its master has a radio group — the
-/// degradation this test exists to make explicit rather than incidental.
+/// Measured against the tree, 1,128 ports set `MASTERDIR` and 1,043 of them used
+/// to index with no options at all. `describe-json` covered the names and
+/// defaults for whichever got targeted, but carries neither descriptions nor
+/// `SINGLE`/`MULTI`/`RADIO` grouping, so those ports were configured as flat
+/// lists of undescribed checkboxes even where the master defines a radio group.
+/// Following the pointer is what recovers the presentation.
 #[test]
-fn test_a_slave_port_inherits_no_options_from_its_master() {
+fn test_a_slave_port_inherits_its_masters_options() {
     let temp = TempDir::new("slave_port");
     let ports_root = temp.path.join("ports");
 
@@ -469,23 +469,49 @@ MASTERDIR=      ${.CURDIR}/../postfixadmin33
         vec!["DOCS", "FPM", "MYSQL", "PGSQL"],
         "the master's own options are found normally"
     );
-    assert!(
-        options_of("mail/postfixadmin33-lite").is_empty(),
-        "the sweep does not follow MASTERDIR, so the slave has nothing"
+    assert_eq!(
+        options_of("mail/postfixadmin33-lite"),
+        vec!["DOCS", "FPM", "MYSQL", "PGSQL"],
+        "the slave inherits the master's option list through MASTERDIR"
     );
 
-    // The slave is still indexed as a port; only its options are missing, which
-    // is what makes the omission silent rather than obvious.
-    let indexed: i64 = conn
+    // ---- the part describe-json could never have supplied ----
+    let described = |origin: &str, name: &str| -> (String, String, String) {
+        conn.query_row(
+            "SELECT description, group_type, group_name FROM options
+             WHERE port_origin = ?1 AND option_name = ?2",
+            rusqlite::params![origin, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        described("mail/postfixadmin33-lite", "MYSQL"),
+        (
+            "MySQL backend".to_string(),
+            "SINGLE".to_string(),
+            "DB".to_string()
+        ),
+        "the radio group survives the inheritance, not just the option name"
+    );
+    assert_eq!(
+        described("mail/postfixadmin33-lite", "FPM").0,
+        "Use PHP-FPM"
+    );
+
+    // The slave keeps its own identity rather than adopting the master's
+    let (name, version): (String, String) = conn
         .query_row(
-            "SELECT COUNT(*) FROM ports WHERE origin = 'mail/postfixadmin33-lite'",
+            "SELECT name, version FROM ports WHERE origin = 'mail/postfixadmin33-lite'",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(indexed, 1);
+    assert_eq!(name, "postfixadmin");
+    assert_eq!(version, "3.3.13");
 
-    // ---- what describe-json then rescues, and what it does not ----
+    // ---- describe-json still has the last word on which options exist ----
     cache_details(
         &conn,
         "mail/postfixadmin33-lite",
@@ -510,21 +536,320 @@ MASTERDIR=      ${.CURDIR}/../postfixadmin33
             .unwrap_or_else(|| panic!("{name} missing after the merge"))
     };
 
-    // Rescued: every option exists, with the tree's defaults
     assert_eq!(graph.option_nodes.len(), 4);
     assert!(opt("DOCS").enabled);
     assert!(opt("MYSQL").enabled);
     assert!(!opt("FPM").enabled);
     assert!(!opt("PGSQL").enabled);
 
-    // Not rescued: describe-json carries neither of these, and the index had
-    // nothing to match them against. MYSQL/PGSQL are a radio group in the
-    // master and are presented here as two independent checkboxes.
-    assert_eq!(opt("MYSQL").description, "");
-    assert_eq!(opt("PGSQL").description, "");
-    assert_eq!(opt("MYSQL").group_type, "DEFINE");
-    assert_eq!(opt("PGSQL").group_type, "DEFINE");
-    assert_eq!(opt("MYSQL").group_name, "");
+    // The merge now finds an indexed row to match against, so the presentation
+    // reaches the dialog instead of being dropped on the floor.
+    assert_eq!(opt("MYSQL").description, "MySQL backend");
+    assert_eq!(opt("MYSQL").group_type, "SINGLE");
+    assert_eq!(opt("MYSQL").group_name, "DB");
+    assert_eq!(opt("PGSQL").description, "PostgreSQL backend");
+}
+
+/// The other two `MASTERDIR` shapes, and a chain of them.
+///
+/// `:H` is bmake's head modifier — a `dirname` — so each one climbs a level
+/// before the rest of the path is appended. In a current tree the three shapes
+/// are `${.CURDIR}` (1024 ports), `${.CURDIR:H:H}` (96) and `${.CURDIR:H}` (8).
+/// Ten ports have a master that is itself a slave, so one hop is not enough.
+#[test]
+fn test_every_masterdir_shape_resolves_and_chains_are_followed() {
+    let temp = TempDir::new("masterdir_shapes");
+    let ports_root = temp.path.join("ports");
+
+    let write = |rel: &str, body: &str| {
+        let dir = ports_root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Makefile"), body).unwrap();
+    };
+
+    write(
+        "multimedia/base",
+        "PORTNAME=base\nPORTVERSION=1.0\nCOMMENT=c\nOPTIONS_DEFINE=ROOT\nROOT_DESC=From the root\n",
+    );
+    // ${.CURDIR:H:H} climbs to the tree root, then names a category
+    write(
+        "audio/viaroot",
+        "MASTERDIR=${.CURDIR:H:H}/multimedia/base\n.include \"${MASTERDIR}/Makefile\"\n",
+    );
+    // ${.CURDIR:H} climbs to the category
+    write(
+        "multimedia/viacategory",
+        "MASTERDIR=${.CURDIR:H}/base\n.include \"${MASTERDIR}/Makefile\"\n",
+    );
+    // A slave whose master is itself a slave
+    write(
+        "multimedia/chained",
+        "MASTERDIR=${.CURDIR}/../viacategory\n.include \"${MASTERDIR}/Makefile\"\n",
+    );
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    for origin in [
+        "audio/viaroot",
+        "multimedia/viacategory",
+        "multimedia/chained",
+    ] {
+        let opts: Vec<String> = conn
+            .prepare("SELECT option_name FROM options WHERE port_origin = ?1")
+            .unwrap()
+            .query_map([origin], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(opts, vec!["ROOT"], "{origin} did not reach the master");
+    }
+}
+
+/// A `MASTERDIR` that cannot be resolved leaves the port as it was, rather than
+/// attributing some other port's options to it.
+///
+/// Reading the wrong directory would be worse than the missing options this
+/// exists to fix: the options file would name options the port does not define
+/// and omit ones it does, which is exactly what makes poudriere re-prompt.
+#[test]
+fn test_an_unresolvable_masterdir_is_refused_rather_than_guessed() {
+    let temp = TempDir::new("masterdir_guards");
+    let ports_root = temp.path.join("ports");
+
+    let write = |rel: &str, body: &str| {
+        let dir = ports_root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Makefile"), body).unwrap();
+    };
+
+    // Something to be wrongly picked up, and something outside the tree
+    write(
+        "www/decoy",
+        "PORTNAME=decoy\nPORTVERSION=1.0\nCOMMENT=c\nOPTIONS_DEFINE=DECOY\n",
+    );
+    fs::create_dir_all(temp.path.join("outside")).unwrap();
+    fs::write(
+        temp.path.join("outside").join("Makefile"),
+        "PORTNAME=outside\nOPTIONS_DEFINE=ESCAPED\n",
+    )
+    .unwrap();
+
+    write("www/nosuch", "MASTERDIR=${.CURDIR}/../gone\n");
+    write("www/escapes", "MASTERDIR=${.CURDIR:H:H}/outside\n");
+    write("www/weirdmod", "MASTERDIR=${.CURDIR:T}/../decoy\n");
+    write("www/notacurdir", "MASTERDIR=/etc\n");
+    write("www/selfref", "MASTERDIR=${.CURDIR}\nOPTIONS_DEFINE=OWN\n");
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let opts = |origin: &str| -> Vec<String> {
+        conn.prepare("SELECT option_name FROM options WHERE port_origin = ?1")
+            .unwrap()
+            .query_map([origin], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    for origin in [
+        "www/nosuch",     // target does not exist
+        "www/escapes",    // resolves outside the ports tree
+        "www/weirdmod",   // a modifier other than :H
+        "www/notacurdir", // not written against ${.CURDIR} at all
+    ] {
+        assert!(
+            opts(origin).is_empty(),
+            "{origin} should have picked up nothing"
+        );
+    }
+
+    // A port pointing at itself keeps its own options and does not loop
+    assert_eq!(opts("www/selfref"), vec!["OWN"]);
+}
+
+/// Options reached through a quoted `.include` are followed, and the include is
+/// resolved against the file that wrote it rather than against the port.
+///
+/// `mail/exim` keeps its whole option list in a file called `options` and pulls
+/// it in with `.include "options"`. Its six slaves reach that file only through
+/// two hops: `MASTERDIR` to exim, then exim's own relative include — which
+/// resolves against exim's directory, not the slave's. Getting that base
+/// directory wrong is the whole difficulty, and this is what pins it.
+#[test]
+fn test_options_reached_through_an_include_are_followed() {
+    let temp = TempDir::new("include_limit");
+    let ports_root = temp.path.join("ports");
+
+    let master = ports_root.join("mail").join("exim");
+    fs::create_dir_all(&master).unwrap();
+    fs::write(
+        master.join("Makefile"),
+        "PORTNAME=exim\nPORTVERSION=4.99.5\nCOMMENT=MTA\nOPTIONS_DEFINE=INLINE\n.include \"options\"\n",
+    )
+    .unwrap();
+    // Not named Makefile*, so it is never read
+    fs::write(
+        master.join("options"),
+        "OPTIONS_DEFINE+=\tLDAP MYSQL\nLDAP_DESC=\tLDAP lookups\n",
+    )
+    .unwrap();
+
+    let slave = ports_root.join("mail").join("exim-ldap2");
+    fs::create_dir_all(&slave).unwrap();
+    fs::write(
+        slave.join("Makefile"),
+        "PKGNAMESUFFIX=-ldap2\nMASTERDIR=${.CURDIR}/../exim\n.include \"${MASTERDIR}/Makefile\"\n",
+    )
+    .unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let opts = |origin: &str| -> Vec<String> {
+        conn.prepare("SELECT option_name FROM options WHERE port_origin = ?1 ORDER BY option_name")
+            .unwrap()
+            .query_map([origin], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert_eq!(opts("mail/exim"), vec!["INLINE", "LDAP", "MYSQL"]);
+    assert_eq!(
+        opts("mail/exim-ldap2"),
+        vec!["INLINE", "LDAP", "MYSQL"],
+        "the slave reaches the master's include through two hops"
+    );
+
+    // The description in the included file rides along with the option
+    let desc: String = conn
+        .query_row(
+            "SELECT description FROM options
+             WHERE port_origin = 'mail/exim-ldap2' AND option_name = 'LDAP'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(desc, "LDAP lookups");
+}
+
+/// The include shapes that occur in a real tree, and the ones that are refused.
+///
+/// Excluding `${MASTERDIR}`, which [`fold_masters`] already handles: 730 use a
+/// `${.CURDIR}`-rooted path, 138 a bare name or relative path resolved against
+/// the including file, and 26 `${PORTSDIR}`. Fifteen name a variable this parse
+/// cannot know and are refused rather than guessed at.
+#[test]
+fn test_include_shapes_resolve_and_unknown_ones_are_refused() {
+    let temp = TempDir::new("include_shapes");
+    let ports_root = temp.path.join("ports");
+
+    let write = |rel: &str, file: &str, body: &str| {
+        let dir = ports_root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), body).unwrap();
+    };
+
+    write("shared/frag", "opts.mk", "OPTIONS_DEFINE+=SHARED\n");
+    write("www/p1", "Makefile", "PORTNAME=p1\nPORTVERSION=1\nCOMMENT=c\nOPTIONS_DEFINE=OWN\n.include \"${.CURDIR}/../../shared/frag/opts.mk\"\n");
+    write("www/p2", "local.mk", "OPTIONS_DEFINE+=LOCAL\n");
+    write(
+        "www/p2",
+        "Makefile",
+        "PORTNAME=p2\nPORTVERSION=1\nCOMMENT=c\n.include \"local.mk\"\n",
+    );
+    write(
+        "www/p3",
+        "Makefile",
+        "PORTNAME=p3\nPORTVERSION=1\nCOMMENT=c\n.include \"../../shared/frag/opts.mk\"\n",
+    );
+    write(
+        "www/p4",
+        "Makefile",
+        "PORTNAME=p4\nPORTVERSION=1\nCOMMENT=c\n.include \"${PORTSDIR}/shared/frag/opts.mk\"\n",
+    );
+
+    // Refused: a variable this parse cannot resolve, and the framework's own
+    // angle-bracket includes, which live outside the tree entirely.
+    write(
+        "www/r1",
+        "Makefile",
+        "PORTNAME=r1\nPORTVERSION=1\nCOMMENT=c\n.include \"${USESDIR}/opts.mk\"\n",
+    );
+    write(
+        "www/r2",
+        "Makefile",
+        "PORTNAME=r2\nPORTVERSION=1\nCOMMENT=c\n.include <bsd.port.mk>\n",
+    );
+    write(
+        "www/r3",
+        "Makefile",
+        "PORTNAME=r3\nPORTVERSION=1\nCOMMENT=c\n.include \"../../../outside.mk\"\n",
+    );
+    fs::write(temp.path.join("outside.mk"), "OPTIONS_DEFINE+=ESCAPED\n").unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let opts = |origin: &str| -> Vec<String> {
+        conn.prepare("SELECT option_name FROM options WHERE port_origin = ?1 ORDER BY option_name")
+            .unwrap()
+            .query_map([origin], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert_eq!(opts("www/p1"), vec!["OWN", "SHARED"], "CURDIR-rooted");
+    assert_eq!(
+        opts("www/p2"),
+        vec!["LOCAL"],
+        "bare file beside the Makefile"
+    );
+    assert_eq!(opts("www/p3"), vec!["SHARED"], "relative path");
+    assert_eq!(opts("www/p4"), vec!["SHARED"], "PORTSDIR-rooted");
+
+    for origin in ["www/r1", "www/r2", "www/r3"] {
+        assert!(opts(origin).is_empty(), "{origin} should have read nothing");
+    }
+}
+
+/// Two files including each other terminate, and neither is read twice.
+#[test]
+fn test_a_cycle_of_includes_terminates() {
+    let temp = TempDir::new("include_cycle");
+    let ports_root = temp.path.join("ports");
+    let dir = ports_root.join("www").join("loop");
+    fs::create_dir_all(&dir).unwrap();
+
+    fs::write(
+        dir.join("Makefile"),
+        "PORTNAME=loop\nPORTVERSION=1\nCOMMENT=c\n.include \"a.mk\"\n",
+    )
+    .unwrap();
+    fs::write(dir.join("a.mk"), "OPTIONS_DEFINE+=AAA\n.include \"b.mk\"\n").unwrap();
+    fs::write(dir.join("b.mk"), "OPTIONS_DEFINE+=BBB\n.include \"a.mk\"\n").unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let opts: Vec<String> = conn
+        .prepare(
+            "SELECT option_name FROM options WHERE port_origin = 'www/loop' ORDER BY option_name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(opts, vec!["AAA", "BBB"]);
 }
 
 /// Conditionals are not evaluated, so an option defined in either branch of an

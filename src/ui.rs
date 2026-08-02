@@ -21,7 +21,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::collections::BTreeMap;
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 
 /// The action keys shown along the bottom of the screen, one row per line.
@@ -1565,6 +1565,13 @@ pub fn run_tui(graph: &mut DependencyGraph, config_path: Option<PathBuf>) -> Res
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // The alternate screen keeps whatever was last on it, and the first draw
+    // only paints cells that differ from ratatui's own buffer — which starts
+    // empty, so anything already on screen matches "empty" and is left alone.
+    // Without this the previous contents show through until something forces a
+    // full repaint, which is why starting up used to need a manual Ctrl + L.
+    terminal.clear()?;
+
     let mut app = App::new(config_path);
     let action;
 
@@ -1588,6 +1595,16 @@ pub fn run_tui(graph: &mut DependencyGraph, config_path: Option<PathBuf>) -> Res
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Leaving the alternate screen drops the cursor back where the shell left
+    // it, which is part-way along a line if the last thing printed there did
+    // not end in one. Whatever comes next — this program's own output, or the
+    // prompt — then starts mid-line and reads as though the terminal is still
+    // waiting for input. One newline, flushed before anything else is written,
+    // is what makes exiting land cleanly.
+    let mut out = std::io::stdout();
+    writeln!(out)?;
+    out.flush()?;
 
     Ok(action)
 }

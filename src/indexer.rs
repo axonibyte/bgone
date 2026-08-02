@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -113,30 +113,320 @@ fn is_valid_option_name(opt: &str) -> bool {
         && opt.chars().any(|ch| ch.is_ascii_uppercase())
 }
 
-fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
-    let mut makefile_paths = Vec::new();
-    if let Ok(files) = fs::read_dir(port_path) {
+/// Collects every variable assignment in a preprocessed Makefile.
+///
+/// Assignment operators are honoured rather than everything being treated as
+/// `+=`. A port that sets the same variable under several conditionals — a
+/// `PKGNAMESUFFIX` per flavour, say — would otherwise accumulate every branch at
+/// once, and expansions using it come out as nonsense like
+/// `subversion-lts-lts-lts-lts-lts`.
+///
+/// Only one branch of a conditional is ever really taken; reading the file
+/// linearly, last-one-wins is the closest approximation available without
+/// evaluating the Makefile.
+fn collect_vars(content: &str) -> HashMap<String, String> {
+    let Ok(re_var_assign) = Regex::new(r"(?m)^\s*([A-Za-z0-9_]+)\s*([:\+\?]?)=\s*(.+)$") else {
+        return HashMap::new();
+    };
+
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for cap in re_var_assign.captures_iter(content) {
+        if let (Some(k), Some(op), Some(v)) = (cap.get(1), cap.get(2), cap.get(3)) {
+            let key = k.as_str().trim().to_string();
+            let val = v.as_str().trim().to_string();
+
+            match op.as_str() {
+                "+" => vars
+                    .entry(key)
+                    .and_modify(|e| {
+                        e.push(' ');
+                        e.push_str(&val);
+                    })
+                    .or_insert(val),
+                // `?=` only applies when the variable has no value yet
+                "?" => vars.entry(key).or_insert(val),
+                _ => {
+                    vars.insert(key.clone(), val);
+                    vars.get_mut(&key).expect("just inserted")
+                }
+            };
+        }
+    }
+    vars
+}
+
+/// Reads every `Makefile*` in one directory, in name order, into one string.
+fn read_makefiles(dir: &Path) -> Option<String> {
+    let mut paths = Vec::new();
+    if let Ok(files) = fs::read_dir(dir) {
         for file in files.flatten() {
             let name = file.file_name().to_string_lossy().to_string();
             if name == "Makefile" || name.starts_with("Makefile.") {
-                makefile_paths.push(file.path());
+                paths.push(file.path());
             }
         }
     }
 
-    if makefile_paths.is_empty() {
+    if paths.is_empty() {
         return None;
     }
+    paths.sort();
 
-    makefile_paths.sort();
-
-    let mut raw_content = String::new();
-    for path in makefile_paths {
+    let mut raw = String::new();
+    for path in paths {
         if let Ok(c) = fs::read_to_string(&path) {
-            raw_content.push_str(&c);
-            raw_content.push('\n');
+            raw.push_str(&c);
+            raw.push('\n');
         }
     }
+    Some(raw)
+}
+
+/// Resolves a `MASTERDIR` value to the directory it names.
+///
+/// Every one of the 1,128 ports in a current tree that sets `MASTERDIR` writes
+/// it against `${.CURDIR}`, in one of three shapes:
+///
+/// ```text
+/// ${.CURDIR}/../nginx                 1024
+/// ${.CURDIR:H:H}/multimedia/mplayer     96
+/// ${.CURDIR:H}/postfixadmin33            8
+/// ```
+///
+/// `:H` is bmake's "head" modifier — a `dirname` — so each one climbs a level
+/// before the rest of the path is appended. Anything else is refused rather
+/// than guessed at; a wrong directory would attribute one port's options to
+/// another, which is worse than the missing options this exists to fix.
+///
+/// The result must be a directory inside `tree_root` and must not be the port
+/// itself, so a malformed or hostile value cannot walk out of the ports tree.
+fn resolve_masterdir(value: &str, port_path: &Path, tree_root: &Path) -> Option<PathBuf> {
+    let rest = value.trim();
+    let inner = rest.strip_prefix("${.CURDIR")?;
+    let (modifiers, tail) = inner.split_once('}')?;
+
+    let mut base = port_path.to_path_buf();
+    let mut remaining = modifiers;
+    while let Some(next) = remaining.strip_prefix(":H") {
+        base = base.parent()?.to_path_buf();
+        remaining = next;
+    }
+    if !remaining.is_empty() {
+        return None; // a modifier other than :H — refuse rather than guess
+    }
+
+    let joined = base.join(tail.trim_start_matches('/'));
+    // Canonicalised on both sides: comparing a resolved path against an
+    // unresolved one would let a symlinked tree defeat both guards below.
+    let resolved = fs::canonicalize(joined).ok()?;
+    let root = fs::canonicalize(tree_root).ok()?;
+    let here = fs::canonicalize(port_path).ok()?;
+
+    if !resolved.is_dir() || !resolved.starts_with(&root) || resolved == here {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// A chunk of Makefile text, paired with the directory it was read from.
+///
+/// The directory matters because a relative `.include "options"` resolves
+/// against the file that wrote it — which stops being the port itself once
+/// `MASTERDIR` has folded a master's Makefile into the same parse.
+type Chunk = (String, PathBuf);
+
+fn joined(chunks: &[Chunk]) -> String {
+    chunks
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How far a chain of slave ports is followed.
+///
+/// A master can itself be a slave — 10 ports in a current tree are — so one hop
+/// is not enough. Nothing observed goes beyond two, and the visited set already
+/// makes a cycle terminate; this is only a backstop against a pathological tree.
+const MAX_MASTER_DEPTH: usize = 4;
+
+/// How far a chain of `.include` directives is followed. 49 included files in a
+/// current tree include something themselves; none go deep.
+const MAX_INCLUDE_DEPTH: usize = 4;
+
+/// Folds in the master's Makefiles, and its master's, and so on.
+///
+/// A slave port's own Makefile is little more than `MASTERDIR` and an
+/// `.include`; everything the configurator needs — the option list, the
+/// descriptions, the `SINGLE`/`MULTI`/`RADIO` grouping — lives in the master.
+///
+/// Appended *after* the slave, mirroring the trailing `.include` slaves actually
+/// use, so the last-one-wins rule in the variable pass resolves conflicts the
+/// way bmake would.
+fn fold_masters(chunks: &mut Vec<Chunk>, tree_root: &Path) {
+    let Ok(re_masterdir) = Regex::new(r"(?m)^\s*MASTERDIR\s*[:\+\?]?=\s*(.+)$") else {
+        return;
+    };
+
+    let mut visited: Vec<PathBuf> = chunks.iter().map(|(_, dir)| dir.clone()).collect();
+
+    for _ in 0..MAX_MASTER_DEPTH {
+        // Only the newest chunk is searched, so each round sees the master's own
+        // MASTERDIR rather than re-resolving the one just followed.
+        let Some((text, dir)) = chunks.last().cloned() else {
+            return;
+        };
+        let Some(value) = re_masterdir
+            .captures_iter(&text)
+            .last()
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+        else {
+            return;
+        };
+
+        // 46 ports build the path out of another variable —
+        // `${.CURDIR}/../${PORTNAME}-server`, `${WANT_PGSQL_VER}` — so the value
+        // has to be expanded before it names a directory. `${.CURDIR}` itself
+        // survives untouched, since `expand_vars` only matches names made of
+        // word characters and cannot see a leading dot.
+        let vars = collect_vars(&preprocess_makefile(&joined(chunks)));
+        let expanded = expand_vars(&value, &vars);
+
+        let Some(master) = resolve_masterdir(&expanded, &dir, tree_root) else {
+            return;
+        };
+        if visited.contains(&master) {
+            return;
+        }
+        let Some(master_text) = read_makefiles(&master) else {
+            return;
+        };
+
+        visited.push(master.clone());
+        chunks.push((master_text, master));
+    }
+}
+
+/// Resolves one quoted `.include` value to the file it names.
+///
+/// The shapes that occur, once `${MASTERDIR}` is excluded as already folded:
+/// `${.CURDIR}`-rooted paths with optional `:H` modifiers (730), a bare file
+/// name or relative path resolved against the including file's own directory
+/// (138), and `${PORTSDIR}` (26). Fifteen others name a variable this parse
+/// cannot know — `${USESDIR}`, `${.PARSEDIR}` — and are refused.
+///
+/// Angle-bracket includes are never considered: those are the framework's own
+/// `bsd.port.mk` and friends, which live outside the tree and describe how to
+/// build rather than what to build.
+fn resolve_include(
+    value: &str,
+    from_dir: &Path,
+    port_path: &Path,
+    tree_root: &Path,
+    vars: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let raw = value.trim();
+
+    // Prefixes are matched before expansion: `expand_vars` turns an unknown name
+    // into the empty string, which would silently reduce `${PORTSDIR}/x` to the
+    // absolute `/x` instead of failing.
+    let joined_path = if let Some(inner) = raw.strip_prefix("${.CURDIR") {
+        let (modifiers, tail) = inner.split_once('}')?;
+        let mut base = port_path.to_path_buf();
+        let mut remaining = modifiers;
+        while let Some(next) = remaining.strip_prefix(":H") {
+            base = base.parent()?.to_path_buf();
+            remaining = next;
+        }
+        if !remaining.is_empty() {
+            return None;
+        }
+        base.join(expand_vars(tail.trim_start_matches('/'), vars))
+    } else if let Some(tail) = raw.strip_prefix("${PORTSDIR}") {
+        tree_root.join(expand_vars(tail.trim_start_matches('/'), vars))
+    } else if raw.starts_with('$') || raw.starts_with('/') {
+        // A variable this parse cannot resolve, or an absolute path out of the
+        // tree. Refused rather than guessed at.
+        return None;
+    } else {
+        from_dir.join(expand_vars(raw, vars))
+    };
+
+    let resolved = fs::canonicalize(joined_path).ok()?;
+    let root = fs::canonicalize(tree_root).ok()?;
+    if !resolved.is_file() || !resolved.starts_with(&root) {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Folds in files pulled in by a quoted `.include`.
+///
+/// `mail/exim` keeps its whole option list in a file called `options` and pulls
+/// it in with `.include "options"`; reading only `Makefile*` left it and its six
+/// slaves with nothing. Runs after [`fold_masters`] so a master's own includes
+/// are followed, resolved against the master's directory rather than the slave's.
+fn fold_includes(chunks: &mut Vec<Chunk>, port_path: &Path, tree_root: &Path) {
+    let Ok(re_include) = Regex::new(r#"(?m)^\s*\.\s*include\s+"([^"]+)""#) else {
+        return;
+    };
+    // Most ports include nothing quoted; this keeps them clear of the
+    // preprocess-and-collect below, which is the expensive part.
+    if !chunks.iter().any(|(text, _)| re_include.is_match(text)) {
+        return;
+    }
+
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut frontier: Vec<Chunk> = chunks.clone();
+
+    for _ in 0..MAX_INCLUDE_DEPTH {
+        let vars = collect_vars(&preprocess_makefile(&joined(chunks)));
+        let mut next: Vec<Chunk> = Vec::new();
+
+        for (text, dir) in &frontier {
+            for cap in re_include.captures_iter(text) {
+                let Some(value) = cap.get(1).map(|m| m.as_str()) else {
+                    continue;
+                };
+                // `fold_masters` already brought the master in; following this
+                // as well would parse it twice.
+                if value.contains("MASTERDIR") {
+                    continue;
+                }
+                let Some(path) = resolve_include(value, dir, port_path, tree_root, &vars) else {
+                    continue;
+                };
+                if !visited.insert(path.clone()) {
+                    continue;
+                }
+                let Ok(body) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let base = path.parent().unwrap_or(port_path).to_path_buf();
+                next.push((body, base));
+            }
+        }
+
+        if next.is_empty() {
+            return;
+        }
+        chunks.extend(next.iter().cloned());
+        frontier = next;
+    }
+}
+
+fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
+    let mut chunks: Vec<Chunk> = vec![(read_makefiles(port_path)?, port_path.to_path_buf())];
+
+    // `tree_root` is derived from the origin rather than passed down: an origin
+    // is always `category/port`, so the root is two levels up from the port.
+    if let Some(tree_root) = port_path.parent().and_then(|p| p.parent()) {
+        fold_masters(&mut chunks, tree_root);
+        fold_includes(&mut chunks, port_path, tree_root);
+    }
+
+    let raw_content = joined(&chunks);
 
     let content = preprocess_makefile(&raw_content);
 
@@ -159,42 +449,10 @@ fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
     ))
     .ok()?;
     let re_origin_extract = Regex::new(r"([a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+)").ok()?;
-    let re_var_assign = Regex::new(r"(?m)^\s*([A-Za-z0-9_]+)\s*([:\+\?]?)=\s*(.+)$").ok()?;
 
     let port_folder = port_path.file_name()?.to_str()?;
 
-    // Assignment operators are honoured rather than everything being treated as
-    // `+=`. A port that sets the same variable under several conditionals — a
-    // `PKGNAMESUFFIX` per flavour, say — would otherwise accumulate every branch
-    // at once, and expansions using it come out as nonsense like
-    // `subversion-lts-lts-lts-lts-lts`.
-    //
-    // Only one branch of a conditional is ever really taken; reading the file
-    // linearly, last-one-wins is the closest approximation available without
-    // evaluating the Makefile.
-    let mut vars: HashMap<String, String> = HashMap::new();
-    for cap in re_var_assign.captures_iter(&content) {
-        if let (Some(k), Some(op), Some(v)) = (cap.get(1), cap.get(2), cap.get(3)) {
-            let key = k.as_str().trim().to_string();
-            let val = v.as_str().trim().to_string();
-
-            match op.as_str() {
-                "+" => vars
-                    .entry(key)
-                    .and_modify(|e| {
-                        e.push(' ');
-                        e.push_str(&val);
-                    })
-                    .or_insert(val),
-                // `?=` only applies when the variable has no value yet
-                "?" => vars.entry(key).or_insert(val),
-                _ => {
-                    vars.insert(key.clone(), val);
-                    vars.get_mut(&key).expect("just inserted")
-                }
-            };
-        }
-    }
+    let vars = collect_vars(&content);
 
     let name = re_portname
         .captures(&content)

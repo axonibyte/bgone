@@ -1,7 +1,15 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+/// Bumped whenever an existing cache would be *wrong* or *incomplete*, not only
+/// when the table layout changes.
+///
+/// 7 adds no columns. It exists because the sweep now follows `MASTERDIR`, so a
+/// cache built before it holds no options for 627 slave ports — data that is
+/// structurally valid and silently short. Discarding it is the only signal the
+/// cache has for "rebuild me"; without the bump those ports would keep showing
+/// up empty with nothing to suggest re-indexing.
+const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// Initializes the SQLite database schema.
 /// Drops outdated tables if the schema version on disk is incompatible

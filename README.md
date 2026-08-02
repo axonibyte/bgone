@@ -29,7 +29,7 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * **Option Groups & Radios**: Supports standard checkboxes (`[X]`), mutual-exclusion radio groups (`(*)`), and group categories (`<CATEGORY>`).
 * **Multi-Core Parallel Indexing**: Uses `rayon` to parse Makefile dependencies concurrently across CPU cores into a local SQLite cache (`bgone_cache.db`).
 * **System Option Preloading**: Reads existing configuration files from `/var/db/ports/<category>_<port>/options` and `/etc/make.conf` on startup so previously saved preferences are preserved.
-* **Authoritative Port Details**: For the ports you are actually configuring, `bgone` asks the tree itself via `make describe-json`. It catches the roughly 1% of ports whose options the Makefile sweep cannot see — those inheriting through `MASTERDIR` — which are precisely the ones `poudriere options` would keep prompting for, and supplies the real `PKGNAME` for the file header. Cached until a port's Makefiles change; skip it with `--no-describe`.
+* **Authoritative Port Details**: For the ports you are actually configuring, `bgone` asks the tree itself via `make describe-json`. It catches the ports whose options the Makefile sweep still cannot see — those injected by `Mk/Uses/*.mk`, or built by a `.for` loop — which are precisely the ones `poudriere options` would keep prompting for, and supplies the real `PKGNAME` for the file header. Cached until a port's Makefiles change; skip it with `--no-describe`.
 * **`make config` File Format**: Writes the same `OPTIONS_FILE_SET+=` / `OPTIONS_FILE_UNSET+=` files `make config` and `poudriere options` write, listing every option the port defines — which is what stops `make config-conditional` (and so `poudriere options` and `poudriere bulk`) from re-opening the dialog. Files in the older `WITH_`/`WITHOUT_` format are still read back.
 * **In-TUI Search (`/`)**: Narrows the list to ports whose origin contains what you type — `postgres`, `databases/`, `py-`. Options are not searched, and a matching port is shown whole rather than reduced to the rows that matched. `Up`/`Down` (and `PgUp`/`PgDn`) move through the results while the bar is still open, so you can look before committing; `Enter` keeps the filter and the header reports it, `Esc` clears it. Filtering is a view: a hidden port keeps its options and is still written on save.
 * **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole list preserves view preferences across state updates.
@@ -125,14 +125,26 @@ are exactly the ports that keep re-opening the dialog. It also supplies the real
 `PKGNAME` (`pkgconf-2.4.3_1,1`, `py312-black-26.5.1`), which the sweep gets wrong
 for 88% of ports, though only the file header consumes that.
 
-What the describe pass cannot recover is *presentation*. `describe-json` reports
-which options exist and which are on by default, but carries no descriptions and
-no `SINGLE`/`MULTI`/`RADIO` grouping — those only come from the Makefile sweep,
-matched by name. A slave port therefore configures correctly but reads poorly: on
-a current tree 1,127 ports set `MASTERDIR` and 1,043 of them (93%) index with no
-options at all, so they are presented as a flat list of undescribed checkboxes
-even where the master defines a radio group. The options written are right; only
-the labels and the grouping are missing.
+The sweep follows the two pointers a port uses to keep its options somewhere
+else. `MASTERDIR` gives a slave port its master's option list, chains included —
+ten ports have a master that is itself a slave. A quoted `.include` pulls in a
+fragment such as `mail/exim`'s `options` file, resolved against the file that
+wrote the directive rather than against the port, so a master's own relative
+include is followed correctly on the slave's behalf.
+
+Both matter because they carry the descriptions and `SINGLE`/`MULTI`/`RADIO`
+grouping that `describe-json` cannot supply, reporting as it does only which
+options exist and which are on by default. On a current tree they took the
+number of slave ports indexing with no options at all from 1,043 to 392 — and
+every one of that remainder has a master that genuinely defines none. Total
+options indexed went from 26,829 to 37,901, with no port losing any.
+
+A pointer that cannot be resolved is refused rather than guessed at: the target
+must be inside the ports tree, and a value naming a variable this parse cannot
+know is skipped. Reading the wrong file would attribute one port's options to
+another, which is worse than the missing options this exists to fix. Angle-
+bracket includes are never followed — those are the framework's own
+`bsd.port.mk` and friends, which describe how to build rather than what.
 
 Pass `--no-describe` to skip it. Without a readable tree `bgone` skips the pass
 automatically and says so.
