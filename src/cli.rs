@@ -131,15 +131,6 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Skip asking the ports tree about the targeted ports.
-    ///
-    /// That pass exists to catch the roughly 1% of ports whose options the
-    /// Makefile sweep cannot see, which are the ones poudriere would keep
-    /// prompting for. Skipping it avoids a one-time cost on a cold cache and
-    /// costs nothing else beyond exact package names in the written headers.
-    #[arg(long)]
-    pub no_describe: bool,
-
     /// Discard previous database cache and rebuild schema
     #[arg(short = 'r', long)]
     pub force_reset: bool,
@@ -159,7 +150,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Index a local FreeBSD ports tree directory into SQLite
+    /// Evaluate a local FreeBSD ports tree into SQLite.
+    ///
+    /// Every port is evaluated by make, which is what makes the result exact:
+    /// `.if`, `.for`, MASTERDIR, `.include` and Mk/Uses all resolve because the
+    /// ports framework resolves them. It is the slow part of using bgone, and
+    /// the only part that needs a ports tree — configuring afterwards reads
+    /// nothing but the cache.
     Index {
         /// Path to the ports tree root
         #[arg(short, long, default_value = "/usr/ports")]
@@ -168,6 +165,26 @@ pub enum Commands {
         /// Discard previous database cache before indexing
         #[arg(short, long)]
         force: bool,
+
+        /// Resolve as this architecture rather than the host's.
+        ///
+        /// Which options a port defines can depend on it — `OPTIONS_DEFINE_${ARCH}`,
+        /// `OPTIONS_EXCLUDE_${OPSYS}` — so a cache built on amd64 does not
+        /// necessarily describe an aarch64 jail.
+        #[arg(long, value_name = "ARCH")]
+        jail_arch: Option<String>,
+
+        /// Resolve as this OSVERSION (e.g. 1404000 for FreeBSD 14.4)
+        #[arg(long, value_name = "N")]
+        osversion: Option<String>,
+
+        /// Resolve as this OPSYS (default: the host's)
+        #[arg(long, value_name = "NAME")]
+        opsys: Option<String>,
+
+        /// Resolve as this OSREL (e.g. 14.4)
+        #[arg(long, value_name = "VERSION")]
+        osrel: Option<String>,
     },
 }
 
@@ -250,7 +267,6 @@ impl Cli {
         fill!(opt file, "file");
         fill!(origins, "origins");
         fill!(dry_run, "dry_run");
-        fill!(no_describe, "no_describe");
         fill!(force_reset, "force_reset");
         fill!(ignore_missing, "ignore_missing");
 

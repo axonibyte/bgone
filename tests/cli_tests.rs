@@ -73,7 +73,9 @@ fn test_index_subcommand_defaults() {
     let cli = parse(&["index"]);
 
     match cli.command {
-        Some(Commands::Index { ports_dir, force }) => {
+        Some(Commands::Index {
+            ports_dir, force, ..
+        }) => {
             assert_eq!(ports_dir, PathBuf::from("/usr/ports"));
             assert!(!force);
         }
@@ -175,7 +177,9 @@ fn test_index_subcommand_switches_parse() {
     ] {
         let cli = parse(&args);
         match cli.command {
-            Some(Commands::Index { ports_dir, force }) => {
+            Some(Commands::Index {
+                ports_dir, force, ..
+            }) => {
                 assert_eq!(ports_dir, PathBuf::from("/mnt/ports"), "args: {:?}", args);
                 assert!(force, "args: {:?}", args);
             }
@@ -450,7 +454,7 @@ fn test_index_force_rebuilds_the_cache() {
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute(
-            "INSERT INTO ports (origin, name, version, comment) VALUES ('stale/port', 's', '1', '')",
+            "INSERT INTO ports (origin, pkgbase, pkgname) VALUES ('stale/port', 's', 's-1')",
             [],
         )
         .unwrap();
@@ -576,7 +580,6 @@ fn test_a_partial_config_leaves_everything_else_alone() {
     assert!(cli.make_conf.is_none());
     assert!(cli.file.is_none());
     assert!(!cli.dry_run);
-    assert!(!cli.no_describe);
     assert!(cli.origins.is_empty());
 
     // ...and an entirely empty config changes nothing at all

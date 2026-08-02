@@ -29,7 +29,8 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * **Option Groups & Radios**: Supports standard checkboxes (`[X]`), mutual-exclusion radio groups (`(*)`), and group categories (`<CATEGORY>`).
 * **Multi-Core Parallel Indexing**: Uses `rayon` to parse Makefile dependencies concurrently across CPU cores into a local SQLite cache (`bgone_cache.db`).
 * **System Option Preloading**: Reads existing configuration files from `/var/db/ports/<category>_<port>/options` and `/etc/make.conf` on startup so previously saved preferences are preserved.
-* **Authoritative Port Details**: For the ports you are actually configuring, `bgone` asks the tree itself via `make describe-json`. It catches the ports whose options the Makefile sweep still cannot see — those injected by `Mk/Uses/*.mk`, or built by a `.for` loop — which are precisely the ones `poudriere options` would keep prompting for, and supplies the real `PKGNAME` for the file header. Cached until a port's Makefiles change; skip it with `--no-describe`.
+* **Resolved, not guessed**: every port is evaluated by `make` at index time, so `.if`, `.for`, `MASTERDIR`, `.include` and `Mk/Uses` injection all resolve — because the ports framework resolves them. Dependency targets are foreign keys to real ports, and anything that cannot be resolved is recorded rather than dropped.
+* **Option semantics**: `FOO_IMPLIES` and `FOO_PREVENTS` are enforced as you toggle, the way `bsddialog` does, so you cannot save a combination the framework would override.
 * **`make config` File Format**: Writes the same `OPTIONS_FILE_SET+=` / `OPTIONS_FILE_UNSET+=` files `make config` and `poudriere options` write, listing every option the port defines — which is what stops `make config-conditional` (and so `poudriere options` and `poudriere bulk`) from re-opening the dialog. Files in the older `WITH_`/`WITHOUT_` format are still read back.
 * **In-TUI Search (`/`)**: Narrows the list to ports whose origin contains what you type — `postgres`, `databases/`, `py-`. Options are not searched, and a matching port is shown whole rather than reduced to the rows that matched. `Up`/`Down` (and `PgUp`/`PgDn`) move through the results while the bar is still open, so you can look before committing; `Enter` keeps the filter and the header reports it, `Esc` clears it. Filtering is a view: a hidden port keeps its options and is still written on save.
 * **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole list preserves view preferences across state updates.
@@ -101,57 +102,61 @@ A cache written by an older `bgone` whose schema no longer matches is discarded 
 open, and `bgone` says so. Re-run `bgone index` to rebuild it — nothing else is
 lost, since the cache only ever mirrors the ports tree.
 
-The index sweep is fast because it reads Makefiles with regexes rather than
-evaluating them, which means it cannot see options a port inherits through
-`MASTERDIR`, options injected by `Mk/Uses/*.mk`, or a port's real `PKGNAME`. So
-the first time you configure a given set of ports, `bgone` asks the tree about
-just those ports with `make describe-json` and caches the answers until their
-Makefiles change:
+Indexing evaluates every port with `make`, which is the slow part of using
+`bgone` and the only part that needs a ports tree. Configuring afterwards reads
+nothing but the cache.
+
+That is a deliberate trade. The alternative — reading Makefiles with regexes —
+is far faster but cannot evaluate them, and the gap is not small: a port's
+option list can be built by a `.for` loop, inherited through `MASTERDIR`,
+injected by `Mk/Uses/*.mk`, or vary by architecture. Closing those one at a time
+means reimplementing `bmake`, and a port does not just evaluate its own
+Makefile: it evaluates `bsd.port.mk` (5,593 lines), `bsd.options.mk` and
+`Mk/Uses/*.mk` (19,981 lines across 140 files) — some 38,000 lines defining 702+
+variables, with 214 `!=` assignments that shell out to `sysctl`, `uname` and
+`pkg` while evaluating. So `bgone` asks the ports framework instead of imitating
+it, and pays for the answer once.
+
+One `make` invocation per port yields everything: `PKGNAME`, flavours, the
+complete option list with descriptions and `SINGLE`/`MULTI`/`RADIO` grouping,
+`FOO_IMPLIES`/`FOO_PREVENTS`, and both kinds of dependency with their real class.
+Results are keyed on Makefile mtime, so re-indexing after a tree update
+re-evaluates only what changed:
 
 ```
-[*] Reading details for 1476 ports from the tree...
-[+] 1476 read, 0 already current, 0 unavailable in 21.68s
+[+] Indexed 34954 ports (33112 unchanged), 37901 options and 95324 dependency edges in 41.20s
 ```
 
-Expect tens of seconds on a first run and effectively nothing afterwards. For
-scale, on a current tree `www/nginx` alone reaches 1,476 ports once unconditional
-dependencies are followed, and a seven-entry port list with globs reached 2,540.
+Dependencies are resolved rather than guessed. A depends entry is
+`test:origin[:target]` — `bsd.port.mk` extracts the origin with
+`${_UNIFIED_DEPENDS:C,([^:]*:[^:]*):?.*,\1,}` and so does `bgone`, taking the
+second colon-separated field and its optional `@flavour`. Every stored edge is a
+foreign key to a port row, so an edge pointing at nothing cannot be written; an
+entry that names no port is recorded in `unresolved_dep` with a reason rather
+than dropped, which makes "did anything fail to resolve" a query:
 
-What this buys, measured against a current tree rather than assumed: sampling
-498 ports, the sweep and the tree agreed on the option set 99% of the time, and
-only 2 ports had options the sweep missed entirely — both inheriting through
-`MASTERDIR`, like `security/ossec-hids-agent`. That is a small share, but those
-are exactly the ports that keep re-opening the dialog. It also supplies the real
-`PKGNAME` (`pkgconf-2.4.3_1,1`, `py312-black-26.5.1`), which the sweep gets wrong
-for 88% of ports, though only the file header consumes that.
+```
+sqlite3 bgone_cache.db "SELECT reason, COUNT(*) FROM unresolved_dep GROUP BY reason"
+```
 
-The sweep follows the two pointers a port uses to keep its options somewhere
-else. `MASTERDIR` gives a slave port its master's option list, chains included —
-ten ports have a master that is itself a slave. A quoted `.include` pulls in a
-fragment such as `mail/exim`'s `options` file, resolved against the file that
-wrote the directive rather than against the port, so a master's own relative
-include is followed correctly on the slave's behalf.
+### Matching the jail rather than the host
 
-Both matter because they carry the descriptions and `SINGLE`/`MULTI`/`RADIO`
-grouping that `describe-json` cannot supply, reporting as it does only which
-options exist and which are on by default. On a current tree they took the
-number of slave ports indexing with no options at all from 1,043 to 392 — and
-every one of that remainder has a master that genuinely defines none. Total
-options indexed went from 26,829 to 37,901, with no port losing any.
+Which options a port defines can depend on the architecture
+(`OPTIONS_DEFINE_${ARCH}`, `OPTIONS_EXCLUDE_${OPSYS}`), so a cache built on the
+host does not necessarily describe the jail you are building for. Pass the
+target's identity and the tree is evaluated as that jail:
 
-A pointer that cannot be resolved is refused rather than guessed at: the target
-must be inside the ports tree, and a value naming a variable this parse cannot
-know is skipped. Reading the wrong file would attribute one port's options to
-another, which is worse than the missing options this exists to fix. Angle-
-bracket includes are never followed — those are the framework's own
-`bsd.port.mk` and friends, which describe how to build rather than what.
+```bash
+bgone index -p /usr/ports --jail-arch aarch64 --osversion 1404000 --osrel 14.4
+```
 
-Pass `--no-describe` to skip it. Without a readable tree `bgone` skips the pass
-automatically and says so.
+What the cache was resolved as is recorded in it.
 
-`COMPLETE_OPTIONS_LIST` can vary by architecture (`OPTIONS_DEFINE_${ARCH}`,
-`OPTIONS_EXCLUDE_${OPSYS}`). Details are read on the host, which may differ from
-a cross-architecture poudriere jail.
+The evaluation also runs with `PORT_DBDIR`, `__MAKE_CONF`, `OPTIONS_SET` and
+`OPTIONS_UNSET` neutralised, so what lands in the cache is the port as shipped.
+Your saved options and `make.conf` are read separately and applied on top —
+letting them reach `make` here would bake the indexing host's configuration into
+the cache and then count it twice.
 
 ### 2. Configuring Ports
 
@@ -199,7 +204,6 @@ Arguments:
 
 Options:
       --config <FILE>       Read settings from a TOML config file
-      --no-describe         Skip asking the ports tree about the targeted ports
   -d, --db-path <PATH>      Path to SQLite cache DB [default: bgone_cache.db]
   -o, --options-dir <PATH>  Directory to read/write FreeBSD option files [default: /var/db/ports]
   -m, --make-conf <PATH>    Optional path to read/export global make.conf overrides
@@ -218,9 +222,13 @@ Options:
 Usage: bgone index [OPTIONS]
 
 Options:
-  -p, --ports-dir <PATH>  Path to the ports tree root [default: /usr/ports]
-  -f, --force             Discard previous database cache before indexing
-  -d, --db-path <PATH>    Path to SQLite cache DB [default: bgone_cache.db]
+  -p, --ports-dir <PATH>    Path to the ports tree root [default: /usr/ports]
+  -f, --force               Discard previous database cache before indexing
+      --jail-arch <ARCH>    Resolve as this architecture rather than the host's
+      --osversion <N>       Resolve as this OSVERSION (e.g. 1404000)
+      --opsys <NAME>        Resolve as this OPSYS
+      --osrel <VERSION>     Resolve as this OSREL (e.g. 14.4)
+  -d, --db-path <PATH>      Path to SQLite cache DB [default: bgone_cache.db]
 
 ```
 
@@ -446,7 +454,7 @@ This is a workaround for a real limitation rather than a stylistic choice. Termi
 
 171 tests across three suites: unit tests beside the code they cover, an integration suite, and a command-line suite.
 
-Between them they cover Makefile parsing — including what the regex sweep does with the `.if`, `.for` and `MASTERDIR` constructs it cannot evaluate — SQLite caching, graph building, live reachability, file exporting, shared state across repeated ports, group synchronisation, search filtering, key handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
+Between them they cover dependency-entry resolution against `bsd.port.mk`'s own grammar, turning a `make` reply into rows, SQLite caching, graph building, live reachability, file exporting, shared state across repeated ports, group synchronisation, search filtering, key handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
 
 Tests run inside isolated temporary directories and clean up automatically on completion:
 

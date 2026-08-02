@@ -1326,7 +1326,12 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
 
             // Colour carries provenance: whether you asked for this port
             // or something else dragged it in.
-            if let RowKind::Port { origin, provenance } = &row.kind {
+            if let RowKind::Port {
+                origin,
+                provenance,
+                resolved,
+            } = &row.kind
+            {
                 let prefix = if row.has_children {
                     if row.is_expanded {
                         "[-] "
@@ -1342,10 +1347,20 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
                     Provenance::Dependency => Style::default().fg(Color::Yellow),
                 };
 
-                return ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(format!("{}{}", indent, prefix)),
                     Span::styled(origin.clone(), name_style),
-                ]));
+                ];
+                // Said on the port row as well as inside it, because a port
+                // whose options are unknown looks exactly like one with none
+                // until it is opened — and the row is what you scroll past.
+                if !resolved {
+                    spans.push(Span::styled(
+                        "  [unevaluated]",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                return ListItem::new(Line::from(spans));
             }
 
             // `required by` marks conditional parents so it is clear at
@@ -1636,23 +1651,64 @@ mod tests {
         }
     }
 
+    /// Writes a port with one option, in the shape `bgone index` would.
+    ///
+    /// The cache is normally filled by evaluating ports with make; these tests
+    /// care about key handling, not resolution, so they write the rows directly.
+    fn fixture_option(
+        conn: &Connection,
+        origin: &str,
+        name: &str,
+        default_on: bool,
+        group_type: &str,
+        group_name: &str,
+    ) -> i64 {
+        let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
+        conn.execute(
+            "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
+        )
+        .unwrap();
+        let port_id: i64 = conn
+            .query_row(
+                "SELECT id FROM ports WHERE origin = ?1",
+                rusqlite::params![origin],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO options (port_id, name, description, group_type, group_name, default_on)
+             VALUES (?1, ?2, '', ?3, ?4, ?5)",
+            rusqlite::params![port_id, name, group_type, group_name, default_on as i32],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn fixture_edge(conn: &Connection, from: &str, to: &str, via: Option<i64>) {
+        for origin in [from, to] {
+            let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
+            conn.execute(
+                "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id, polarity)
+             SELECT f.id, t.id, 'RUN', ?3, 'ON' FROM ports f, ports t
+             WHERE f.origin = ?1 AND t.origin = ?2",
+            rusqlite::params![from, to, via],
+        )
+        .unwrap();
+    }
+
     /// Two ports sharing an option, so the list has something to put a cursor on.
     fn test_graph() -> DependencyGraph {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn, true).unwrap();
         for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
-            let name = origin.split('/').nth(1).unwrap();
-            conn.execute(
-                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-                rusqlite::params![origin, name],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-                 VALUES (?1, 'SOAP', 0, '', 'DEFINE', '')",
-                rusqlite::params![origin],
-            )
-            .unwrap();
+            fixture_option(&conn, origin, "SOAP", false, "DEFINE", "");
         }
         let targets = vec![
             "lang/php83-extensions".to_string(),
@@ -1863,19 +1919,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn, true).unwrap();
         for origin in ["www/aaa", "www/zzz"] {
-            let name = origin.split('/').nth(1).unwrap();
-            conn.execute(
-                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-                rusqlite::params![origin, name],
-            )
-            .unwrap();
             for opt in ["ALPHA", "BETA", "GAMMA"] {
-                conn.execute(
-                    "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-                     VALUES (?1, ?2, 0, '', 'DEFINE', '')",
-                    rusqlite::params![origin, opt],
-                )
-                .unwrap();
+                fixture_option(&conn, origin, opt, false, "DEFINE", "");
             }
         }
         let targets = vec!["www/aaa".to_string(), "www/zzz".to_string()];
@@ -2003,29 +2048,11 @@ mod tests {
     fn toggling_leaves_the_cursor_on_the_option_it_toggled() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn, true).unwrap();
-        for origin in ["www/app", "aaa/pulled"] {
-            let name = origin.split('/').nth(1).unwrap();
-            conn.execute(
-                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-                rusqlite::params![origin, name],
-            )
-            .unwrap();
-        }
         // EXTRA is on by default and pulls in aaa/pulled, which sorts *above*
         // www/app — so turning it off shifts every row under www/app upwards.
-        conn.execute(
-            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-             VALUES ('www/app', 'EXTRA', 1, '', 'DEFINE', ''),
-                    ('aaa/pulled', 'DOCS', 1, '', 'DEFINE', '')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO option_deps (port_origin, option_name, dep_origin, dep_type)
-             VALUES ('www/app', 'EXTRA', 'aaa/pulled', 'RUN')",
-            [],
-        )
-        .unwrap();
+        let extra = fixture_option(&conn, "www/app", "EXTRA", true, "DEFINE", "");
+        fixture_option(&conn, "aaa/pulled", "DOCS", true, "DEFINE", "");
+        fixture_edge(&conn, "www/app", "aaa/pulled", Some(extra));
 
         let mut graph = DependencyGraph::load_from_db(
             &conn,
@@ -2733,25 +2760,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn, true).unwrap();
         for origin in ["www/app", "devel/lib"] {
-            let name = origin.split('/').nth(1).unwrap();
-            conn.execute(
-                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-                rusqlite::params![origin, name],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-                 VALUES (?1, 'DOCS', 1, '', 'DEFINE', '')",
-                rusqlite::params![origin],
-            )
-            .unwrap();
+            fixture_option(&conn, origin, "DOCS", true, "DEFINE", "");
         }
-        conn.execute(
-            "INSERT INTO port_deps (port_origin, dep_origin, dep_type)
-             VALUES ('www/app', 'devel/lib', 'LIB')",
-            [],
-        )
-        .unwrap();
+        fixture_edge(&conn, "www/app", "devel/lib", None);
         let mut graph = DependencyGraph::load_from_db(
             &conn,
             &["www/app".to_string()],

@@ -54,3 +54,160 @@ pub fn write_mock_ports_tree(temp: &TempDir) -> PathBuf {
     .unwrap();
     ports_root
 }
+
+// ---------------------------------------------------------------- cache fixtures
+//
+// The cache is written by `bgone index`, which evaluates every port with make.
+// Tests that only care about the graph should not have to run make, so these
+// write the same rows directly. They are the only place that knows the schema's
+// shape, so a schema change lands here rather than in forty call sites.
+
+use rusqlite::Connection;
+
+/// Inserts a port and returns its id.
+pub fn add_port(conn: &Connection, origin: &str) -> i64 {
+    let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
+    conn.execute(
+        "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved)
+         VALUES (?1, ?2, ?3, 1)",
+        rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
+    )
+    .unwrap();
+    port_id(conn, origin)
+}
+
+pub fn port_id(conn: &Connection, origin: &str) -> i64 {
+    conn.query_row(
+        "SELECT id FROM ports WHERE origin = ?1",
+        rusqlite::params![origin],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| panic!("no port row for {origin}"))
+}
+
+/// Inserts an option on a port, creating the port if needed. Returns its id.
+#[allow(clippy::too_many_arguments)]
+pub fn add_option(
+    conn: &Connection,
+    origin: &str,
+    name: &str,
+    default_on: bool,
+    description: &str,
+    group_type: &str,
+    group_name: &str,
+) -> i64 {
+    let pid = add_port(conn, origin);
+    conn.execute(
+        "INSERT OR REPLACE INTO options
+         (port_id, name, description, group_type, group_name, default_on)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            pid,
+            name,
+            description,
+            group_type,
+            group_name,
+            default_on as i32
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+pub fn option_id(conn: &Connection, origin: &str, name: &str) -> i64 {
+    conn.query_row(
+        "SELECT o.id FROM options o JOIN ports p ON p.id = o.port_id
+         WHERE p.origin = ?1 AND o.name = ?2",
+        rusqlite::params![origin, name],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| panic!("no option {name} on {origin}"))
+}
+
+/// An edge that applies only when `opt` on `from` is set.
+pub fn add_option_dep(conn: &Connection, from: &str, opt: &str, to: &str) {
+    add_option_dep_with(conn, from, opt, to, "RUN", "ON");
+}
+
+pub fn add_option_dep_with(
+    conn: &Connection,
+    from: &str,
+    opt: &str,
+    to: &str,
+    class: &str,
+    polarity: &str,
+) {
+    let from_id = add_port(conn, from);
+    let to_id = add_port(conn, to);
+    let opt_id = conn
+        .query_row(
+            "SELECT o.id FROM options o WHERE o.port_id = ?1 AND o.name = ?2",
+            rusqlite::params![from_id, opt],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|_| add_option(conn, from, opt, true, "", "DEFINE", ""));
+
+    conn.execute(
+        "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id, polarity)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![from_id, to_id, class, opt_id, polarity],
+    )
+    .unwrap();
+}
+
+/// An edge that applies whatever the options say.
+pub fn add_port_dep(conn: &Connection, from: &str, to: &str) {
+    add_port_dep_with(conn, from, to, "LIB");
+}
+
+pub fn add_port_dep_with(conn: &Connection, from: &str, to: &str, class: &str) {
+    let from_id = add_port(conn, from);
+    let to_id = add_port(conn, to);
+    conn.execute(
+        "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id)
+         VALUES (?1, ?2, ?3, NULL)",
+        rusqlite::params![from_id, to_id, class],
+    )
+    .unwrap();
+}
+
+pub fn add_implies(conn: &Connection, origin: &str, opt: &str, implies: &str) {
+    let id = option_id(conn, origin, opt);
+    conn.execute(
+        "INSERT OR REPLACE INTO option_implies (option_id, implies_name) VALUES (?1, ?2)",
+        rusqlite::params![id, implies],
+    )
+    .unwrap();
+}
+
+pub fn add_prevents(conn: &Connection, origin: &str, opt: &str, prevents: &str) {
+    let id = option_id(conn, origin, opt);
+    conn.execute(
+        "INSERT OR REPLACE INTO option_prevents (option_id, prevents_name) VALUES (?1, ?2)",
+        rusqlite::params![id, prevents],
+    )
+    .unwrap();
+}
+
+/// Sets the package name make would have reported.
+pub fn set_pkgname(conn: &Connection, origin: &str, pkgname: &str) {
+    add_port(conn, origin);
+    conn.execute(
+        "UPDATE ports SET pkgname = ?2 WHERE origin = ?1",
+        rusqlite::params![origin, pkgname],
+    )
+    .unwrap();
+}
+
+/// A port that exists in the tree but that `make` could not evaluate.
+///
+/// The indexer inserts a row for every directory so that edges have something
+/// to point at, and marks it resolved only once make has answered for it.
+pub fn add_unevaluated_port(conn: &Connection, origin: &str) {
+    conn.execute(
+        "INSERT OR REPLACE INTO ports (origin, pkgbase, pkgname, resolved)
+         VALUES (?1, '', '', 0)",
+        rusqlite::params![origin],
+    )
+    .unwrap();
+}

@@ -35,7 +35,6 @@ pub struct Config {
     pub file: Option<PathBuf>,
     pub origins: Option<Vec<String>>,
     pub dry_run: Option<bool>,
-    pub no_describe: Option<bool>,
     pub force_reset: Option<bool>,
     pub ignore_missing: Option<bool>,
     /// Belongs to the `index` subcommand rather than the top level.
