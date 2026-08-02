@@ -1,7 +1,8 @@
+use crate::describe::{load_cached, PortDetails};
 use crate::reader::SystemOptions;
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Row a `Shift + Down` should land on: the next sibling of `from`, or — when
 /// `from` is the last child of its parent — the following "uncle", i.e. the next
@@ -32,7 +33,10 @@ pub fn prev_sibling_index(depths: &[usize], from: usize) -> usize {
         None => return from,
     };
 
-    (0..from).rev().find(|&i| depths[i] <= depth).unwrap_or(from)
+    (0..from)
+        .rev()
+        .find(|&i| depths[i] <= depth)
+        .unwrap_or(from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +46,34 @@ pub enum Mode {
     None,
 }
 
+/// Why a port is in the list. A port named on the command line stays
+/// `Requested` even when something else depends on it as well — asking for a
+/// port by name outranks having it dragged in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    Requested,
+    Dependency,
+}
+
+/// The two relationship sections shown beneath a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    /// Ports pulled in whatever the options say.
+    Requires,
+    /// Ports that pull this one in, by option or unconditionally.
+    RequiredBy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeId {
     Port(usize),
     Option(usize),
+    Section {
+        port: usize,
+        kind: SectionKind,
+    },
+    /// A jump target. The origin it points at lives in the row's `RowKind`.
+    Ref,
     Info,
 }
 
@@ -53,6 +81,7 @@ pub enum NodeId {
 pub enum RowKind {
     Port {
         origin: String,
+        provenance: Provenance,
     },
     Option {
         name: String,
@@ -61,9 +90,40 @@ pub enum RowKind {
         group_type: String,
         group_name: String,
     },
+    /// A port the option above it pulls in.
+    DependsOn {
+        origin: String,
+        /// False when nothing currently pulls this port in, so it is not in the
+        /// list and turning the option on is what would add it.
+        active: bool,
+    },
+    SectionHeader {
+        kind: SectionKind,
+        count: usize,
+    },
+    RequiresEntry {
+        origin: String,
+    },
+    RequiredByEntry {
+        origin: String,
+        /// Set when that port depends on this one only because an option is on.
+        via_option: Option<String>,
+    },
     Info {
         message: String,
     },
+}
+
+impl RowKind {
+    /// The port a row points at, for rows that are jump targets.
+    pub fn jump_target(&self) -> Option<&str> {
+        match self {
+            RowKind::DependsOn { origin, .. }
+            | RowKind::RequiresEntry { origin }
+            | RowKind::RequiredByEntry { origin, .. } => Some(origin),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +135,72 @@ pub struct VisibleRow {
     pub node_id: NodeId,
 }
 
+/// One entry in a port's `required by` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredBy {
+    pub origin: String,
+    pub via_option: Option<String>,
+}
+
+/// Expansion state for a relationship section, which has no node of its own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SectionState {
+    pub is_expanded: bool,
+    pub last_single_seq: u64,
+}
+
+/// One row of the `options` table: name, default state, description, group type
+/// and group name.
+type OptionRow = (String, bool, String, String, String);
+
+/// Options `bsd.options.mk` turns on by default whenever a port defines them,
+/// over and above whatever `OPTIONS_DEFAULT` lists.
+const ALWAYS_DEFAULT_ON: [&str; 4] = ["DOCS", "NLS", "EXAMPLES", "IPV6"];
+
+/// Reconciles the option list the regex sweep found with the one the ports tree
+/// reports.
+///
+/// `describe-json` is authoritative for *which* options exist and *which* are on
+/// by default, and is the only source that sees options inherited through
+/// `MASTERDIR` or injected by `Mk/Uses/*.mk`. It carries no descriptions and no
+/// `SINGLE`/`RADIO`/`MULTI` grouping, so those keep coming from the Makefile
+/// parse, matched by name. An option only the tree knows about shows up with no
+/// description and no group.
+fn merge_described_options(indexed: Vec<OptionRow>, details: &PortDetails) -> Vec<OptionRow> {
+    if details.complete_options_list.is_empty() {
+        return indexed;
+    }
+
+    let mut merged: Vec<OptionRow> = details
+        .complete_options_list
+        .iter()
+        .map(|name| {
+            let default_on = details.options_default.iter().any(|d| d == name)
+                || ALWAYS_DEFAULT_ON.contains(&name.as_str());
+
+            match indexed.iter().find(|(n, ..)| n == name) {
+                Some((_, _, description, group_type, group_name)) => (
+                    name.clone(),
+                    default_on,
+                    description.clone(),
+                    group_type.clone(),
+                    group_name.clone(),
+                ),
+                None => (
+                    name.clone(),
+                    default_on,
+                    String::new(),
+                    "DEFINE".to_string(),
+                    String::new(),
+                ),
+            }
+        })
+        .collect();
+
+    merged.sort_by(|a, b| a.0.cmp(&b.0));
+    merged
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OptionNode {
@@ -83,7 +209,7 @@ pub struct OptionNode {
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    /// State this option had when the tree was loaded, used to detect unsaved edits.
+    /// State this option had when the list was loaded, used to detect unsaved edits.
     pub initial_enabled: bool,
     pub group_type: String,
     pub group_name: String,
@@ -92,35 +218,78 @@ pub struct OptionNode {
     pub subtree_seq: u64,
     pub subtree_mode: Mode,
     pub parent_port: usize,
-    pub child_ports: Vec<usize>,
+    /// Ports this option pulls in, as origins rather than indices: every port
+    /// lives once in the flat list and is reached by jumping, not by nesting.
+    pub dep_origins: Vec<String>,
+    /// `dep_origins` resolved to `ports` indices, so the reachability walk that
+    /// runs on every toggle never has to hash a string.
+    dep_idx: Vec<usize>,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct PortNode {
+pub struct PortEntry {
     pub id: usize,
     pub origin: String,
-    pub depth: usize,
+    pub provenance: Provenance,
+    pub options: Vec<usize>,
+    /// Dependencies pulled in whatever the options say.
+    pub requires: Vec<String>,
+    /// `requires` resolved to `ports` indices. See [`OptionNode::dep_idx`].
+    requires_idx: Vec<usize>,
+    /// Inverse of every forward edge, both conditional and unconditional.
+    pub required_by: Vec<RequiredBy>,
     pub is_expanded: bool,
     pub last_single_seq: u64,
     pub subtree_seq: u64,
     pub subtree_mode: Mode,
-    pub parent_option: Option<usize>,
-    pub options: Vec<usize>,
+    pub requires_section: SectionState,
+    pub required_by_section: SectionState,
 }
 
+/// Every distinct port reachable from the requested targets, held once each.
+///
+/// The list is flat and alphabetised rather than nested. A port depended on by
+/// several others used to appear once per edge, which meant either repeating its
+/// subtree at every occurrence — enumerating paths rather than edges, which does
+/// not scale — or drawing it at one occurrence and not the others, which reads
+/// inconsistently. Holding each port once removes the choice: relationships are
+/// shown as references that jump to the single entry for that port.
 #[derive(Debug)]
 pub struct DependencyGraph {
     pub root_origin: String,
-    pub port_nodes: Vec<PortNode>,
+    pub ports: Vec<PortEntry>,
     pub option_nodes: Vec<OptionNode>,
-    pub root_port_ids: Vec<usize>,
+    /// Origin -> index into `ports`, for resolving jump targets.
+    pub by_origin: HashMap<String, usize>,
+    /// Ports something currently pulls in: the requested ports, plus whatever is
+    /// reachable from them through *enabled* options and unconditional
+    /// dependencies. Turning an option off can drop a port out of this set, and
+    /// everything only that port pulled in with it.
+    ///
+    /// Ports outside it stay in `ports` with their option state intact, so
+    /// turning the option back on restores the selections rather than resetting
+    /// them. They are neither listed nor written.
+    ///
+    /// Indexed by position in `ports`; use [`DependencyGraph::is_live`].
+    live: Vec<bool>,
     pub visible_rows: Vec<VisibleRow>,
+    /// Port origin -> `PKGNAME`-ish label ("nginx-1.24.0"), for the header the
+    /// ports framework writes into an options file. Only ever informational.
+    pub pkg_names: HashMap<String, String>,
 
     pub global_mode: Mode,
     pub last_global_seq: u64,
     pub current_seq: u64,
     pub search_query: String,
+}
+
+/// Everything read out of the database for one port before entries are built.
+struct Collected {
+    options: Vec<OptionRow>,
+    /// (option name, dependency origin)
+    option_deps: Vec<(String, String)>,
+    requires: Vec<String>,
 }
 
 impl DependencyGraph {
@@ -207,246 +376,423 @@ impl DependencyGraph {
 
         let mut graph = Self {
             root_origin: header_title,
-            port_nodes: Vec::new(),
+            ports: Vec::new(),
             option_nodes: Vec::new(),
-            root_port_ids: Vec::new(),
+            by_origin: HashMap::new(),
+            live: Vec::new(),
             visible_rows: Vec::new(),
+            pkg_names: HashMap::new(),
             global_mode: Mode::None,
             last_global_seq: 0,
             current_seq: 0,
             search_query: String::new(),
         };
 
-        // 2. Load all resolved origins as root nodes in the dependency graph
-        for origin in &resolved_origins {
-            let mut visited = HashSet::new();
-            let root_id =
-                graph.load_port_recursive(conn, origin, 0, None, sys_opts, &mut visited)?;
-            graph.root_port_ids.push(root_id);
-        }
+        graph.load_ports(conn, &resolved_origins, sys_opts)?;
 
+        graph.recompute_live_set();
         graph.rebuild_visible_rows();
 
         Ok(graph)
     }
 
-    fn load_port_recursive(
+    /// Walks the dependency graph breadth-first from `roots` and builds one
+    /// entry per distinct port.
+    ///
+    /// Termination is by reaching a port already collected, which a finite ports
+    /// tree guarantees — there is no depth limit. The walk is iterative because
+    /// dependency chains are unbounded and a recursive one would put them on the
+    /// call stack.
+    fn load_ports(
         &mut self,
         conn: &Connection,
-        origin: &str,
-        depth: usize,
-        parent_option: Option<usize>,
+        roots: &[String],
         sys_opts: &SystemOptions,
-        visited: &mut HashSet<String>,
-    ) -> Result<usize> {
-        let port_id = self.port_nodes.len();
-        visited.insert(origin.to_string());
+    ) -> Result<()> {
+        let requested: HashSet<&str> = roots.iter().map(|s| s.as_str()).collect();
 
-        let port_node = PortNode {
-            id: port_id,
-            origin: origin.to_string(),
-            depth,
-            is_expanded: false,
-            last_single_seq: 0,
-            subtree_seq: 0,
-            subtree_mode: Mode::None,
-            parent_option,
-            options: Vec::new(),
-        };
-        self.port_nodes.push(port_node);
+        let mut collected: HashMap<String, Collected> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
 
-        let mut stmt = conn.prepare(
-            "SELECT option_name, default_state, description, group_type, group_name FROM options WHERE port_origin = ?1",
-        )?;
-        let rows = stmt.query_map(params![origin], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i32>(1)? == 1,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-
-        let mut option_data = Vec::new();
-        for r in rows {
-            if let Ok(data) = r {
-                option_data.push(data);
+        for origin in roots {
+            if seen.insert(origin.clone()) {
+                queue.push_back(origin.clone());
             }
         }
 
-        for (opt_name, default_state, description, group_type, group_name) in option_data {
-            let initial_enabled = sys_opts.get_state(origin, &opt_name, default_state);
+        while let Some(origin) = queue.pop_front() {
+            let mut stmt = conn.prepare(
+                "SELECT option_name, default_state, description, group_type, group_name
+                 FROM options WHERE port_origin = ?1 ORDER BY option_name",
+            )?;
+            let indexed: Vec<OptionRow> = stmt
+                .query_map(params![origin], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)? == 1,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
 
-            let opt_id = self.option_nodes.len();
-            let opt_node = OptionNode {
-                id: opt_id,
-                port_origin: origin.to_string(),
-                name: opt_name.clone(),
-                description,
-                enabled: initial_enabled,
-                initial_enabled,
-                group_type,
-                group_name,
-                is_expanded: false,
+            let details = load_cached(conn, &origin);
+            let options = match &details {
+                Some(details) => merge_described_options(indexed, details),
+                None => indexed,
+            };
+
+            let mut option_deps = Vec::new();
+            {
+                let mut dep_stmt = conn.prepare(
+                    "SELECT DISTINCT dep_origin FROM option_deps
+                     WHERE port_origin = ?1 AND option_name = ?2 ORDER BY dep_origin",
+                )?;
+                for (opt_name, ..) in &options {
+                    let deps: Vec<String> = dep_stmt
+                        .query_map(params![origin, opt_name], |row| row.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    for dep in deps {
+                        if seen.insert(dep.clone()) {
+                            queue.push_back(dep.clone());
+                        }
+                        option_deps.push((opt_name.clone(), dep));
+                    }
+                }
+            }
+
+            let requires: Vec<String> = {
+                let mut req_stmt = conn.prepare(
+                    "SELECT DISTINCT dep_origin FROM port_deps WHERE port_origin = ?1 ORDER BY dep_origin",
+                )?;
+                let rows: Vec<String> = req_stmt
+                    .query_map(params![origin], |row| row.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                rows
+            };
+            for dep in &requires {
+                if seen.insert(dep.clone()) {
+                    queue.push_back(dep.clone());
+                }
+            }
+
+            self.record_pkg_name(conn, &origin, details.as_ref())?;
+
+            collected.insert(
+                origin,
+                Collected {
+                    options,
+                    option_deps,
+                    requires,
+                },
+            );
+        }
+
+        // Alphabetised, so the list reads as an index rather than a walk order
+        let mut origins: Vec<String> = collected.keys().cloned().collect();
+        origins.sort();
+
+        for (index, origin) in origins.iter().enumerate() {
+            self.by_origin.insert(origin.clone(), index);
+        }
+
+        for origin in &origins {
+            let entry = collected.remove(origin).expect("origin was just listed");
+            let port_id = self.ports.len();
+
+            let mut option_ids = Vec::new();
+            for (opt_name, default_state, description, group_type, group_name) in entry.options {
+                let initial_enabled = sys_opts.get_state(origin, &opt_name, default_state);
+                let dep_origins: Vec<String> = entry
+                    .option_deps
+                    .iter()
+                    .filter(|(name, _)| name == &opt_name)
+                    .map(|(_, dep)| dep.clone())
+                    .collect();
+                // Every dependency was queued during the walk, so it is in
+                // by_origin, which was fully populated before this loop.
+                let dep_idx: Vec<usize> = dep_origins
+                    .iter()
+                    .filter_map(|d| self.by_origin.get(d).copied())
+                    .collect();
+
+                let opt_id = self.option_nodes.len();
+                self.option_nodes.push(OptionNode {
+                    id: opt_id,
+                    port_origin: origin.clone(),
+                    name: opt_name,
+                    description,
+                    enabled: initial_enabled,
+                    initial_enabled,
+                    group_type,
+                    group_name,
+                    is_expanded: false,
+                    last_single_seq: 0,
+                    subtree_seq: 0,
+                    subtree_mode: Mode::None,
+                    parent_port: port_id,
+                    dep_origins,
+                    dep_idx,
+                });
+                option_ids.push(opt_id);
+            }
+
+            let provenance = if requested.contains(origin.as_str()) {
+                Provenance::Requested
+            } else {
+                Provenance::Dependency
+            };
+
+            let requires_idx: Vec<usize> = entry
+                .requires
+                .iter()
+                .filter_map(|d| self.by_origin.get(d).copied())
+                .collect();
+
+            self.ports.push(PortEntry {
+                id: port_id,
+                origin: origin.clone(),
+                provenance,
+                options: option_ids,
+                requires: entry.requires,
+                requires_idx,
+                required_by: Vec::new(),
+                // Ports asked for by name open on arrival; the rest would bury
+                // them, so they start closed and are opened or jumped to.
+                is_expanded: provenance == Provenance::Requested,
                 last_single_seq: 0,
                 subtree_seq: 0,
                 subtree_mode: Mode::None,
-                parent_port: port_id,
-                child_ports: Vec::new(),
-            };
-            self.option_nodes.push(opt_node);
-            self.port_nodes[port_id].options.push(opt_id);
+                requires_section: SectionState::default(),
+                required_by_section: SectionState::default(),
+            });
+        }
 
-            if depth < 4 {
-                let mut dep_stmt = conn.prepare(
-                    "SELECT DISTINCT dep_origin FROM option_deps WHERE port_origin = ?1 AND option_name = ?2",
-                )?;
-                let dep_rows =
-                    dep_stmt.query_map(params![origin, opt_name], |row| row.get::<_, String>(0))?;
+        self.build_required_by();
+        Ok(())
+    }
 
-                let mut deps = Vec::new();
-                for dr in dep_rows {
-                    if let Ok(d) = dr {
-                        if !visited.contains(&d) {
-                            deps.push(d);
-                        }
+    /// Inverts every forward edge so each port can show what pulls it in.
+    fn build_required_by(&mut self) {
+        let mut inverse: HashMap<String, Vec<RequiredBy>> = HashMap::new();
+
+        for port in &self.ports {
+            for &opt_id in &port.options {
+                let opt = &self.option_nodes[opt_id];
+                for dep in &opt.dep_origins {
+                    inverse.entry(dep.clone()).or_default().push(RequiredBy {
+                        origin: port.origin.clone(),
+                        via_option: Some(opt.name.clone()),
+                    });
+                }
+            }
+            for dep in &port.requires {
+                inverse.entry(dep.clone()).or_default().push(RequiredBy {
+                    origin: port.origin.clone(),
+                    via_option: None,
+                });
+            }
+        }
+
+        for port in &mut self.ports {
+            if let Some(mut entries) = inverse.remove(&port.origin) {
+                entries.sort_by(|a, b| {
+                    a.origin
+                        .cmp(&b.origin)
+                        .then_with(|| a.via_option.cmp(&b.via_option))
+                });
+                entries.dedup();
+                port.required_by = entries;
+            }
+        }
+    }
+
+    fn record_pkg_name(
+        &mut self,
+        conn: &Connection,
+        origin: &str,
+        details: Option<&PortDetails>,
+    ) -> Result<()> {
+        if self.pkg_names.contains_key(origin) {
+            return Ok(());
+        }
+
+        // The tree's own PKGNAME whenever it has been read, since the indexer
+        // cannot reconstruct one
+        if let Some(details) = details {
+            self.pkg_names
+                .insert(origin.to_string(), details.pkgname.clone());
+            return Ok(());
+        }
+
+        let pkg_name = conn
+            .query_row(
+                "SELECT name, version FROM ports WHERE origin = ?1",
+                params![origin],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok()
+            .map(|(name, version)| {
+                // The indexer only reads PORTVERSION, so `version` is its
+                // "latest" placeholder — or empty, where PORTVERSION expands
+                // through a variable it could not resolve — on the many ports
+                // that set DISTVERSION instead. A bare name is more honest than
+                // a made-up or half-formed version.
+                let version = version.trim();
+                if version.is_empty() || version == "latest" {
+                    name.trim().to_string()
+                } else {
+                    format!("{}-{}", name.trim(), version)
+                }
+            });
+
+        if let Some(pkg_name) = pkg_name {
+            self.pkg_names.insert(origin.to_string(), pkg_name);
+        }
+        Ok(())
+    }
+
+    /// Ports named on the command line, in list order. These are the roots of
+    /// the dependency walk and are always kept.
+    pub fn requested_ports(&self) -> impl Iterator<Item = &PortEntry> {
+        self.ports
+            .iter()
+            .filter(|p| p.provenance == Provenance::Requested)
+    }
+
+    /// True when something currently pulls this port in.
+    pub fn is_live(&self, origin: &str) -> bool {
+        self.port_index(origin)
+            .map(|i| self.live[i])
+            .unwrap_or(false)
+    }
+
+    /// How many ports are currently pulled in.
+    pub fn live_count(&self) -> usize {
+        self.live.iter().filter(|l| **l).count()
+    }
+
+    /// Recomputes which ports are currently pulled in, following only enabled
+    /// options plus unconditional dependencies.
+    ///
+    /// Done from scratch on every toggle rather than incrementally: turning one
+    /// option off can strand a whole subtree, and only a fresh walk from the
+    /// requested ports can tell what is still reachable by some other route.
+    pub fn recompute_live_set(&mut self) {
+        let mut live = vec![false; self.ports.len()];
+        let mut queue: VecDeque<usize> = VecDeque::new();
+
+        for port in self.requested_ports() {
+            if !live[port.id] {
+                live[port.id] = true;
+                queue.push_back(port.id);
+            }
+        }
+
+        while let Some(port_id) = queue.pop_front() {
+            let port = &self.ports[port_id];
+
+            for &dep in &port.requires_idx {
+                if !live[dep] {
+                    live[dep] = true;
+                    queue.push_back(dep);
+                }
+            }
+            for &opt_id in &port.options {
+                let opt = &self.option_nodes[opt_id];
+                if !opt.enabled {
+                    continue;
+                }
+                for &dep in &opt.dep_idx {
+                    if !live[dep] {
+                        live[dep] = true;
+                        queue.push_back(dep);
                     }
                 }
-
-                for dep_origin in deps {
-                    let child_id = self.load_port_recursive(
-                        conn,
-                        &dep_origin,
-                        depth + 2,
-                        Some(opt_id),
-                        sys_opts,
-                        visited,
-                    )?;
-                    self.option_nodes[opt_id].child_ports.push(child_id);
-                }
             }
         }
 
-        self.port_nodes[port_id].is_expanded = self.get_effective_port_expansion(port_id);
-        for &opt_id in &self.port_nodes[port_id].options {
-            self.option_nodes[opt_id].is_expanded = self.get_effective_option_expansion(opt_id);
-        }
-
-        visited.remove(origin);
-        Ok(port_id)
+        self.live = live;
     }
 
-    fn get_ancestor_subtree_info_for_port(&self, port_id: usize) -> (u64, Mode) {
-        let mut max_seq = self.port_nodes[port_id].subtree_seq;
-        let mut max_mode = self.port_nodes[port_id].subtree_mode;
-
-        let mut curr_opt_id = self.port_nodes[port_id].parent_option;
-        while let Some(opt_id) = curr_opt_id {
-            let opt = &self.option_nodes[opt_id];
-            if opt.subtree_seq > max_seq {
-                max_seq = opt.subtree_seq;
-                max_mode = opt.subtree_mode;
-            }
-            let port = &self.port_nodes[opt.parent_port];
-            if port.subtree_seq > max_seq {
-                max_seq = port.subtree_seq;
-                max_mode = port.subtree_mode;
-            }
-            curr_opt_id = port.parent_option;
-        }
-
-        (max_seq, max_mode)
+    /// Index into `ports` for an origin, for resolving a jump.
+    pub fn port_index(&self, origin: &str) -> Option<usize> {
+        self.by_origin.get(origin).copied()
     }
 
-    fn get_ancestor_subtree_info_for_option(&self, opt_id: usize) -> (u64, Mode) {
-        let mut max_seq = self.option_nodes[opt_id].subtree_seq;
-        let mut max_mode = self.option_nodes[opt_id].subtree_mode;
-
-        let parent_port_id = self.option_nodes[opt_id].parent_port;
-        let (port_max_seq, port_max_mode) = self.get_ancestor_subtree_info_for_port(parent_port_id);
-
-        if port_max_seq > max_seq {
-            max_seq = port_max_seq;
-            max_mode = port_max_mode;
-        }
-
-        (max_seq, max_mode)
-    }
-
-    pub fn get_effective_port_expansion(&self, port_id: usize) -> bool {
-        let port = &self.port_nodes[port_id];
-        let (ancestor_seq, ancestor_mode) = self.get_ancestor_subtree_info_for_port(port_id);
-
-        let single_seq = port.last_single_seq;
-        let global_seq = self.last_global_seq;
-
-        if single_seq > ancestor_seq && single_seq > global_seq {
-            port.is_expanded
-        } else if ancestor_seq > global_seq {
-            ancestor_mode == Mode::Expand
-        } else if global_seq > 0 {
-            self.global_mode == Mode::Expand
-        } else {
-            port.depth == 0
-        }
-    }
-
-    pub fn get_effective_option_expansion(&self, opt_id: usize) -> bool {
-        let opt = &self.option_nodes[opt_id];
-        let (ancestor_seq, ancestor_mode) = self.get_ancestor_subtree_info_for_option(opt_id);
-
-        let single_seq = opt.last_single_seq;
-        let global_seq = self.last_global_seq;
-
-        if single_seq > ancestor_seq && single_seq > global_seq {
-            opt.is_expanded
-        } else if ancestor_seq > global_seq {
-            ancestor_mode == Mode::Expand
-        } else if global_seq > 0 {
-            self.global_mode == Mode::Expand
-        } else {
-            false
-        }
-    }
-
-    pub fn expand_subtree(&mut self, row_index: usize) {
-        if let Some(row) = self.visible_rows.get(row_index) {
-            self.current_seq += 1;
-            let seq = self.current_seq;
-
-            match row.node_id {
-                NodeId::Port(id) => self.apply_port_subtree_mode(id, Mode::Expand, seq),
-                NodeId::Option(id) => self.apply_option_subtree_mode(id, Mode::Expand, seq),
-                NodeId::Info => {}
-            }
+    /// Opens a port, so a jump lands on something readable rather than a bare
+    /// collapsed row.
+    pub fn open_port(&mut self, port_id: usize) {
+        self.current_seq += 1;
+        let seq = self.current_seq;
+        if let Some(p) = self.ports.get_mut(port_id) {
+            p.last_single_seq = seq;
+            p.is_expanded = true;
         }
         self.rebuild_visible_rows();
     }
 
+    /// Every port option. Anything deciding what gets written to an options file
+    /// goes through here.
+    pub fn real_options(&self) -> impl Iterator<Item = &OptionNode> {
+        self.option_nodes.iter()
+    }
+
+    /// True when any option differs from the state it was loaded with. Toggling
+    /// an option back to where it started clears this again.
+    /// True when any option on a port that will actually be written differs from
+    /// the state it was loaded with. Edits to a port nothing pulls in any more
+    /// are not saved, so they must not raise the unsaved-changes prompt either.
+    pub fn is_dirty(&self) -> bool {
+        self.real_options()
+            .filter(|opt| self.is_live(&opt.port_origin))
+            .any(|opt| opt.enabled != opt.initial_enabled)
+    }
+
+    pub fn expand_subtree(&mut self, row_index: usize) {
+        self.apply_subtree_mode(row_index, Mode::Expand);
+    }
+
     pub fn collapse_subtree(&mut self, row_index: usize) {
+        self.apply_subtree_mode(row_index, Mode::Collapse);
+    }
+
+    fn apply_subtree_mode(&mut self, row_index: usize, mode: Mode) {
         if let Some(row) = self.visible_rows.get(row_index) {
             self.current_seq += 1;
             let seq = self.current_seq;
 
-            match row.node_id {
-                NodeId::Port(id) => self.apply_port_subtree_mode(id, Mode::Collapse, seq),
-                NodeId::Option(id) => self.apply_option_subtree_mode(id, Mode::Collapse, seq),
-                NodeId::Info => {}
+            match row.node_id.clone() {
+                NodeId::Port(id) => self.apply_port_subtree_mode(id, mode, seq),
+                NodeId::Option(id) => self.apply_option_subtree_mode(id, mode, seq),
+                NodeId::Section { port, kind } => self.set_section(port, kind, mode, seq),
+                NodeId::Ref | NodeId::Info => {}
             }
         }
         self.rebuild_visible_rows();
     }
 
     fn apply_port_subtree_mode(&mut self, port_id: usize, mode: Mode, seq: u64) {
-        if let Some(p) = self.port_nodes.get_mut(port_id) {
-            p.subtree_seq = seq;
-            p.subtree_mode = mode;
-            p.is_expanded = mode == Mode::Expand;
-            let options = p.options.clone();
-            for opt_id in options {
-                self.apply_option_subtree_mode(opt_id, mode, seq);
+        let options = match self.ports.get_mut(port_id) {
+            Some(p) => {
+                p.subtree_seq = seq;
+                p.subtree_mode = mode;
+                p.is_expanded = mode == Mode::Expand;
+                p.requires_section.is_expanded = mode == Mode::Expand;
+                p.requires_section.last_single_seq = seq;
+                p.required_by_section.is_expanded = mode == Mode::Expand;
+                p.required_by_section.last_single_seq = seq;
+                p.options.clone()
             }
+            None => return,
+        };
+        for opt_id in options {
+            self.apply_option_subtree_mode(opt_id, mode, seq);
         }
     }
 
@@ -455,38 +801,41 @@ impl DependencyGraph {
             o.subtree_seq = seq;
             o.subtree_mode = mode;
             o.is_expanded = mode == Mode::Expand;
-            let child_ports = o.child_ports.clone();
-            for child_id in child_ports {
-                self.apply_port_subtree_mode(child_id, mode, seq);
-            }
+        }
+    }
+
+    fn set_section(&mut self, port_id: usize, kind: SectionKind, mode: Mode, seq: u64) {
+        if let Some(p) = self.ports.get_mut(port_id) {
+            let state = match kind {
+                SectionKind::Requires => &mut p.requires_section,
+                SectionKind::RequiredBy => &mut p.required_by_section,
+            };
+            state.is_expanded = mode == Mode::Expand;
+            state.last_single_seq = seq;
         }
     }
 
     pub fn expand_all(&mut self) {
-        self.current_seq += 1;
-        self.last_global_seq = self.current_seq;
-        self.global_mode = Mode::Expand;
-
-        for port in &mut self.port_nodes {
-            port.is_expanded = true;
-        }
-        for opt in &mut self.option_nodes {
-            opt.is_expanded = true;
-        }
-
-        self.rebuild_visible_rows();
+        self.set_all(Mode::Expand);
     }
 
     pub fn collapse_all(&mut self) {
+        self.set_all(Mode::Collapse);
+    }
+
+    fn set_all(&mut self, mode: Mode) {
         self.current_seq += 1;
         self.last_global_seq = self.current_seq;
-        self.global_mode = Mode::Collapse;
+        self.global_mode = mode;
+        let expanded = mode == Mode::Expand;
 
-        for port in &mut self.port_nodes {
-            port.is_expanded = false;
+        for port in &mut self.ports {
+            port.is_expanded = expanded;
+            port.requires_section.is_expanded = expanded;
+            port.required_by_section.is_expanded = expanded;
         }
         for opt in &mut self.option_nodes {
-            opt.is_expanded = false;
+            opt.is_expanded = expanded;
         }
 
         self.rebuild_visible_rows();
@@ -499,9 +848,9 @@ impl DependencyGraph {
             self.current_seq += 1;
             let seq = self.current_seq;
 
-            match row.node_id {
+            match row.node_id.clone() {
                 NodeId::Port(id) => {
-                    if let Some(p) = self.port_nodes.get_mut(id) {
+                    if let Some(p) = self.ports.get_mut(id) {
                         p.last_single_seq = seq;
                         p.is_expanded = expanded;
                     }
@@ -512,7 +861,15 @@ impl DependencyGraph {
                         o.is_expanded = expanded;
                     }
                 }
-                NodeId::Info => {}
+                NodeId::Section { port, kind } => {
+                    let mode = if expanded {
+                        Mode::Expand
+                    } else {
+                        Mode::Collapse
+                    };
+                    self.set_section(port, kind, mode, seq);
+                }
+                NodeId::Ref | NodeId::Info => {}
             }
         }
         self.rebuild_visible_rows();
@@ -524,14 +881,6 @@ impl DependencyGraph {
 
     pub fn collapse_node(&mut self, row_index: usize) {
         self.set_node_expanded(row_index, false);
-    }
-
-    /// True when any option differs from the state it was loaded with. Toggling
-    /// an option back to where it started clears this again.
-    pub fn is_dirty(&self) -> bool {
-        self.option_nodes
-            .iter()
-            .any(|opt| opt.enabled != opt.initial_enabled)
     }
 
     pub fn toggle_option(&mut self, row_index: usize) {
@@ -554,7 +903,7 @@ impl DependencyGraph {
                 if is_radio {
                     // Radios only turn on; the rest of the group turns off.
                     if !current_enabled {
-                        let sibling_ids = self.port_nodes[parent_port].options.clone();
+                        let sibling_ids = self.ports[parent_port].options.clone();
                         let updates: Vec<(String, String, bool)> = sibling_ids
                             .iter()
                             .map(|&opt_id| &self.option_nodes[opt_id])
@@ -571,15 +920,11 @@ impl DependencyGraph {
                 }
             }
         }
+        // An option change can add or strand whole subtrees
+        self.recompute_live_set();
         self.rebuild_visible_rows();
     }
 
-    /// Writes an option's state to *every* node describing that option.
-    ///
-    /// The same port can appear in the tree more than once (as several roots'
-    /// dependency, or as both an explicit target and a dependency), so each
-    /// occurrence carries its own `OptionNode`. Keeping them in lockstep means a
-    /// toggle anywhere is reflected everywhere on the next redraw.
     pub fn set_option_state(&mut self, port_origin: &str, option_name: &str, enabled: bool) {
         for opt in &mut self.option_nodes {
             if opt.port_origin == port_origin && opt.name == option_name {
@@ -588,8 +933,8 @@ impl DependencyGraph {
         }
     }
 
-    /// All option nodes matching a `(port origin, option name)` pair — one per
-    /// occurrence of that port in the tree.
+    /// Option nodes matching a `(port origin, option name)` pair. Each port is
+    /// held once, so this yields at most one.
     #[allow(dead_code)]
     pub fn option_instances(&self, port_origin: &str, option_name: &str) -> Vec<usize> {
         self.option_nodes
@@ -600,21 +945,20 @@ impl DependencyGraph {
     }
 
     pub fn rebuild_visible_rows(&mut self) {
-        self.visible_rows.clear();
-        if self.port_nodes.is_empty() {
-            return;
-        }
+        // Built into a local vector so `flatten_port` can borrow `self`
+        // immutably; otherwise every port would have to be cloned to satisfy the
+        // borrow checker, which dominates the cost on a large list.
+        let mut rows = Vec::with_capacity(self.visible_rows.len());
 
-        let root_ids = self.root_port_ids.clone();
-        for root_id in root_ids {
-            self.flatten_port(root_id);
+        for port_id in 0..self.ports.len() {
+            self.flatten_port(port_id, &mut rows);
         }
 
         // Apply active search filter
         if !self.search_query.is_empty() {
             let query = self.search_query.to_lowercase();
-            self.visible_rows.retain(|row| match &row.kind {
-                RowKind::Port { origin } => origin.to_lowercase().contains(&query),
+            rows.retain(|row| match &row.kind {
+                RowKind::Port { origin, .. } => origin.to_lowercase().contains(&query),
                 RowKind::Option {
                     name,
                     description,
@@ -625,65 +969,152 @@ impl DependencyGraph {
                         || description.to_lowercase().contains(&query)
                         || group_name.to_lowercase().contains(&query)
                 }
-                RowKind::Info { .. } => true,
+                RowKind::DependsOn { origin, .. }
+                | RowKind::RequiresEntry { origin }
+                | RowKind::RequiredByEntry { origin, .. } => origin.to_lowercase().contains(&query),
+                RowKind::SectionHeader { .. } | RowKind::Info { .. } => true,
             });
         }
+
+        self.visible_rows = rows;
     }
 
-    fn flatten_port(&mut self, port_id: usize) {
-        let port = self.port_nodes[port_id].clone();
-        let has_children = !port.options.is_empty();
+    fn flatten_port(&self, port_id: usize, rows: &mut Vec<VisibleRow>) {
+        let port = &self.ports[port_id];
+        if !self.live[port_id] {
+            return;
+        }
 
-        self.visible_rows.push(VisibleRow {
-            depth: port.depth,
+        // A parent that is not itself pulled in explains nothing about why this
+        // port is here, so it is left out of `required by`.
+        let required_by: Vec<&RequiredBy> = port
+            .required_by
+            .iter()
+            .filter(|r| self.is_live(&r.origin))
+            .collect();
+
+        let has_children =
+            !port.options.is_empty() || !port.requires.is_empty() || !required_by.is_empty();
+
+        rows.push(VisibleRow {
+            depth: 0,
             kind: RowKind::Port {
                 origin: port.origin.clone(),
+                provenance: port.provenance,
             },
             is_expanded: port.is_expanded,
             has_children,
             node_id: NodeId::Port(port_id),
         });
 
-        if port.is_expanded {
-            if port.options.is_empty() {
-                self.visible_rows.push(VisibleRow {
-                    depth: port.depth + 1,
-                    kind: RowKind::Info {
-                        message: "(No options defined for this port)".to_string(),
-                    },
-                    is_expanded: false,
-                    has_children: false,
-                    node_id: NodeId::Info,
-                });
-            } else {
-                for &opt_id in &port.options {
-                    self.flatten_option(opt_id, port.depth + 1);
+        if !port.is_expanded {
+            return;
+        }
+
+        if !has_children {
+            rows.push(VisibleRow {
+                depth: 1,
+                kind: RowKind::Info {
+                    message: "(No options defined for this port)".to_string(),
+                },
+                is_expanded: false,
+                has_children: false,
+                node_id: NodeId::Info,
+            });
+            return;
+        }
+
+        for &opt_id in &port.options {
+            let opt = &self.option_nodes[opt_id];
+            rows.push(VisibleRow {
+                depth: 1,
+                kind: RowKind::Option {
+                    name: opt.name.clone(),
+                    description: opt.description.clone(),
+                    enabled: opt.enabled,
+                    group_type: opt.group_type.clone(),
+                    group_name: opt.group_name.clone(),
+                },
+                is_expanded: opt.is_expanded,
+                has_children: !opt.dep_origins.is_empty(),
+                node_id: NodeId::Option(opt_id),
+            });
+
+            if opt.is_expanded {
+                for dep in &opt.dep_origins {
+                    let active = self.is_live(dep);
+                    rows.push(VisibleRow {
+                        depth: 2,
+                        kind: RowKind::DependsOn {
+                            origin: dep.clone(),
+                            active,
+                        },
+                        is_expanded: false,
+                        has_children: false,
+                        node_id: NodeId::Ref,
+                    });
                 }
             }
         }
-    }
 
-    fn flatten_option(&mut self, opt_id: usize, opt_depth: usize) {
-        let opt = self.option_nodes[opt_id].clone();
-        let has_children = !opt.child_ports.is_empty();
+        if !port.requires.is_empty() {
+            rows.push(VisibleRow {
+                depth: 1,
+                kind: RowKind::SectionHeader {
+                    kind: SectionKind::Requires,
+                    count: port.requires.len(),
+                },
+                is_expanded: port.requires_section.is_expanded,
+                has_children: true,
+                node_id: NodeId::Section {
+                    port: port_id,
+                    kind: SectionKind::Requires,
+                },
+            });
 
-        self.visible_rows.push(VisibleRow {
-            depth: opt_depth,
-            kind: RowKind::Option {
-                name: opt.name.clone(),
-                description: opt.description.clone(),
-                enabled: opt.enabled,
-                group_type: opt.group_type.clone(),
-                group_name: opt.group_name.clone(),
-            },
-            is_expanded: opt.is_expanded,
-            has_children,
-            node_id: NodeId::Option(opt_id),
-        });
+            if port.requires_section.is_expanded {
+                for dep in &port.requires {
+                    rows.push(VisibleRow {
+                        depth: 2,
+                        kind: RowKind::RequiresEntry {
+                            origin: dep.clone(),
+                        },
+                        is_expanded: false,
+                        has_children: false,
+                        node_id: NodeId::Ref,
+                    });
+                }
+            }
+        }
 
-        if opt.is_expanded && opt.enabled {
-            for &child_port_id in &opt.child_ports {
-                self.flatten_port(child_port_id);
+        if !required_by.is_empty() {
+            rows.push(VisibleRow {
+                depth: 1,
+                kind: RowKind::SectionHeader {
+                    kind: SectionKind::RequiredBy,
+                    count: required_by.len(),
+                },
+                is_expanded: port.required_by_section.is_expanded,
+                has_children: true,
+                node_id: NodeId::Section {
+                    port: port_id,
+                    kind: SectionKind::RequiredBy,
+                },
+            });
+
+            if port.required_by_section.is_expanded {
+                for entry in &required_by {
+                    rows.push(VisibleRow {
+                        depth: 2,
+                        kind: RowKind::RequiredByEntry {
+                            origin: entry.origin.clone(),
+                            via_option: entry.via_option.clone(),
+                        },
+                        is_expanded: false,
+                        has_children: false,
+                        node_id: NodeId::Ref,
+                    });
+                }
             }
         }
     }

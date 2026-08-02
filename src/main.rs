@@ -1,5 +1,6 @@
 mod cli;
 mod db;
+mod describe;
 mod exporter;
 mod graph;
 mod indexer;
@@ -10,7 +11,49 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
 use rusqlite::Connection;
+use std::path::PathBuf;
 use std::time::Instant;
+
+/// Asks the ports tree about the ports being configured, so their option lists
+/// and package names come from the tree rather than from a regex.
+///
+/// Best effort: without a readable tree bgone still works, it just keeps the
+/// indexed approximation, which can leave `poudriere` prompting for ports whose
+/// options the Makefile parse could not see.
+fn describe_working_set(conn: &mut Connection, dep_graph: &graph::DependencyGraph) {
+    let ports_dir = match db::get_meta(conn, "ports_dir").map(PathBuf::from) {
+        Some(dir) if dir.is_dir() => dir,
+        Some(dir) => {
+            eprintln!(
+                "[!] Ports tree {:?} is gone; using indexed data only. Re-run 'bgone index'.",
+                dir
+            );
+            return;
+        }
+        None => {
+            eprintln!("[!] No ports tree recorded; using indexed data only. Re-run 'bgone index'.");
+            return;
+        }
+    };
+
+    let origins: Vec<String> = dep_graph.ports.iter().map(|p| p.origin.clone()).collect();
+    println!(
+        "[*] Reading details for {} ports from the tree...",
+        origins.len()
+    );
+    let start = Instant::now();
+
+    match describe::describe_ports(conn, &ports_dir, &origins) {
+        Ok(stats) => println!(
+            "[+] {} read, {} already current, {} unavailable in {:.2?}",
+            stats.described,
+            stats.cached,
+            stats.failed,
+            start.elapsed()
+        ),
+        Err(e) => eprintln!("[!] Could not read port details: {e}"),
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -27,11 +70,18 @@ fn main() -> Result<()> {
 
             let stats = indexer::index_ports_dir(&mut conn, ports_dir)?;
 
+            // Remembered so later runs can find the tree again to read port
+            // details from, without having to be told where it is twice
+            if let Ok(canonical) = ports_dir.canonicalize() {
+                db::set_meta(&conn, "ports_dir", &canonical.to_string_lossy())?;
+            }
+
             println!(
-                "[+] Indexed {} ports, {} options, and {} option dependencies in {:.2?}",
+                "[+] Indexed {} ports, {} options, {} option dependencies, and {} unconditional dependencies in {:.2?}",
                 stats.ports_indexed,
                 stats.options_indexed,
                 stats.option_deps_indexed,
+                stats.port_deps_indexed,
                 start.elapsed()
             );
         }
@@ -52,8 +102,8 @@ fn main() -> Result<()> {
                 let sys_opts =
                     reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
 
-                let mut dep_graph = match graph::DependencyGraph::load_from_db(
-                    &conn,
+                let load = |conn: &Connection| match graph::DependencyGraph::load_from_db(
+                    conn,
                     &targets,
                     &sys_opts,
                     cli.ignore_missing,
@@ -64,6 +114,16 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 };
+
+                // Loaded once from the indexed data to find out which ports are
+                // in play, then again once the tree has been asked about them.
+                // Reading details cannot change which ports are reachable, only
+                // what is known about them, so the second load sees the same set.
+                let mut dep_graph = load(&conn);
+                if !cli.no_describe {
+                    describe_working_set(&mut conn, &dep_graph);
+                    dep_graph = load(&conn);
+                }
 
                 let action = ui::run_tui(&mut dep_graph)?;
 

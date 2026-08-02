@@ -10,7 +10,22 @@ pub struct IndexerStats {
     pub ports_indexed: usize,
     pub options_indexed: usize,
     pub option_deps_indexed: usize,
+    pub port_deps_indexed: usize,
 }
+
+/// The dependency classes making up `_UNIFIED_DEPENDS` in bsd.port.mk, which is
+/// what `make config-recursive` — and so `poudriere options` — walks. Ordered
+/// most- to least-specific so the `_DEPENDS` suffixes cannot shadow each other.
+const UNCONDITIONAL_DEP_VARS: [&str; 8] = [
+    "EXTRACT_DEPENDS",
+    "PATCH_DEPENDS",
+    "FETCH_DEPENDS",
+    "BUILD_DEPENDS",
+    "LIB_DEPENDS",
+    "RUN_DEPENDS",
+    "TEST_DEPENDS",
+    "PKG_DEPENDS",
+];
 
 #[derive(Debug)]
 struct ExtractedOption {
@@ -33,6 +48,7 @@ struct ParsedPort {
     comment: String,
     options: Vec<(ExtractedOption, bool, String)>, // (opt, default_state, description)
     deps: Vec<ParsedOptionDep>,
+    port_deps: Vec<(String, String)>, // (dep_origin, dep_type)
 }
 
 fn preprocess_makefile(content: &str) -> String {
@@ -135,22 +151,48 @@ fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
     let re_opt_deps = Regex::new(
         r"(?m)^\s*([A-Z0-9_]+)_(?:BUILD_DEPENDS|RUN_DEPENDS|LIB_DEPENDS|USE|USES)\s*[:\+\?]?=\s*(.+)$",
     ).ok()?;
+    // Anchored at the start of the line, so an option-conditional
+    // `FOO_BUILD_DEPENDS=` cannot be mistaken for an unconditional one.
+    let re_port_deps = Regex::new(&format!(
+        r"(?m)^\s*({})\s*[:\+\?]?=\s*(.+)$",
+        UNCONDITIONAL_DEP_VARS.join("|")
+    ))
+    .ok()?;
     let re_origin_extract = Regex::new(r"([a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+)").ok()?;
-    let re_var_assign = Regex::new(r"(?m)^\s*([A-Za-z0-9_]+)\s*[:\+\?]?=\s*(.+)$").ok()?;
+    let re_var_assign = Regex::new(r"(?m)^\s*([A-Za-z0-9_]+)\s*([:\+\?]?)=\s*(.+)$").ok()?;
 
     let port_folder = port_path.file_name()?.to_str()?;
 
+    // Assignment operators are honoured rather than everything being treated as
+    // `+=`. A port that sets the same variable under several conditionals — a
+    // `PKGNAMESUFFIX` per flavour, say — would otherwise accumulate every branch
+    // at once, and expansions using it come out as nonsense like
+    // `subversion-lts-lts-lts-lts-lts`.
+    //
+    // Only one branch of a conditional is ever really taken; reading the file
+    // linearly, last-one-wins is the closest approximation available without
+    // evaluating the Makefile.
     let mut vars: HashMap<String, String> = HashMap::new();
     for cap in re_var_assign.captures_iter(&content) {
-        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+        if let (Some(k), Some(op), Some(v)) = (cap.get(1), cap.get(2), cap.get(3)) {
             let key = k.as_str().trim().to_string();
             let val = v.as_str().trim().to_string();
-            vars.entry(key)
-                .and_modify(|e| {
-                    e.push(' ');
-                    e.push_str(&val);
-                })
-                .or_insert(val);
+
+            match op.as_str() {
+                "+" => vars
+                    .entry(key)
+                    .and_modify(|e| {
+                        e.push(' ');
+                        e.push_str(&val);
+                    })
+                    .or_insert(val),
+                // `?=` only applies when the variable has no value yet
+                "?" => vars.entry(key).or_insert(val),
+                _ => {
+                    vars.insert(key.clone(), val);
+                    vars.get_mut(&key).expect("just inserted")
+                }
+            };
         }
     }
 
@@ -252,6 +294,23 @@ fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
         }
     }
 
+    // Unconditional dependencies. A port can be named by several classes at
+    // once (LIB_DEPENDS and RUN_DEPENDS, typically); the first class wins, so
+    // that each edge appears in the tree exactly once.
+    let mut port_deps: Vec<(String, String)> = Vec::new();
+    for cap in re_port_deps.captures_iter(&content) {
+        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+            let dep_type = k.as_str().trim_end_matches("_DEPENDS");
+            let dep_val = expand_vars(v.as_str(), &vars);
+            for dep_match in re_origin_extract.find_iter(&dep_val) {
+                let dep_origin = dep_match.as_str();
+                if dep_origin != origin && !port_deps.iter().any(|(d, _)| d == dep_origin) {
+                    port_deps.push((dep_origin.to_string(), dep_type.to_string()));
+                }
+            }
+        }
+    }
+
     Some(ParsedPort {
         origin: origin.to_string(),
         name,
@@ -259,6 +318,7 @@ fn parse_port_dir(origin: &str, port_path: &Path) -> Option<ParsedPort> {
         comment,
         options,
         deps,
+        port_deps,
     })
 }
 
@@ -267,6 +327,7 @@ pub fn index_ports_dir(conn: &mut Connection, ports_dir: &Path) -> Result<Indexe
         ports_indexed: 0,
         options_indexed: 0,
         option_deps_indexed: 0,
+        port_deps_indexed: 0,
     };
 
     // 1. Collect all port directory targets
@@ -331,7 +392,32 @@ pub fn index_ports_dir(conn: &mut Connection, ports_dir: &Path) -> Result<Indexe
             )?;
             stats.option_deps_indexed += 1;
         }
+
+        for (dep_origin, dep_type) in port.port_deps {
+            tx.execute(
+                "INSERT OR REPLACE INTO port_deps (port_origin, dep_origin, dep_type)
+                 VALUES (?1, ?2, ?3)",
+                params![port.origin, dep_origin, dep_type],
+            )?;
+            stats.port_deps_indexed += 1;
+        }
     }
+
+    // Depends lines name their targets in forms the origin regex cannot always
+    // tell apart from a plain path (`${LOCALBASE}/bin/foo` collapses to
+    // `bin/foo` once an unresolved variable expands away). Anything that is not
+    // a port we actually indexed cannot be configured, so drop it rather than
+    // hang an empty node off the tree for it.
+    let pruned_opt = tx.execute(
+        "DELETE FROM option_deps WHERE dep_origin NOT IN (SELECT origin FROM ports)",
+        [],
+    )?;
+    let pruned_port = tx.execute(
+        "DELETE FROM port_deps WHERE dep_origin NOT IN (SELECT origin FROM ports)",
+        [],
+    )?;
+    stats.option_deps_indexed -= pruned_opt.min(stats.option_deps_indexed);
+    stats.port_deps_indexed -= pruned_port.min(stats.port_deps_indexed);
 
     tx.commit()?;
     Ok(stats)

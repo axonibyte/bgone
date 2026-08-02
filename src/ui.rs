@@ -1,4 +1,6 @@
-use crate::graph::{next_sibling_index, prev_sibling_index, DependencyGraph, RowKind};
+use crate::graph::{
+    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, RowKind, SectionKind,
+};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -17,6 +19,15 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::stdout;
+
+/// The action keys shown along the bottom of the screen.
+///
+/// A constant rather than an inline literal so `--help` can be checked against
+/// it. Every key advertised here has to be explained there, and drift between
+/// the two is invisible otherwise — `Ctrl + R` was dropped from this row once
+/// without anything noticing.
+pub const FOOTER_ACTION_KEYS: &str =
+    " Space toggle | Enter jump | Bksp back | Tab OK/Cancel | ^S save | q quit | ^L recenter | ^R redraw";
 
 pub enum TuiAction {
     SaveAndQuit,
@@ -204,6 +215,41 @@ fn button_row(buttons: &[(&str, bool)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Row index of the port `origin` is listed at, if it is currently listed. A
+/// search filter can hide it, which is why this is fallible.
+fn port_row_index(graph: &DependencyGraph, origin: &str) -> Option<usize> {
+    graph
+        .visible_rows
+        .iter()
+        .position(|r| matches!(&r.kind, RowKind::Port { origin: o, .. } if o == origin))
+}
+
+/// The port whose block `row` sits inside — the nearest port row at or above it.
+///
+/// Jump history is kept as origins rather than row indices because expanding a
+/// port rebuilds the row list and shifts every index after it.
+fn enclosing_port_origin(graph: &DependencyGraph, row: usize) -> Option<String> {
+    graph
+        .visible_rows
+        .get(..=row)?
+        .iter()
+        .rev()
+        .find_map(|r| match &r.kind {
+            RowKind::Port { origin, .. } => Some(origin.clone()),
+            _ => None,
+        })
+}
+
+/// Moves to `origin`'s entry, opening it on arrival. `None` when that port is
+/// not currently listed.
+fn jump_to_port(graph: &mut DependencyGraph, origin: &str) -> Option<usize> {
+    let port_id = graph.port_index(origin)?;
+    if !graph.ports[port_id].is_expanded {
+        graph.open_port(port_id);
+    }
+    port_row_index(graph, origin)
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -260,6 +306,9 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
     let mut recenter_pos: Option<RecenterPosition> = None;
     let mut last_tree_key: Option<char> = None;
     let mut viewport_height: usize = 0;
+    // Ports each jump came from, so Backspace can retrace it. Origins rather
+    // than row indices, which shift whenever the row list is rebuilt.
+    let mut jump_stack: Vec<String> = Vec::new();
 
     loop {
         let total_rows = graph.visible_rows.len();
@@ -281,7 +330,11 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
 
             // Target on the left, most recent action right-aligned, which keeps
             // the footer free for keybindings alone
-            let target = format!(" Target: {}", graph.root_origin);
+            let target = format!(
+                " Target: {}  ({} ports)",
+                graph.root_origin,
+                graph.live_count()
+            );
             let status = format!("{} ", status_msg);
             let gap = (chunks[0].width.saturating_sub(2) as usize)
                 .saturating_sub(target.chars().count() + status.chars().count())
@@ -309,19 +362,50 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
                 .iter()
                 .map(|row| {
                     let indent = "  ".repeat(row.depth);
-                    let line = match &row.kind {
-                        RowKind::Port { origin } => {
-                            let prefix = if row.has_children {
-                                if row.is_expanded {
-                                    "[-] "
-                                } else {
-                                    "[+] "
-                                }
+
+                    // Colour carries provenance: whether you asked for this port
+                    // or something else dragged it in.
+                    if let RowKind::Port { origin, provenance } = &row.kind {
+                        let prefix = if row.has_children {
+                            if row.is_expanded {
+                                "[-] "
                             } else {
-                                "    "
-                            };
-                            format!("{}{}{}", indent, prefix, origin)
-                        }
+                                "[+] "
+                            }
+                        } else {
+                            "    "
+                        };
+
+                        let name_style = match provenance {
+                            Provenance::Requested => Style::default().fg(Color::White),
+                            Provenance::Dependency => Style::default().fg(Color::Yellow),
+                        };
+
+                        return ListItem::new(Line::from(vec![
+                            Span::raw(format!("{}{}", indent, prefix)),
+                            Span::styled(origin.clone(), name_style),
+                        ]));
+                    }
+
+                    // `required by` marks conditional parents so it is clear at
+                    // a glance which of them would stop needing this port if an
+                    // option were turned off.
+                    if let RowKind::RequiredByEntry { origin, via_option } = &row.kind {
+                        let (text, style) = match via_option {
+                            Some(opt) => (
+                                format!("{}    {}  (via {})", indent, origin, opt),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            None => (
+                                format!("{}    {}", indent, origin),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        };
+                        return ListItem::new(Line::from(Span::styled(text, style)));
+                    }
+
+                    let line = match &row.kind {
+                        RowKind::Port { .. } | RowKind::RequiredByEntry { .. } => unreachable!(),
                         RowKind::Option {
                             name,
                             description,
@@ -371,6 +455,32 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
                                     indent, prefix, control, category_badge, name, description
                                 )
                             }
+                        }
+                        RowKind::DependsOn {
+                            origin,
+                            active: false,
+                        } => {
+                            // Nothing pulls it in right now, so it is not in the
+                            // list; turning this option on is what would add it
+                            format!("{}    {}  (not pulled in)", indent, origin)
+                        }
+                        RowKind::DependsOn { origin, .. } | RowKind::RequiresEntry { origin } => {
+                            format!("{}    {}", indent, origin)
+                        }
+                        RowKind::SectionHeader { kind, count } => {
+                            let prefix = if row.is_expanded { "[-] " } else { "[+] " };
+                            let label = match kind {
+                                SectionKind::Requires => "requires",
+                                SectionKind::RequiredBy => "required by",
+                            };
+                            format!(
+                                "{}{}--- {} {} port{} ---",
+                                indent,
+                                prefix,
+                                label,
+                                count,
+                                if *count == 1 { "" } else { "s" }
+                            )
                         }
                         RowKind::Info { message } => {
                             format!("{}* {}", indent, message)
@@ -425,15 +535,13 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 _ => (
-                    " =/- open/close row | +/_ open/close branch | ++/__ open/close tree | / search"
+                    " =/- open/close row | +/_ open/close branch | ++/__ open/close list | / search"
                         .to_string(),
                     Style::default().fg(Color::DarkGray),
                 ),
             };
 
-            let secondary_line =
-                " Space toggle | Tab OK/Cancel | ^S save | q quit | ^L recenter | ^R redraw"
-                    .to_string();
+            let secondary_line = FOOTER_ACTION_KEYS.to_string();
 
             let footer = Paragraph::new(Text::from(vec![
                 Line::styled(primary_line, primary_style),
@@ -553,6 +661,53 @@ pub fn run_tui(graph: &mut DependencyGraph) -> Result<TuiAction> {
                             KeyCode::BackTab => {
                                 focus = prev_focus(focus);
                             }
+
+                            // The list is flat, so a relationship is a reference
+                            // rather than a nested subtree: Enter follows it to
+                            // that port's own entry.
+                            KeyCode::Enter
+                                if focus == Focus::List
+                                    && graph
+                                        .visible_rows
+                                        .get(selected_index)
+                                        .and_then(|r| r.kind.jump_target())
+                                        .is_some() =>
+                            {
+                                let target = graph.visible_rows[selected_index]
+                                    .kind
+                                    .jump_target()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let from = enclosing_port_origin(graph, selected_index);
+
+                                match jump_to_port(graph, &target) {
+                                    Some(row) => {
+                                        if let Some(from) = from {
+                                            jump_stack.push(from);
+                                        }
+                                        list_state.select(Some(row));
+                                        status_msg = format!("Jumped to {}", target);
+                                    }
+                                    None => {
+                                        status_msg = format!("{} is not in the list", target);
+                                    }
+                                }
+                            }
+
+                            KeyCode::Backspace if focus == Focus::List => match jump_stack.pop() {
+                                Some(origin) => match jump_to_port(graph, &origin) {
+                                    Some(row) => {
+                                        list_state.select(Some(row));
+                                        status_msg = format!("Back to {}", origin);
+                                    }
+                                    None => {
+                                        status_msg = format!("{} is no longer listed", origin);
+                                    }
+                                },
+                                None => {
+                                    status_msg = String::from("No jump to go back from");
+                                }
+                            },
 
                             // Buttons: Enter presses the focused one, defaulting
                             // to OK while the list has focus, as dialog does

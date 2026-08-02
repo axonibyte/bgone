@@ -256,6 +256,32 @@ fn test_ports_list_ignores_fully_commented_and_blank_content() {
 // 4. BINARY BEHAVIOUR (non-interactive paths only)
 // ============================================================================
 
+/// Every key the footer advertises must be explained by `--help`.
+///
+/// The other direction is checked by hand below; this one is checked
+/// mechanically because the footer is a single line that is easy to edit
+/// without remembering that the help text exists.
+#[test]
+fn test_every_key_on_the_footer_is_explained_in_help() {
+    let help = stdout_of(&run(&["--help"]));
+
+    for hint in bgone::ui::FOOTER_ACTION_KEYS.split('|') {
+        let key = hint.trim().split_whitespace().next().unwrap_or_default();
+        // How the footer's shorthand is spelled out in the help text
+        let spelled = match key {
+            "^S" => "Ctrl + S",
+            "^L" => "Ctrl + L",
+            "^R" => "Ctrl + R",
+            "Bksp" => "Backspace",
+            other => other,
+        };
+        assert!(
+            help.contains(spelled),
+            "footer advertises {key:?} but --help never explains {spelled:?}"
+        );
+    }
+}
+
 #[test]
 fn test_help_documents_every_switch() {
     let out = run(&["--help"]);
@@ -290,6 +316,7 @@ fn test_help_documents_every_switch() {
         "+  /  _",
         "++ /  __",
         "o  /  c",
+        "Backspace",
     ] {
         assert!(help.contains(binding), "`--help` is missing {binding}");
     }
@@ -298,11 +325,20 @@ fn test_help_documents_every_switch() {
     for explanation in [
         "Just the row under the cursor",
         "That row and everything nested inside it",
-        "The whole tree",
+        "The whole list",
     ] {
         assert!(
             help.contains(explanation),
             "`--help` lists the expansion keys without explaining {explanation:?}"
+        );
+    }
+
+    // Relationships are references rather than nesting, so the keys that follow
+    // them have to be discoverable from --help
+    for explanation in ["jump to that port's own entry", "Go back the way you came"] {
+        assert!(
+            help.contains(explanation),
+            "`--help` does not explain how to follow a relationship: {explanation:?}"
         );
     }
 

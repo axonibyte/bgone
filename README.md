@@ -2,7 +2,7 @@
 
 **A reactive TUI ports configurator for FreeBSD.**
 
-`bgone` modernizes the traditional `make config` workflow. It parses FreeBSD port Makefiles, maps option dependency chains into a local SQLite database, and provides an interactive tree UI to inspect and configure port options across dependency chains in real time.
+`bgone` modernizes the traditional `make config` workflow. It indexes FreeBSD port Makefiles into a local SQLite database and presents every port in a build — targets and dependencies alike — as one flat, alphabetised list you can navigate and configure in a single pass.
 
 ---
 
@@ -14,20 +14,25 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * It is difficult to see how enabling an option on a parent port triggers options and dependencies several levels down.
 * Reviewing or changing previously saved options usually means stepping back through recursive menus.
 
-`bgone` indexes your ports tree into a local SQLite database, builds an in-memory graph of options and their sub-dependencies, and presents them in a single, navigable tree. You can expand subtrees, toggle radio choices, filter options, and save your selections to `/var/db/ports/` before starting a build.
+`bgone` indexes your ports tree into a local SQLite database and presents the whole build as one alphabetised list: every port appears exactly once, whether you asked for it or something else dragged it in. Relationships are shown as references you jump between rather than as nesting, so a dependency shared by five ports is one entry with one set of options, not five copies to keep in step. Toggle options, follow dependencies in either direction, and save to `/var/db/ports/` before starting a build.
 
 ---
 
 ## Features
 
-* **Reactive Dependency Graph**: View port options alongside the sub-dependencies they pull in. Toggle an option, and its downstream port options update immediately.
-* **Shared State for Repeated Ports**: A port that shows up more than once—as a dependency of several targets, or as both an explicit target and someone else's dependency—is a single configuration. Changing an option on one occurrence updates every other occurrence on the spot, and the port is still written out exactly once.
+* **Flat Port List**: Every reachable port is listed once, alphabetised by origin. No nesting to lose your place in, and no port drawn twice for you to reconcile.
+* **Provenance Colours**: White for ports you named, yellow for ports pulled in. Asking for a port by name outranks having it dragged in.
+* **Relationships, Both Directions**: Each port shows what its options pull in (`depends on`, under the option responsible), what it needs regardless of options (`requires`), and what pulls *it* in (`required by`, with conditional parents in yellow). `Enter` jumps to any of them; `Backspace` retraces.
+* **Live Reachability**: Turn an option off and the port it pulled in leaves the list, along with anything only that port needed. Its selections stay in memory, so turning the option back on restores them rather than resetting. Ports outside the list are not written.
+* **Complete Dependency Coverage**: Walks the same edges `poudriere options` does — both the option-conditional dependencies (`OPT_LIB_DEPENDS`) and the unconditional ones (`_UNIFIED_DEPENDS`: `PKG`, `EXTRACT`, `PATCH`, `FETCH`, `BUILD`, `LIB`, `RUN` and `TEST`). The walk follows chains to their end rather than stopping at a fixed depth; it terminates by reaching a port already on the list, which a finite ports tree guarantees.
 * **Multiple Targets & Globs**: Configure several ports in one session by listing origins, passing shell-style patterns (`"www/py-*"`), or reading a list from a file (`-f`).
 * **Option Groups & Radios**: Supports standard checkboxes (`[X]`), mutual-exclusion radio groups (`(*)`), and group categories (`<CATEGORY>`).
 * **Multi-Core Parallel Indexing**: Uses `rayon` to parse Makefile dependencies concurrently across CPU cores into a local SQLite cache (`bgone_cache.db`).
 * **System Option Preloading**: Reads existing configuration files from `/var/db/ports/<category>_<port>/options` and `/etc/make.conf` on startup so previously saved preferences are preserved.
-* **In-TUI Search (`/`)**: Filter visible tree rows by option name, description, or group name.
-* **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole tree preserves view preferences across state updates.
+* **Authoritative Port Details**: For the ports you are actually configuring, `bgone` asks the tree itself via `make describe-json`. It catches the roughly 1% of ports whose options the Makefile sweep cannot see — those inheriting through `MASTERDIR` — which are precisely the ones `poudriere options` would keep prompting for, and supplies the real `PKGNAME` for the file header. Cached until a port's Makefiles change; skip it with `--no-describe`.
+* **`make config` File Format**: Writes the same `OPTIONS_FILE_SET+=` / `OPTIONS_FILE_UNSET+=` files `make config` and `poudriere options` write, listing every option the port defines — which is what stops `make config-conditional` (and so `poudriere options` and `poudriere bulk`) from re-opening the dialog. Files in the older `WITH_`/`WITHOUT_` format are still read back.
+* **In-TUI Search (`/`)**: Filter rows by port origin, option name, description, or group name.
+* **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole list preserves view preferences across state updates.
 * **Familiar Controls**: Follows `bsddialog(1)` conventions—an `OK` / `Cancel` button row, `Space` to toggle, `Tab` to move focus, `Esc` to cancel—with a confirmation prompt guarding unsaved changes.
 * **Dry-Run Output**: Preview the exact files and flags that would be written before making changes on disk.
 
@@ -91,6 +96,41 @@ bgone index --ports-dir /usr/ports --force
 bgone index --ports-dir /usr/ports --db-path ~/.cache/bgone.db
 
 ```
+
+A cache written by an older `bgone` whose schema no longer matches is discarded on
+open, and `bgone` says so. Re-run `bgone index` to rebuild it — nothing else is
+lost, since the cache only ever mirrors the ports tree.
+
+The index sweep is fast because it reads Makefiles with regexes rather than
+evaluating them, which means it cannot see options a port inherits through
+`MASTERDIR`, options injected by `Mk/Uses/*.mk`, or a port's real `PKGNAME`. So
+the first time you configure a given set of ports, `bgone` asks the tree about
+just those ports with `make describe-json` and caches the answers until their
+Makefiles change:
+
+```
+[*] Reading details for 1476 ports from the tree...
+[+] 1476 read, 0 already current, 0 unavailable in 21.68s
+```
+
+Expect tens of seconds on a first run and effectively nothing afterwards. For
+scale, on a current tree `www/nginx` alone reaches 1,476 ports once unconditional
+dependencies are followed, and a seven-entry port list with globs reached 2,540.
+
+What this buys, measured against a current tree rather than assumed: sampling
+498 ports, the sweep and the tree agreed on the option set 99% of the time, and
+only 2 ports had options the sweep missed entirely — both inheriting through
+`MASTERDIR`, like `security/ossec-hids-agent`. That is a small share, but those
+are exactly the ports that keep re-opening the dialog. It also supplies the real
+`PKGNAME` (`pkgconf-2.4.3_1,1`, `py312-black-26.5.1`), which the sweep gets wrong
+for 88% of ports, though only the file header consumes that.
+
+Pass `--no-describe` to skip it. Without a readable tree `bgone` skips the pass
+automatically and says so.
+
+`COMPLETE_OPTIONS_LIST` can vary by architecture (`OPTIONS_DEFINE_${ARCH}`,
+`OPTIONS_EXCLUDE_${OPSYS}`). Details are read on the host, which may differ from
+a cross-architecture poudriere jail.
 
 ### 2. Configuring Ports
 
@@ -184,6 +224,46 @@ bgone -i "www/py-*" "www/rubygem-*"
 
 ```
 
+### Colours
+
+Colour carries **provenance**:
+
+| | Meaning |
+| --- | --- |
+| white | You named this port |
+| yellow | Something else pulled it in |
+| yellow, in `required by` | That parent needs this port only because an option is on |
+
+### Using `bgone` with `poudriere`
+
+`poudriere` keeps port options under `${POUDRIERE_ETC}/poudriere.d/`, in a directory whose
+name it derives from `-j`/`-p`/`-z`. Point `-o` at the same directory `poudriere` will read,
+and `bgone` becomes a drop-in replacement for `poudriere options`:
+
+```bash
+bgone -o /usr/local/etc/poudriere.d/HEAD-options -f /usr/local/etc/poudriere.d/port-list
+```
+
+At build time `poudriere` copies the **first** of these that exists into the jail's
+`/var/db/ports` — it does not merge them:
+
+| Directory | Scope |
+| --- | --- |
+| `<jail>-<tree>-<set>-options` | Exactly one jail, tree, and set |
+| `<jail>-<set>-options` | One jail and set |
+| `<jail>-<tree>-options` | One jail and tree — what `poudriere options -j <jail> -p <tree>` writes |
+| `<tree>-<set>-options`, `<set>-options` | One set |
+| `<tree>-options` | Every jail building from that ports tree |
+| `<jail>-options` | One jail, any tree |
+| `options` | Everything, when nothing above matches |
+
+Naming the jail ties the options to a jail you will eventually replace. Keying on the
+**ports tree** (`<tree>-options`, e.g. `HEAD-options`) survives jail upgrades and still
+takes precedence over the bare `options` fallback. Note that a leftover
+`<jail>-<tree>-options` directory outranks it — `poudriere options -j <jail> -p <tree>`
+creates one unconditionally, even if you cancel out of the dialog, so remove it if you
+did not mean to keep it.
+
 ---
 
 ## Keybindings Cheat Sheet
@@ -192,7 +272,7 @@ bgone -i "www/py-*" "www/rubygem-*"
 
 | Key | Action |
 | --- | --- |
-| **`Up` / `Down`** | Navigate tree rows |
+| **`Up` / `Down`** | Navigate list rows |
 | **`Shift + Up` / `Shift + Down`** | Jump to the previous / next sibling (see below) |
 | **`Ctrl + Up` / `Ctrl + Down`** | Navigate five rows at a time |
 | **`PgUp` / `PgDn`** | Navigate one screen at a time |
@@ -200,10 +280,12 @@ bgone -i "www/py-*" "www/rubygem-*"
 | **`Space`** | Toggle selected option or switch radio selection |
 | **`=`** / **`-`** | Open / close just the row under the cursor |
 | **`+`** / **`_`** | Open / close that row and everything nested inside it |
-| **`++`** / **`__`** | Open / close the whole tree (press the key twice) |
+| **`++`** / **`__`** | Open / close the whole list (press the key twice) |
+| **`Enter`** (on a relationship row) | Jump to that port's entry in the list |
+| **`Backspace`** | Retrace the last jump |
 | **`Tab`** / **`Shift + Tab`** | Move focus between the list and the `OK` / `Cancel` buttons |
 | **`Left` / `Right`** | Move between buttons while the button row has focus |
-| **`Enter`** | Press the focused button (`OK` while the list has focus) |
+| **`Enter`** (elsewhere) | Press the focused button (`OK` while the list has focus) |
 | **`o`** / **`c`** | Press `OK` / `Cancel` directly |
 | **`/`** or **`Ctrl + F`** | Open search / filter bar |
 | **`Ctrl + L`** | Recenter the cursor row and repaint (see below) |

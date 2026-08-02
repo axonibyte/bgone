@@ -17,7 +17,7 @@ KEYBINDINGS:
                       keeps the shape it already had, so re-opening the row
                       brings back the same view.
    +  /  _            That row and everything nested inside it, however deep.
-   ++ /  __           The whole tree. Press + or _ a second time, with no
+   ++ /  __           The whole list. Press + or _ a second time, with no
                       other key in between, to widen what you just did.
 
  MOVING AROUND
@@ -28,6 +28,14 @@ KEYBINDINGS:
    PgUp / PgDn        One screen
    Home / End         First / last row
 
+ FOLLOWING RELATIONSHIPS
+   Every port is listed once, so a dependency is shown as a reference rather
+   than by nesting the whole port underneath.
+
+   Enter              On a 'depends on', 'requires' or 'required by' entry,
+                      jump to that port's own entry and open it.
+   Backspace          Go back the way you came.
+
  CHOOSING OPTIONS
    Space              Turn the highlighted option on or off, or pick it when
                       it belongs to a radio group
@@ -35,11 +43,12 @@ KEYBINDINGS:
                       (Enter keeps the filter, Esc clears it)
 
  BUTTONS AND EXITING
-   Tab / Shift + Tab  Move the highlight between the tree and the
+   Tab / Shift + Tab  Move the highlight between the list and the
                       < OK > and < Cancel > buttons along the bottom
    Left / Right       Move between the two buttons
-   Enter              Press the highlighted button. While the highlight is
-                      still in the tree this presses < OK >.
+   Enter              Press the highlighted button. In the list it presses
+                      < OK >, unless the cursor is on a relationship entry,
+                      which it follows instead.
    o  /  c            Press < OK > / < Cancel > from anywhere
    Ctrl + S  or  s    Save the options and exit (same as < OK >)
    q  or  Esc         Exit without saving (same as < Cancel >). Asks you to
@@ -73,6 +82,15 @@ pub struct Cli {
     /// Perform a dry-run without writing files to disk
     #[arg(short = 'n', long)]
     pub dry_run: bool,
+
+    /// Skip asking the ports tree about the targeted ports.
+    ///
+    /// That pass exists to catch the roughly 1% of ports whose options the
+    /// Makefile sweep cannot see, which are the ones poudriere would keep
+    /// prompting for. Skipping it avoids a one-time cost on a cold cache and
+    /// costs nothing else beyond exact package names in the written headers.
+    #[arg(long)]
+    pub no_describe: bool,
 
     /// Discard previous database cache and rebuild schema
     #[arg(short = 'r', long)]
