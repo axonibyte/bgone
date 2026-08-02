@@ -50,22 +50,16 @@ fn test_reader_precedence_and_parsing() {
     let sys_opts = SystemOptions::load(&ports_dir, Some(&make_conf));
 
     // 1. Per-port overrides
-    assert_eq!(sys_opts.get_state("www/apache24", "HTTP2", false), true);
-    assert_eq!(sys_opts.get_state("www/apache24", "DOCS", true), false);
+    assert!(sys_opts.get_state("www/apache24", "HTTP2", false));
+    assert!(!sys_opts.get_state("www/apache24", "DOCS", true));
 
     // 2. Global make.conf overrides
-    assert_eq!(sys_opts.get_state("dns/bind9", "GLOBAL_SET", false), true);
-    assert_eq!(sys_opts.get_state("dns/bind9", "GLOBAL_UNSET", true), false);
+    assert!(sys_opts.get_state("dns/bind9", "GLOBAL_SET", false));
+    assert!(!sys_opts.get_state("dns/bind9", "GLOBAL_UNSET", true));
 
     // 3. Fallback to Makefile defaults when no override exists
-    assert_eq!(
-        sys_opts.get_state("www/apache24", "UNTOUCHED_OPT", true),
-        true
-    );
-    assert_eq!(
-        sys_opts.get_state("www/apache24", "UNTOUCHED_OPT", false),
-        false
-    );
+    assert!(sys_opts.get_state("www/apache24", "UNTOUCHED_OPT", true));
+    assert!(!sys_opts.get_state("www/apache24", "UNTOUCHED_OPT", false));
 }
 
 /// Files bgone wrote before it emitted `OPTIONS_FILE_SET`/`OPTIONS_FILE_UNSET`
@@ -85,8 +79,8 @@ fn test_reader_accepts_legacy_with_without_format() {
 
     let sys_opts = SystemOptions::load(&ports_dir, None);
 
-    assert_eq!(sys_opts.get_state("www/apache24", "HTTP2", false), true);
-    assert_eq!(sys_opts.get_state("www/apache24", "DOCS", true), false);
+    assert!(sys_opts.get_state("www/apache24", "HTTP2", false));
+    assert!(!sys_opts.get_state("www/apache24", "DOCS", true));
 }
 
 /// `OPTIONS_SET_FORCE` shares a prefix with `OPTIONS_SET` but is a different
@@ -104,8 +98,8 @@ fn test_reader_ignores_prefixed_lookalike_variables() {
 
     let sys_opts = SystemOptions::load(&temp.path.join("nonexistent"), Some(&make_conf));
 
-    assert_eq!(sys_opts.get_state("www/apache24", "PLAIN", false), true);
-    assert_eq!(sys_opts.get_state("www/apache24", "FORCED", false), false);
+    assert!(sys_opts.get_state("www/apache24", "PLAIN", false));
+    assert!(!sys_opts.get_state("www/apache24", "FORCED", false));
 }
 
 // ============================================================================
@@ -236,8 +230,8 @@ fn test_exported_options_round_trip_through_the_reader() {
 
     // Defaults inverted, so anything not genuinely read back flips state
     let reloaded = SystemOptions::load(&options_dir, None);
-    assert_eq!(reloaded.get_state("www/apache24", "HTTP2", false), true);
-    assert_eq!(reloaded.get_state("www/apache24", "DOCS", true), false);
+    assert!(reloaded.get_state("www/apache24", "HTTP2", false));
+    assert!(!reloaded.get_state("www/apache24", "DOCS", true));
 
     let regraph =
         DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &reloaded, false)
@@ -393,6 +387,294 @@ RUN_DEPENDS=  ${LOCALBASE}/bin/nowhere:devel/nonexistent
 }
 
 // ============================================================================
+// 3b. THE MAKEFILE SWEEP MEETS CONSTRUCTS IT CANNOT EVALUATE
+//
+// The indexer is a line-oriented regex sweep, not bmake. It never evaluates
+// `.if`, never expands `.for`, and never follows `.include` or `MASTERDIR`.
+// That is deliberate: `make describe-json` is run against the ports actually
+// targeted and is authoritative for which options exist, so the sweep only has
+// to be fast and approximately right.
+//
+// What follows pins what it does with the constructs it cannot evaluate, so
+// that changing any of it is a visible decision rather than an accident. Each
+// test says which way the approximation errs, because the two directions are
+// not equally safe: collecting an option that does not exist is harmless —
+// `bsd.options.mk` guards `OPTIONS_FILE_SET` with a membership test — whereas
+// missing one that does is what keeps `config-conditional` re-prompting.
+// ============================================================================
+
+/// A slave port keeps its options in the master's Makefile, so the sweep, which
+/// reads only the port's own directory, finds none of them.
+///
+/// Measured against the tree: 1,127 ports set `MASTERDIR`, and 1,043 of them
+/// (93%) come out of indexing with no options at all. `describe-json` supplies
+/// the names and defaults for whichever of them get targeted. What it cannot
+/// supply is descriptions or `SINGLE`/`MULTI`/`RADIO` grouping, so a slave port
+/// is configured as a flat list even where its master has a radio group — the
+/// degradation this test exists to make explicit rather than incidental.
+#[test]
+fn test_a_slave_port_inherits_no_options_from_its_master() {
+    let temp = TempDir::new("slave_port");
+    let ports_root = temp.path.join("ports");
+
+    let master = ports_root.join("mail").join("postfixadmin33");
+    fs::create_dir_all(&master).unwrap();
+    fs::write(
+        master.join("Makefile"),
+        r#"
+PORTNAME=   postfixadmin
+PORTVERSION=3.3.13
+COMMENT=    Web based virtual user administration
+
+OPTIONS_DEFINE=     DOCS FPM
+OPTIONS_SINGLE=     DB
+OPTIONS_SINGLE_DB=  MYSQL PGSQL
+OPTIONS_DEFAULT=    DOCS MYSQL
+
+FPM_DESC=   Use PHP-FPM
+MYSQL_DESC= MySQL backend
+PGSQL_DESC= PostgreSQL backend
+"#,
+    )
+    .unwrap();
+
+    // The real shape of a slave: a suffix, a pointer, and an include
+    let slave = ports_root.join("mail").join("postfixadmin33-lite");
+    fs::create_dir_all(&slave).unwrap();
+    fs::write(
+        slave.join("Makefile"),
+        r#"
+PKGNAMESUFFIX=  -lite
+MASTERDIR=      ${.CURDIR}/../postfixadmin33
+.include "${MASTERDIR}/Makefile"
+"#,
+    )
+    .unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let options_of = |origin: &str| -> Vec<String> {
+        conn.prepare("SELECT option_name FROM options WHERE port_origin = ?1 ORDER BY option_name")
+            .unwrap()
+            .query_map([origin], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert_eq!(
+        options_of("mail/postfixadmin33"),
+        vec!["DOCS", "FPM", "MYSQL", "PGSQL"],
+        "the master's own options are found normally"
+    );
+    assert!(
+        options_of("mail/postfixadmin33-lite").is_empty(),
+        "the sweep does not follow MASTERDIR, so the slave has nothing"
+    );
+
+    // The slave is still indexed as a port; only its options are missing, which
+    // is what makes the omission silent rather than obvious.
+    let indexed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ports WHERE origin = 'mail/postfixadmin33-lite'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, 1);
+
+    // ---- what describe-json then rescues, and what it does not ----
+    cache_details(
+        &conn,
+        "mail/postfixadmin33-lite",
+        "postfixadmin-lite-3.3.13",
+        "DOCS FPM MYSQL PGSQL",
+        "DOCS MYSQL",
+    );
+
+    let graph = DependencyGraph::load_from_db(
+        &conn,
+        &["mail/postfixadmin33-lite".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+
+    let opt = |name: &str| {
+        graph
+            .option_nodes
+            .iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("{name} missing after the merge"))
+    };
+
+    // Rescued: every option exists, with the tree's defaults
+    assert_eq!(graph.option_nodes.len(), 4);
+    assert!(opt("DOCS").enabled);
+    assert!(opt("MYSQL").enabled);
+    assert!(!opt("FPM").enabled);
+    assert!(!opt("PGSQL").enabled);
+
+    // Not rescued: describe-json carries neither of these, and the index had
+    // nothing to match them against. MYSQL/PGSQL are a radio group in the
+    // master and are presented here as two independent checkboxes.
+    assert_eq!(opt("MYSQL").description, "");
+    assert_eq!(opt("PGSQL").description, "");
+    assert_eq!(opt("MYSQL").group_type, "DEFINE");
+    assert_eq!(opt("PGSQL").group_type, "DEFINE");
+    assert_eq!(opt("MYSQL").group_name, "");
+}
+
+/// Conditionals are not evaluated, so an option defined in either branch of an
+/// `.if` is collected from *both*. It errs towards over-collecting, which is
+/// the harmless direction.
+#[test]
+fn test_options_from_every_branch_of_a_conditional_are_collected() {
+    let temp = TempDir::new("branches");
+    let ports_root = temp.path.join("ports");
+    let port = ports_root.join("www").join("branchy");
+    fs::create_dir_all(&port).unwrap();
+
+    fs::write(
+        port.join("Makefile"),
+        r#"
+PORTNAME=   branchy
+PORTVERSION=1.0
+COMMENT=    Defines different options per architecture
+
+OPTIONS_DEFINE= COMMON
+.if ${ARCH} == amd64
+OPTIONS_DEFINE+=    SIMD
+.else
+OPTIONS_DEFINE+=    PORTABLE
+.endif
+
+.if ${OPSYS} == FreeBSD
+OPTIONS_DEFINE+=    JAIL
+.endif
+"#,
+    )
+    .unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let names: Vec<String> = conn
+        .prepare("SELECT option_name FROM options WHERE port_origin = 'www/branchy' ORDER BY option_name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["COMMON", "JAIL", "PORTABLE", "SIMD"],
+        "both arms of the .if are taken, and the .endif is not honoured"
+    );
+}
+
+/// Scalar assignments are last-one-wins across branches, and the operator is
+/// honoured rather than everything being treated as `+=`.
+///
+/// Treating them all as `+=` would accumulate every branch at once, and any
+/// expansion using the variable would come out as nonsense — the
+/// `subversion-lts-lts-lts-lts-lts` case the parser documents.
+#[test]
+fn test_a_variable_set_in_several_branches_takes_the_last_one() {
+    let temp = TempDir::new("last_wins");
+    let ports_root = temp.path.join("ports");
+    let port = ports_root.join("www").join("varsy");
+    fs::create_dir_all(&port).unwrap();
+
+    fs::write(
+        port.join("Makefile"),
+        r#"
+PORTNAME=   varsy
+.if ${FLAVOR} == lts
+SUFFIX=     -lts
+.else
+SUFFIX=     -current
+.endif
+PORTVERSION=1.0${SUFFIX}
+COMMENT=    Version carries whichever suffix was assigned last
+"#,
+    )
+    .unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let version: String = conn
+        .query_row(
+            "SELECT version FROM ports WHERE origin = 'www/varsy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        version, "1.0-current",
+        "the last assignment wins; concatenating both would give 1.0-lts-current"
+    );
+}
+
+/// `.for` loops are not expanded, so options generated by one are dropped
+/// entirely — the *unsafe* direction, and the reason describe-json is not
+/// optional for these ports.
+///
+/// The loop variable is never bound, so `${O}` expands to the empty string and
+/// fails the option-name check. 60 ports in the tree build options this way.
+#[test]
+fn test_options_generated_by_a_for_loop_are_dropped() {
+    let temp = TempDir::new("for_loop");
+    let ports_root = temp.path.join("ports");
+    let port = ports_root.join("www").join("loopy");
+    fs::create_dir_all(&port).unwrap();
+
+    fs::write(
+        port.join("Makefile"),
+        r#"
+PORTNAME=   loopy
+PORTVERSION=1.0
+COMMENT=    Builds its option list with a .for
+
+OPTIONS_DEFINE= KEPT
+.for O in ALPHA BETA GAMMA
+OPTIONS_DEFINE+=    ${O}
+${O}_DESC=          Support for ${O}
+.endfor
+"#,
+    )
+    .unwrap();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT option_name FROM options WHERE port_origin = 'www/loopy' ORDER BY option_name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["KEPT"],
+        "ALPHA/BETA/GAMMA are lost: the loop variable is unbound, so ${{O}} \
+         expands to nothing and the empty name is rejected"
+    );
+}
+
+// ============================================================================
 // 4. GRAPH ENGINE TESTS (Radio Buttons, Search, Expansion)
 // ============================================================================
 
@@ -433,6 +715,9 @@ fn test_graph_radio_group_mutual_exclusion() {
     assert!(graph.option_nodes[1].enabled); // ENGINE_B enabled
 }
 
+/// Search narrows by port origin. An option name is not searched — this test
+/// used to assert the opposite, that searching "SSL" kept the OPENSSL option
+/// row, which is what left options stranded without their ports.
 #[test]
 fn test_graph_search_filtering() {
     let conn = Connection::open_in_memory().unwrap();
@@ -459,11 +744,19 @@ fn test_graph_search_filtering() {
     graph.expand_all();
     let total_unfiltered_rows = graph.visible_rows.len();
 
-    // Filter for "SSL"
+    // "SSL" appears in an option name and an option description, but not in the
+    // origin, so it matches nothing at all
     graph.search_query = "SSL".to_string();
     graph.rebuild_visible_rows();
+    assert!(
+        graph.visible_rows.is_empty(),
+        "an option name must not pull its port into the results"
+    );
 
-    assert!(graph.visible_rows.len() < total_unfiltered_rows);
+    // The origin does match, and brings the whole port back with it
+    graph.search_query = "curl".to_string();
+    graph.rebuild_visible_rows();
+    assert_eq!(graph.visible_rows.len(), total_unfiltered_rows);
     assert!(graph.visible_rows.iter().any(|r| match &r.kind {
         RowKind::Option { name, .. } => name == "OPENSSL",
         _ => false,
@@ -1490,8 +1783,16 @@ fn test_double_tap_escalates_from_section_to_whole_tree() {
 #[test]
 fn test_tree_op_ignores_unrelated_keys() {
     for c in ['a', ' ', 'q', ']', '[', '5'] {
-        assert_eq!(tree_op(c, false), None, "key {c:?} should not touch the tree");
-        assert_eq!(tree_op(c, true), None, "key {c:?} should not touch the tree");
+        assert_eq!(
+            tree_op(c, false),
+            None,
+            "key {c:?} should not touch the tree"
+        );
+        assert_eq!(
+            tree_op(c, true),
+            None,
+            "key {c:?} should not touch the tree"
+        );
     }
 }
 
@@ -1620,7 +1921,10 @@ fn test_graph_is_clean_when_first_loaded() {
     let patterns = vec!["www/root1".to_string()];
     let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
 
-    assert!(!graph.is_dirty(), "a freshly loaded tree has nothing to save");
+    assert!(
+        !graph.is_dirty(),
+        "a freshly loaded tree has nothing to save"
+    );
 }
 
 #[test]
@@ -1795,7 +2099,7 @@ fn group_db() -> Connection {
         .unwrap();
     }
 
-    let mut add = |origin: &str, opt: &str, default: i32, gt: &str, gn: &str| {
+    let add = |origin: &str, opt: &str, default: i32, gt: &str, gn: &str| {
         conn.execute(
             "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
              VALUES (?1, ?2, ?3, '', ?4, ?5)",
@@ -2066,5 +2370,183 @@ fn test_without_groups_a_toggle_touches_only_its_own_port() {
     );
     for origin in ["lang/php84-extensions", "lang/php85-extensions"] {
         assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(false), "{origin}");
+    }
+}
+
+// ============================================================================
+// 11. SEARCH (narrows which ports are listed, on their origin)
+// ============================================================================
+
+/// Three ports where the word "postgres" appears in a *different* place for
+/// each: one origin, one option description, one option name.
+fn search_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    for (origin, opt, desc) in [
+        ("databases/postgresql16-server", "SSL", "Secure sockets"),
+        ("devel/git", "DOCS", "Postgres support"),
+        ("www/nginx", "POSTGRES", "Database backend"),
+    ] {
+        conn.execute(
+            "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
+            rusqlite::params![origin, origin.split('/').nth(1).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
+             VALUES (?1, ?2, 1, ?3, 'DEFINE', '')",
+            rusqlite::params![origin, opt, desc],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO port_deps (port_origin, dep_origin, dep_type)
+         VALUES ('www/nginx', 'databases/postgresql16-server', 'LIB')",
+        [],
+    )
+    .unwrap();
+    conn
+}
+
+fn searched(graph: &mut DependencyGraph, query: &str) -> Vec<String> {
+    graph.search_query = query.to_string();
+    graph.rebuild_visible_rows();
+    listed_origins(graph)
+}
+
+fn search_graph() -> DependencyGraph {
+    let conn = search_db();
+    let targets: Vec<String> = ["databases/postgresql16-server", "devel/git", "www/nginx"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut graph =
+        DependencyGraph::load_from_db(&conn, &targets, &SystemOptions::default(), false).unwrap();
+    graph.expand_all();
+    graph
+}
+
+/// Search matches the port origin and nothing else. An option whose name or
+/// description happens to contain the word does not drag its port in.
+#[test]
+fn search_matches_port_origins_only() {
+    let mut graph = search_graph();
+
+    assert_eq!(
+        searched(&mut graph, "postgres"),
+        vec!["databases/postgresql16-server"],
+        "devel/git matched only in a description and www/nginx only in an option name"
+    );
+
+    // The category half of the origin works too
+    assert_eq!(
+        searched(&mut graph, "databases/"),
+        vec!["databases/postgresql16-server"]
+    );
+    // ...as does a fragment of the name half
+    assert_eq!(searched(&mut graph, "ngin"), vec!["www/nginx"]);
+}
+
+/// A port that matches is shown whole. Filtering row by row used to sever
+/// options from their port and leave section headers with nothing under them.
+#[test]
+fn a_matching_port_keeps_all_of_its_rows() {
+    let mut graph = search_graph();
+    searched(&mut graph, "postgres");
+
+    // header, its option, the required-by header, and the entry under it
+    let kinds: Vec<&str> = graph
+        .visible_rows
+        .iter()
+        .map(|r| match &r.kind {
+            RowKind::Port { .. } => "port",
+            RowKind::Option { .. } => "option",
+            RowKind::SectionHeader { .. } => "section",
+            RowKind::RequiredByEntry { .. } => "required-by",
+            RowKind::RequiresEntry { .. } => "requires",
+            RowKind::DependsOn { .. } => "depends-on",
+            RowKind::Info { .. } => "info",
+        })
+        .collect();
+
+    assert_eq!(kinds, vec!["port", "option", "section", "required-by"]);
+}
+
+/// Every row shown has to belong to a port that is shown. An orphaned option or
+/// a section header with no port above it is what made this confusing.
+#[test]
+fn no_row_is_left_without_its_port() {
+    let mut graph = search_graph();
+
+    for query in ["postgres", "git", "www", "zzz-matches-nothing", ""] {
+        searched(&mut graph, query);
+
+        let mut seen_a_port = false;
+        for row in &graph.visible_rows {
+            match &row.kind {
+                RowKind::Port { .. } => seen_a_port = true,
+                other => assert!(
+                    seen_a_port,
+                    "query {query:?} left {other:?} with no port above it"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn search_is_case_insensitive_and_can_match_nothing() {
+    let mut graph = search_graph();
+
+    assert_eq!(
+        searched(&mut graph, "POSTGRESQL16"),
+        vec!["databases/postgresql16-server"]
+    );
+    assert!(searched(&mut graph, "no-such-port").is_empty());
+
+    // ...and clearing it brings everything back
+    assert_eq!(searched(&mut graph, "").len(), 3);
+}
+
+/// The count in the header comes from this, and has to follow the filter.
+#[test]
+fn the_listed_port_count_follows_the_filter() {
+    let mut graph = search_graph();
+
+    assert_eq!(graph.listed_port_count(), 3);
+    assert_eq!(
+        graph.live_count(),
+        3,
+        "filtering does not change reachability"
+    );
+
+    searched(&mut graph, "postgres");
+    assert_eq!(graph.listed_port_count(), 1);
+    assert_eq!(
+        graph.live_count(),
+        3,
+        "a search hides ports; it does not remove them from the build"
+    );
+}
+
+/// A filtered-out port keeps its options, so they are still written on save.
+/// Search is a view, not a selection.
+#[test]
+fn filtering_does_not_change_what_gets_written() {
+    let temp = TempDir::new("search_export");
+    let options_dir = temp.path.join("ports");
+
+    let mut graph = search_graph();
+    searched(&mut graph, "postgres");
+    assert_eq!(graph.listed_port_count(), 1);
+
+    exporter::export_options(&graph, &options_dir, false, None).unwrap();
+
+    for port in ["databases_postgresql16-server", "devel_git", "www_nginx"] {
+        assert!(
+            options_dir.join(port).join("options").exists(),
+            "{port} was hidden by the filter but must still be written"
+        );
     }
 }

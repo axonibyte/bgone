@@ -115,7 +115,18 @@ fn test_short_switches_parse() {
 #[test]
 fn test_long_switches_parse_identically_to_short() {
     let short = parse(&[
-        "-d", "a.db", "-o", "b", "-m", "c", "-n", "-r", "-i", "-f", "d", "www/nginx",
+        "-d",
+        "a.db",
+        "-o",
+        "b",
+        "-m",
+        "c",
+        "-n",
+        "-r",
+        "-i",
+        "-f",
+        "d",
+        "www/nginx",
     ]);
     let long = parse(&[
         "--db-path",
@@ -280,7 +291,7 @@ fn test_every_key_on_the_footer_is_explained_in_help() {
         .lines()
         .flat_map(|row| row.split('|'))
     {
-        let key = hint.trim().split_whitespace().next().unwrap_or_default();
+        let key = hint.split_whitespace().next().unwrap_or_default();
         // How the footer's shorthand is spelled out in the help text
         let spelled = match key {
             "^S" => "Ctrl + S",
@@ -487,12 +498,7 @@ fn test_missing_ports_file_exits_with_an_error() {
     let db = temp.join("cache.db");
     let missing = temp.join("nope.txt");
 
-    let out = run(&[
-        "-d",
-        db.to_str().unwrap(),
-        "-f",
-        missing.to_str().unwrap(),
-    ]);
+    let out = run(&["-d", db.to_str().unwrap(), "-f", missing.to_str().unwrap()]);
 
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr_of(&out).contains("Error reading ports file"));

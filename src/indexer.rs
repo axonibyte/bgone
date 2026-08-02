@@ -61,8 +61,8 @@ fn preprocess_makefile(content: &str) -> String {
         };
 
         let trimmed = line_without_comment.trim_end();
-        if trimmed.ends_with('\\') {
-            result.push_str(&trimmed[..trimmed.len() - 1]);
+        if let Some(continued) = trimmed.strip_suffix('\\') {
+            result.push_str(continued);
             result.push(' ');
         } else {
             result.push_str(trimmed);
@@ -421,4 +421,133 @@ pub fn index_ports_dir(conn: &mut Connection, ports_dir: &Path) -> Result<Indexe
 
     tx.commit()?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------ preprocess_makefile
+
+    /// A continued line becomes one line, so a regex anchored at `^` sees the
+    /// whole value rather than just the first fragment.
+    #[test]
+    fn a_backslash_continuation_is_folded_into_one_line() {
+        let out = preprocess_makefile("OPTIONS_DEFINE= ALPHA \\\n\tBETA GAMMA\nPORTNAME= x\n");
+        let first = out.lines().next().unwrap();
+        assert!(first.contains("ALPHA"), "got {first:?}");
+        assert!(
+            first.contains("BETA") && first.contains("GAMMA"),
+            "the continuation should be on the same line: {first:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_is_stripped() {
+        let out = preprocess_makefile("OPTIONS_DEFINE= SSL # enable TLS\n");
+        assert_eq!(out, "OPTIONS_DEFINE= SSL\n");
+    }
+
+    /// Comment stripping cuts at the *first* `#` anywhere on the line, which is
+    /// not what bmake does — there, a `#` only opens a comment at the start of a
+    /// line or after whitespace. A URL fragment or a `:M#` modifier is therefore
+    /// truncated.
+    ///
+    /// Pinned rather than fixed because nothing downstream reads the affected
+    /// variables: option names, descriptions and dependency origins never
+    /// legitimately contain `#`. It is here so the next person to look at a
+    /// mangled `MASTER_SITES` finds the cause immediately.
+    #[test]
+    fn a_hash_inside_a_value_truncates_it_too() {
+        let out = preprocess_makefile("MASTER_SITES= https://example.invalid/x#frag\n");
+        assert_eq!(out, "MASTER_SITES= https://example.invalid/x\n");
+    }
+
+    // ------------------------------------------------------------- expand_vars
+
+    fn vars_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn all_three_reference_forms_expand() {
+        let vars = vars_of(&[("PORTNAME", "nginx")]);
+        assert_eq!(expand_vars("${PORTNAME}", &vars), "nginx");
+        assert_eq!(expand_vars("$(PORTNAME)", &vars), "nginx");
+        assert_eq!(expand_vars("$PORTNAME", &vars), "nginx");
+    }
+
+    /// bmake reads a bare `$` as taking exactly one character, so `$FOO` there
+    /// means `${F}OO`. This takes the whole identifier instead.
+    ///
+    /// A deviation, but a safe one in this direction: ports write `${FOO}` and
+    /// the single-character form is vanishingly rare outside `$$` and shell
+    /// lines, which are not read here.
+    #[test]
+    fn a_bare_dollar_takes_the_whole_name_unlike_bmake() {
+        let vars = vars_of(&[("F", "one"), ("FOO", "two")]);
+        assert_eq!(expand_vars("$FOO", &vars), "two");
+    }
+
+    #[test]
+    fn references_nest() {
+        let vars = vars_of(&[("A", "${B}"), ("B", "leaf")]);
+        assert_eq!(expand_vars("${A}", &vars), "leaf");
+    }
+
+    /// An unknown variable expands to nothing rather than being left alone.
+    ///
+    /// This is what drops `.for`-generated options: the loop variable is never
+    /// bound, so `OPTIONS_DEFINE+=${O}` yields an empty name that
+    /// [`is_valid_option_name`] then rejects.
+    #[test]
+    fn an_unknown_reference_expands_to_nothing() {
+        let vars = vars_of(&[("KNOWN", "yes")]);
+        assert_eq!(expand_vars("${UNSET}", &vars), "");
+        assert_eq!(expand_vars("a${UNSET}b", &vars), "ab");
+        assert!(!is_valid_option_name(&expand_vars("${O}", &vars)));
+    }
+
+    /// Expansion gives up after five rounds, leaving the reference in place.
+    ///
+    /// The cap is what stops a self-referential `A=${A}` spinning; the cost is
+    /// that a chain deeper than five resolves partly, and a leftover `${...}`
+    /// is then rejected as an option name rather than being silently accepted.
+    #[test]
+    fn expansion_gives_up_after_five_rounds() {
+        let deep = vars_of(&[
+            ("A", "${B}"),
+            ("B", "${C}"),
+            ("C", "${D}"),
+            ("D", "${E}"),
+            ("E", "${F}"),
+            ("F", "end"),
+        ]);
+        assert_eq!(expand_vars("${A}", &deep), "${F}");
+
+        let cyclic = vars_of(&[("LOOP", "${LOOP}")]);
+        assert_eq!(expand_vars("${LOOP}", &cyclic), "${LOOP}");
+    }
+
+    // ------------------------------------------------------ is_valid_option_name
+
+    #[test]
+    fn option_names_are_uppercase_digits_and_underscores() {
+        for ok in ["SSL", "HTTP2", "GZIP_DEF", "X"] {
+            assert!(is_valid_option_name(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",        // an unexpanded loop variable, post-expansion
+            "ssl",     // lowercase
+            "123",     // digits alone, no letter to make it a name
+            "SSL-X",   // punctuation
+            "${O}",    // an expansion that did not resolve
+            "SSL DEF", // two names that failed to be split
+        ] {
+            assert!(!is_valid_option_name(bad), "{bad:?} should be rejected");
+        }
+    }
 }

@@ -1,6 +1,7 @@
 use crate::config::save_groups;
 use crate::graph::{
-    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, RowKind, SectionKind,
+    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, RowAnchor, RowKind,
+    SectionKind,
 };
 use anyhow::Result;
 use crossterm::{
@@ -279,6 +280,100 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// True when a key means "rub out the character behind the cursor".
+///
+/// Terminals disagree about backspace. Most send DEL (`0x7F`), which crossterm
+/// reports as [`KeyCode::Backspace`]; some send BS (`0x08`), which its parser
+/// folds into the `0x01..=0x1A` control range and reports as `Ctrl+H` instead
+/// (`crossterm/src/event/sys/unix/parse.rs`). Text entry has to accept both or
+/// it silently ignores the key on half the terminals in use — and `Ctrl+H` has
+/// meant backspace since long before either of them.
+fn is_backspace(code: KeyCode, has_ctrl: bool) -> bool {
+    matches!(code, KeyCode::Backspace) || (has_ctrl && matches!(code, KeyCode::Char('h')))
+}
+
+/// Names the row at `index` for a status message — what was acted on, rather
+/// than the row number it happened to have.
+fn row_label(graph: &DependencyGraph, index: usize) -> String {
+    match graph.visible_rows.get(index).map(|r| &r.kind) {
+        Some(RowKind::Port { origin, .. }) => origin.clone(),
+        Some(RowKind::Option { name, .. }) => name.clone(),
+        Some(RowKind::SectionHeader { kind, .. }) => match kind {
+            SectionKind::Requires => String::from("requires"),
+            SectionKind::RequiredBy => String::from("required by"),
+        },
+        _ => String::from("this row"),
+    }
+}
+
+/// Applies an editing key to a text field, reporting whether it was one.
+///
+/// Shared by the two prompts and the search bar so they all edit alike: typing
+/// and rubbing out happen *at* the caret rather than always at the end, which is
+/// what makes moving it worth anything.
+///
+/// The caret is counted in characters, not bytes. Port origins and file paths
+/// can carry multibyte characters, and `String::insert`/`remove` at a byte
+/// offset landing inside one would panic.
+fn edit_field(text: &mut String, cursor: &mut usize, code: KeyCode, has_ctrl: bool) -> bool {
+    let chars = text.chars().count();
+    *cursor = (*cursor).min(chars);
+    let byte_at = |t: &str, i: usize| t.char_indices().nth(i).map(|(b, _)| b).unwrap_or(t.len());
+
+    if is_backspace(code, has_ctrl) {
+        if *cursor > 0 {
+            let at = byte_at(text, *cursor - 1);
+            text.remove(at);
+            *cursor -= 1;
+        }
+        return true;
+    }
+
+    match code {
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(chars),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = chars,
+        KeyCode::Delete => {
+            if *cursor < chars {
+                let at = byte_at(text, *cursor);
+                text.remove(at);
+            }
+        }
+        // A control chord must not type itself into the field
+        KeyCode::Char(c) if !has_ctrl => {
+            let at = byte_at(text, *cursor);
+            text.insert(at, c);
+            *cursor += 1;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Renders a field with a block caret sitting on the character it is in front
+/// of, so its position is visible rather than implied.
+fn field_spans(text: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
+    let at = text
+        .char_indices()
+        .nth(cursor)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len());
+    let (before, rest) = text.split_at(at);
+    let mut rest_chars = rest.chars();
+    let under = rest_chars.next();
+    let after: String = rest_chars.collect();
+
+    vec![
+        Span::styled(before.to_string(), style),
+        Span::styled(
+            under.map(String::from).unwrap_or_else(|| " ".to_string()),
+            style.add_modifier(Modifier::REVERSED),
+        ),
+        Span::styled(after, style),
+    ]
+}
+
 /// One line of the group manager: either a group's name or one of its members.
 ///
 /// Flattened per frame rather than kept as state, so the view cannot drift out
@@ -427,19 +522,21 @@ fn render_group_manage(
 }
 
 /// Shared single-line text prompt, for a new group name or a config path.
-fn render_prompt(f: &mut Frame, title: &str, question: &str, buffer: &str) {
+fn render_prompt(f: &mut Frame, title: &str, question: &str, buffer: &str, cursor: usize) {
     let area = centered_rect(70, 7, f.size());
     f.render_widget(Clear, area);
 
     let body = Text::from(vec![
         Line::from(""),
         Line::from(question.to_string()),
-        Line::styled(
-            format!("  {buffer}_"),
-            Style::default()
+        {
+            let style = Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+                .add_modifier(Modifier::BOLD);
+            let mut spans = vec![Span::styled("  ", style)];
+            spans.extend(field_spans(buffer, cursor, style));
+            Line::from(spans)
+        },
         Line::from(""),
         Line::styled(
             "Enter confirm | Esc cancel",
@@ -500,6 +597,8 @@ struct App {
     group_target: Option<String>,
     group_cursor: usize,
     text_buffer: String,
+    /// Caret position within whichever field is being typed into, in characters.
+    text_cursor: usize,
 }
 
 impl App {
@@ -520,6 +619,7 @@ impl App {
             group_target: None,
             group_cursor: 0,
             text_buffer: String::new(),
+            text_cursor: 0,
         }
     }
 }
@@ -535,6 +635,69 @@ enum KeyOutcome {
 }
 
 impl App {
+    /// Writes the groups out if a config file is already known.
+    ///
+    /// Applied to every change to a group, not only additions: if adding saved
+    /// but removing did not, deleting something and quitting would leave it in
+    /// the file, and the config would quietly disagree with what was on screen.
+    ///
+    /// With no config file chosen there is nowhere to write, and interrupting an
+    /// edit to demand a path would be worse than waiting — the manager's `s` is
+    /// there for that.
+    fn autosave_groups(&mut self, graph: &DependencyGraph, did: &str) {
+        let Some(path) = self.config_path.clone() else {
+            self.status_msg = format!("{did} (unsaved; no config file)");
+            return;
+        };
+        match save_groups(&path, &graph.groups) {
+            Ok(()) => self.status_msg = format!("{did}, saved"),
+            Err(e) => self.status_msg = format!("{did}, but could not save: {e}"),
+        }
+    }
+
+    /// Puts the cursor back on the row it was on before the row list changed.
+    ///
+    /// Expanding or collapsing renumbers everything below the change, so keeping
+    /// the row *number* still slides the highlight onto some unrelated line.
+    /// Keeping the row itself still is what a reader expects. When that row is
+    /// no longer shown — collapsing a port hides the option the cursor was on —
+    /// the anchor falls outwards to the port it belonged to.
+    fn restore_anchor(&mut self, graph: &DependencyGraph, anchor: Option<RowAnchor>) {
+        let here = self.list_state.selected().unwrap_or(0);
+        self.restore_anchor_or(graph, anchor, here);
+    }
+
+    /// As [`restore_anchor`](Self::restore_anchor), but says where to land when
+    /// the anchored row is gone entirely.
+    fn restore_anchor_or(
+        &mut self,
+        graph: &DependencyGraph,
+        anchor: Option<RowAnchor>,
+        fallback: usize,
+    ) {
+        let last = graph.visible_rows.len().saturating_sub(1);
+        let row = anchor
+            .and_then(|a| graph.row_of_anchor(&a))
+            .unwrap_or(fallback);
+        self.list_state.select(Some(row.min(last)));
+    }
+
+    /// Moves the list cursor `delta` rows from `from`, clamped to the list.
+    ///
+    /// Shared by Normal mode and the search bar so that a row moved to while
+    /// the query is still being typed lands exactly where the same keystroke
+    /// would land afterwards — in particular, clamping to the *filtered* list,
+    /// so holding Down cannot walk off the last match into hidden rows.
+    fn move_selection(&mut self, from: usize, delta: isize, total_rows: usize) {
+        let last = total_rows.saturating_sub(1);
+        let row = if delta < 0 {
+            from.saturating_sub(delta.unsigned_abs())
+        } else {
+            from.saturating_add(delta as usize).min(last)
+        };
+        self.list_state.select(Some(row));
+    }
+
     /// Folds one keystroke into the state, reporting anything the event loop
     /// has to act on. Pure with respect to the terminal, so it can be driven
     /// directly by tests.
@@ -597,6 +760,7 @@ impl App {
                         if self.group_cursor == count {
                             // "<new group...>"
                             self.text_buffer.clear();
+                            self.text_cursor = 0;
                             self.input_mode = InputMode::GroupNewName;
                         } else {
                             let name = graph
@@ -621,16 +785,13 @@ impl App {
                 }
             }
 
-            InputMode::GroupNewName if has_ctrl => {}
+            InputMode::GroupNewName
+                if edit_field(&mut self.text_buffer, &mut self.text_cursor, code, has_ctrl) => {}
             InputMode::GroupNewName => match code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
                     self.group_target = None;
                 }
-                KeyCode::Backspace => {
-                    self.text_buffer.pop();
-                }
-                KeyCode::Char(c) => self.text_buffer.push(c),
                 KeyCode::Enter => {
                     let name = self.text_buffer.trim().to_string();
                     let target = self.group_target.clone().unwrap_or_default();
@@ -642,7 +803,7 @@ impl App {
                             members.push(target.clone());
                             members.sort();
                         }
-                        self.status_msg = format!("Added {target} to {name}");
+                        self.autosave_groups(graph, &format!("Added {target} to {name}"));
                         self.input_mode = InputMode::Normal;
                         self.group_target = None;
                     }
@@ -662,8 +823,9 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Delete => {
                         match rows.get(self.group_cursor) {
                             Some(ManageRow::Group(name)) => {
-                                graph.groups.remove(name);
-                                self.status_msg = format!("Deleted group {name}");
+                                let name = name.clone();
+                                graph.groups.remove(&name);
+                                self.autosave_groups(graph, &format!("Deleted group {name}"));
                             }
                             Some(ManageRow::Member { group, origin }) => {
                                 if let Some(members) = graph.groups.get_mut(group) {
@@ -678,7 +840,10 @@ impl App {
                                 {
                                     graph.groups.remove(group);
                                 }
-                                self.status_msg = format!("Removed {origin} from {group}");
+                                self.autosave_groups(
+                                    graph,
+                                    &format!("Removed {origin} from {group}"),
+                                );
                             }
                             None => {}
                         }
@@ -694,6 +859,7 @@ impl App {
                         },
                         None => {
                             self.text_buffer.clear();
+                            self.text_cursor = 0;
                             self.input_mode = InputMode::ConfigPath;
                         }
                     },
@@ -701,13 +867,10 @@ impl App {
                 }
             }
 
-            InputMode::ConfigPath if has_ctrl => {}
+            InputMode::ConfigPath
+                if edit_field(&mut self.text_buffer, &mut self.text_cursor, code, has_ctrl) => {}
             InputMode::ConfigPath => match code {
                 KeyCode::Esc => self.input_mode = InputMode::GroupManage,
-                KeyCode::Backspace => {
-                    self.text_buffer.pop();
-                }
-                KeyCode::Char(c) => self.text_buffer.push(c),
                 KeyCode::Enter => {
                     let path = PathBuf::from(self.text_buffer.trim());
                     if self.text_buffer.trim().is_empty() {
@@ -757,25 +920,50 @@ impl App {
             },
 
             // Control chords must not type themselves into the query
-            InputMode::Search if has_ctrl => {}
+            InputMode::Search
+                if edit_field(
+                    &mut graph.search_query,
+                    &mut self.text_cursor,
+                    code,
+                    has_ctrl,
+                ) =>
+            {
+                let anchor = graph.anchor_at(selected_index);
+                graph.rebuild_visible_rows();
+                // Stay on the port being looked at while it still matches;
+                // once it stops, start again from the top of the results
+                // rather than from wherever the old row number now points.
+                self.restore_anchor_or(graph, anchor, 0);
+            }
             InputMode::Search => match code {
+                // The list stays live while the bar is open, so results can be
+                // scanned as they narrow instead of only after Enter. The
+                // vertical keys are free to do it: `edit_field` claims
+                // Left/Right/Home/End for the caret and passes these through.
+                KeyCode::Up => {
+                    self.move_selection(selected_index, if has_ctrl { -5 } else { -1 }, total_rows)
+                }
+                KeyCode::Down => {
+                    self.move_selection(selected_index, if has_ctrl { 5 } else { 1 }, total_rows)
+                }
+                KeyCode::PageUp => {
+                    self.move_selection(selected_index, -(page_size as isize), total_rows)
+                }
+                KeyCode::PageDown => {
+                    self.move_selection(selected_index, page_size as isize, total_rows)
+                }
                 KeyCode::Esc => {
+                    let anchor = graph.anchor_at(selected_index);
                     graph.search_query.clear();
+                    self.text_cursor = 0;
                     graph.rebuild_visible_rows();
+                    self.restore_anchor(graph, anchor);
                     self.input_mode = InputMode::Normal;
                     self.status_msg = String::from("Cleared search filter");
                 }
                 KeyCode::Enter => {
                     self.input_mode = InputMode::Normal;
                     self.status_msg = format!("Filter locked: '{}'", graph.search_query);
-                }
-                KeyCode::Backspace => {
-                    graph.search_query.pop();
-                    graph.rebuild_visible_rows();
-                }
-                KeyCode::Char(c) => {
-                    graph.search_query.push(c);
-                    graph.rebuild_visible_rows();
                 }
                 _ => {}
             },
@@ -823,7 +1011,7 @@ impl App {
                         }
                     }
 
-                    KeyCode::Backspace if self.focus == Focus::List => {
+                    _ if is_backspace(code, has_ctrl) && self.focus == Focus::List => {
                         match self.jump_stack.pop() {
                             Some(origin) => match jump_to_port(graph, &origin) {
                                 Some(row) => {
@@ -841,13 +1029,13 @@ impl App {
                     }
 
                     // Buttons: Enter presses the focused one, defaulting
-                    // to OK while the list has self.focus, as dialog does
+                    // to OK while the list has focus, as dialog does
                     KeyCode::Enter => match self.focus {
                         Focus::Cancel => quit_requested = true,
                         _ => save_requested = true,
                     },
 
-                    // Letter hotkeys work from any self.focus
+                    // Letter hotkeys work from any focus
                     KeyCode::Char('o') | KeyCode::Char('O') => save_requested = true,
 
                     KeyCode::Char('s') | KeyCode::Char('S') => save_requested = true,
@@ -857,10 +1045,13 @@ impl App {
                     KeyCode::Char('q') | KeyCode::Esc => quit_requested = true,
 
                     KeyCode::Char('/') => {
+                        // The query survives between visits, so pick up after it
+                        self.text_cursor = graph.search_query.chars().count();
                         self.input_mode = InputMode::Search;
                     }
 
                     KeyCode::Char('f') | KeyCode::Char('F') if has_ctrl => {
+                        self.text_cursor = graph.search_query.chars().count();
                         self.input_mode = InputMode::Search;
                     }
 
@@ -911,7 +1102,7 @@ impl App {
                     },
 
                     // Everything below acts on the tree, so it only
-                    // applies while the list holds self.focus
+                    // applies while the list holds focus
                     _ if self.focus != Focus::List => {}
 
                     // Navigation: Siblings (Shift + Up/Down)
@@ -943,38 +1134,31 @@ impl App {
                         self.status_msg = String::from("Jumped to bottom");
                     }
 
-                    // Navigation: Fast Scroll (Ctrl + Up/Down)
-                    KeyCode::Up if has_ctrl => {
-                        let i = selected_index.saturating_sub(5);
-                        self.list_state.select(Some(i));
-                    }
-
-                    KeyCode::Down if has_ctrl => {
-                        let i = (selected_index + 5).min(total_rows.saturating_sub(1));
-                        self.list_state.select(Some(i));
-                    }
-
-                    // Navigation: Single Up / Down
+                    // Navigation: Single Up / Down, five at a time with Ctrl
                     KeyCode::Up => {
-                        let i = selected_index.saturating_sub(1);
-                        self.list_state.select(Some(i));
+                        self.move_selection(
+                            selected_index,
+                            if has_ctrl { -5 } else { -1 },
+                            total_rows,
+                        );
                     }
 
                     KeyCode::Down => {
-                        let i = (selected_index + 1).min(total_rows.saturating_sub(1));
-                        self.list_state.select(Some(i));
+                        self.move_selection(
+                            selected_index,
+                            if has_ctrl { 5 } else { 1 },
+                            total_rows,
+                        );
                     }
 
                     // Navigation: Page Up / Page Down
                     KeyCode::PageUp => {
-                        let i = selected_index.saturating_sub(page_size);
-                        self.list_state.select(Some(i));
+                        self.move_selection(selected_index, -(page_size as isize), total_rows);
                         self.status_msg = format!("Page Up (-{} rows)", page_size);
                     }
 
                     KeyCode::PageDown => {
-                        let i = (selected_index + page_size).min(total_rows.saturating_sub(1));
-                        self.list_state.select(Some(i));
+                        self.move_selection(selected_index, page_size as isize, total_rows);
                         self.status_msg = format!("Page Down (+{} rows)", page_size);
                     }
 
@@ -984,32 +1168,37 @@ impl App {
                     KeyCode::Char(c) if tree_key == Some(c) => {
                         if let Some(op) = tree_op(c, repeat) {
                             let selected = self.list_state.selected().unwrap_or(0);
+                            // Taken before the rebuild, restored after it
+                            let anchor = graph.anchor_at(selected);
+                            let what = row_label(graph, selected);
+
                             self.status_msg = match op {
                                 TreeOp::ExpandNode => {
                                     graph.expand_node(selected);
-                                    format!("Expanded row {}", selected)
+                                    format!("Expanded {what}")
                                 }
                                 TreeOp::CollapseNode => {
                                     graph.collapse_node(selected);
-                                    format!("Collapsed row {}", selected)
+                                    format!("Collapsed {what}")
                                 }
                                 TreeOp::ExpandSection => {
                                     graph.expand_subtree(selected);
-                                    format!("Expanded section at row {}", selected)
+                                    format!("Expanded everything under {what}")
                                 }
                                 TreeOp::CollapseSection => {
                                     graph.collapse_subtree(selected);
-                                    format!("Collapsed section at row {}", selected)
+                                    format!("Collapsed everything under {what}")
                                 }
                                 TreeOp::ExpandAll => {
                                     graph.expand_all();
-                                    String::from("Expanded all subtrees")
+                                    String::from("Expanded the whole list")
                                 }
                                 TreeOp::CollapseAll => {
                                     graph.collapse_all();
-                                    String::from("Collapsed all subtrees")
+                                    String::from("Collapsed the whole list")
                                 }
                             };
+                            self.restore_anchor(graph, anchor);
                         }
                     }
 
@@ -1019,7 +1208,12 @@ impl App {
                                 match &row.kind {
                                     RowKind::Option { name, .. } => {
                                         let opt_name = name.clone();
+                                        // A toggle can strand whole ports out of
+                                        // the list, so it renumbers rows just as
+                                        // an expand does
+                                        let anchor = graph.anchor_at(selected);
                                         graph.toggle_option(selected);
+                                        self.restore_anchor(graph, anchor);
                                         self.status_msg = format!("Toggled option '{}'", opt_name);
                                     }
                                     _ => {
@@ -1085,11 +1279,23 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
 
     // Target on the left, most recent action right-aligned, which keeps
     // the footer free for keybindings alone
-    let target = format!(
-        " Target: {}  ({} ports)",
-        graph.root_origin,
-        graph.live_count()
-    );
+    // A locked filter leaves the list narrowed with the search bar gone, so the
+    // header has to say so; otherwise the missing ports look like a fault.
+    let target = if graph.search_query.is_empty() {
+        format!(
+            " Target: {}  ({} ports)",
+            graph.root_origin,
+            graph.live_count()
+        )
+    } else {
+        format!(
+            " Target: {}  ({} of {} ports matching \"{}\")",
+            graph.root_origin,
+            graph.listed_port_count(),
+            graph.live_count(),
+            graph.search_query
+        )
+    };
     let status = format!("{} ", app.status_msg);
     let gap = (chunks[0].width.saturating_sub(2) as usize)
         .saturating_sub(target.chars().count() + status.chars().count())
@@ -1276,19 +1482,23 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
     f.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
 
     // Footer / Status Bar Rendering
-    let (primary_line, primary_style) = match app.input_mode {
-        InputMode::Search => (
-            format!(
-                " SEARCH: {}_ (Press [Enter] to lock, [Esc] to clear)",
-                graph.search_query
-            ),
-            Style::default()
+    let primary = match app.input_mode {
+        InputMode::Search => {
+            let style = Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        _ => (
-            " =/- open/close row | +/_ open/close branch | ++/__ open/close list | / search"
-                .to_string(),
+                .add_modifier(Modifier::BOLD);
+            // Named for what it matches. The bare word "SEARCH" invited the
+            // assumption that option names and descriptions were in scope too.
+            let mut spans = vec![Span::styled(" PORT SEARCH: ", style)];
+            spans.extend(field_spans(&graph.search_query, app.text_cursor, style));
+            spans.push(Span::styled(
+                " ([Up]/[Down] browse, [Enter] locks, [Esc] clears)".to_string(),
+                style,
+            ));
+            Line::from(spans)
+        }
+        _ => Line::styled(
+            " =/- open/close row | +/_ open/close branch | ++/__ open/close list | / search",
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -1297,7 +1507,7 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
         .lines()
         .map(|row| Line::styled(row.to_string(), Style::default().fg(Color::DarkGray)));
 
-    let mut footer_lines = vec![Line::styled(primary_line, primary_style)];
+    let mut footer_lines = vec![primary];
     footer_lines.extend(action_rows);
     let footer =
         Paragraph::new(Text::from(footer_lines)).block(Block::default().borders(Borders::ALL));
@@ -1329,6 +1539,7 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
                 app.group_target.as_deref().unwrap_or("")
             ),
             &app.text_buffer,
+            app.text_cursor,
         ),
         InputMode::GroupManage => render_group_manage(
             f,
@@ -1341,6 +1552,7 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
             "Save groups",
             "No config file yet. Where should groups be saved?",
             &app.text_buffer,
+            app.text_cursor,
         ),
         InputMode::Normal | InputMode::Search => {}
     }
@@ -1577,6 +1789,740 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::Normal);
         assert_eq!(graph.groups["php-ex"], vec!["lang/php83-extensions"]);
+    }
+
+    /// Terminals that send BS (0x08) rather than DEL (0x7F) arrive as Ctrl+H,
+    /// which the text prompts used to swallow along with every other control
+    /// chord — backspace appeared to do nothing at all on those terminals.
+    #[test]
+    fn ctrl_h_rubs_out_like_backspace_does() {
+        for erase in [key(KeyCode::Backspace), ctrl('h')] {
+            let mut graph = test_graph();
+            let mut app = App::new(None);
+            app.on_key(ctrl('g'), &mut graph);
+            app.on_key(key(KeyCode::Enter), &mut graph);
+
+            for c in "phpp".chars() {
+                app.on_key(key(KeyCode::Char(c)), &mut graph);
+            }
+            app.on_key(erase, &mut graph);
+
+            assert_eq!(app.text_buffer, "php", "{erase:?} did not rub out");
+        }
+    }
+
+    /// The same terminals, the same problem, in the other two places text is
+    /// typed.
+    #[test]
+    fn ctrl_h_rubs_out_in_search_and_in_the_path_prompt() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "soapp".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(ctrl('h'), &mut graph);
+        assert_eq!(graph.search_query, "soap");
+
+        let mut graph = test_graph();
+        graph
+            .groups
+            .insert("php".into(), vec!["lang/php83-extensions".into()]);
+        let mut app = app_in_manager(&mut graph);
+        app.on_key(key(KeyCode::Char('s')), &mut graph);
+        for c in "/tmp/xx".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(ctrl('h'), &mut graph);
+        assert_eq!(app.text_buffer, "/tmp/x");
+    }
+
+    // ------------------------------------------------------- keeping my spot
+
+    /// A graph with two ports, so collapsing the first renumbers everything
+    /// under the second.
+    fn spot_graph() -> DependencyGraph {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn, true).unwrap();
+        for origin in ["www/aaa", "www/zzz"] {
+            let name = origin.split('/').nth(1).unwrap();
+            conn.execute(
+                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
+                rusqlite::params![origin, name],
+            )
+            .unwrap();
+            for opt in ["ALPHA", "BETA", "GAMMA"] {
+                conn.execute(
+                    "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
+                     VALUES (?1, ?2, 0, '', 'DEFINE', '')",
+                    rusqlite::params![origin, opt],
+                )
+                .unwrap();
+            }
+        }
+        let targets = vec!["www/aaa".to_string(), "www/zzz".to_string()];
+        let mut graph = DependencyGraph::load_from_db(
+            &conn,
+            &targets,
+            &crate::reader::SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+        graph.expand_all();
+        graph
+    }
+
+    /// What the cursor is sitting on, for asserting it did not wander.
+    fn under_cursor(graph: &DependencyGraph, app: &App) -> String {
+        let i = app.list_state.selected().unwrap();
+        match &graph.visible_rows[i].kind {
+            RowKind::Port { origin, .. } => format!("port {origin}"),
+            RowKind::Option { name, .. } => format!("option {name}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn row_of_option(graph: &DependencyGraph, origin: &str, opt: &str) -> usize {
+        graph
+            .visible_rows
+            .iter()
+            .position(|r| match r.node_id {
+                NodeId::Option(id) => {
+                    let o = &graph.option_nodes[id];
+                    o.port_origin == origin && o.name == opt
+                }
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no row for {origin}/{opt}"))
+    }
+
+    fn row_of_port(graph: &DependencyGraph, origin: &str) -> usize {
+        graph
+            .visible_rows
+            .iter()
+            .position(|r| matches!(&r.kind, RowKind::Port { origin: o, .. } if o == origin))
+            .unwrap_or_else(|| panic!("no row for {origin}"))
+    }
+
+    /// Expanding the whole list inserts rows *above* the cursor as well as
+    /// below, so its row number changes even though nothing about the row it is
+    /// on did. It has to follow the row.
+    #[test]
+    fn expanding_everything_keeps_the_cursor_on_the_same_port() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        // Collapse everything, then sit on the second port
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+        app.list_state.select(Some(row_of_port(&graph, "www/zzz")));
+        let before = app.list_state.selected().unwrap();
+
+        // Expanding puts www/aaa's three options in ahead of it
+        app.on_key(key(KeyCode::Char('+')), &mut graph);
+        app.on_key(key(KeyCode::Char('+')), &mut graph);
+
+        let after = app.list_state.selected().unwrap();
+        assert_ne!(before, after, "the row number must have moved");
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "port www/zzz",
+            "holding the row number would have landed on one of www/aaa's options"
+        );
+    }
+
+    /// The case that matters most: collapsing the port the cursor is inside
+    /// hides the option, so the cursor falls out to the port itself.
+    #[test]
+    fn collapsing_the_port_im_inside_takes_me_to_the_port() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        // Deliberately the *first* port: after the collapse only two rows are
+        // left, so simply clamping the old row number would land on www/zzz and
+        // look correct by accident.
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/aaa", "BETA")));
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+
+        // Collapse the whole list; every option row goes
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "port www/aaa",
+            "should have fallen out to the port the option belonged to"
+        );
+    }
+
+    /// Expanding again should leave the cursor where it is rather than jumping.
+    #[test]
+    fn expanding_keeps_the_cursor_on_the_port() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+        app.on_key(key(KeyCode::Char('_')), &mut graph);
+
+        let zzz = graph
+            .visible_rows
+            .iter()
+            .position(|r| matches!(&r.kind, RowKind::Port { origin, .. } if origin == "www/zzz"))
+            .unwrap();
+        app.list_state.select(Some(zzz));
+
+        app.on_key(key(KeyCode::Char('=')), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "port www/zzz");
+
+        app.on_key(key(KeyCode::Char('+')), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "port www/zzz");
+    }
+
+    /// Toggling rebuilds the list too, and can strand whole ports out of it, so
+    /// it renumbers rows exactly as an expand does.
+    #[test]
+    fn toggling_leaves_the_cursor_on_the_option_it_toggled() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn, true).unwrap();
+        for origin in ["www/app", "aaa/pulled"] {
+            let name = origin.split('/').nth(1).unwrap();
+            conn.execute(
+                "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
+                rusqlite::params![origin, name],
+            )
+            .unwrap();
+        }
+        // EXTRA is on by default and pulls in aaa/pulled, which sorts *above*
+        // www/app — so turning it off shifts every row under www/app upwards.
+        conn.execute(
+            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
+             VALUES ('www/app', 'EXTRA', 1, '', 'DEFINE', ''),
+                    ('aaa/pulled', 'DOCS', 1, '', 'DEFINE', '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO option_deps (port_origin, option_name, dep_origin, dep_type)
+             VALUES ('www/app', 'EXTRA', 'aaa/pulled', 'RUN')",
+            [],
+        )
+        .unwrap();
+
+        let mut graph = DependencyGraph::load_from_db(
+            &conn,
+            &["www/app".to_string()],
+            &crate::reader::SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+        graph.expand_all();
+        let mut app = App::new(None);
+
+        let before = row_of_option(&graph, "www/app", "EXTRA");
+        app.list_state.select(Some(before));
+        assert!(graph.is_live("aaa/pulled"));
+
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+
+        assert!(!graph.is_live("aaa/pulled"), "the toggle stranded it");
+        assert_ne!(
+            app.list_state.selected().unwrap(),
+            before,
+            "the row number must have moved"
+        );
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "option EXTRA",
+            "the cursor should still be on the option that was toggled"
+        );
+    }
+
+    /// The status line names what was acted on. A row number would be doubly
+    /// useless here, since the operation changes it.
+    #[test]
+    fn the_status_line_names_what_was_expanded() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        let zzz = graph
+            .visible_rows
+            .iter()
+            .position(|r| matches!(&r.kind, RowKind::Port { origin, .. } if origin == "www/zzz"))
+            .unwrap();
+        app.list_state.select(Some(zzz));
+        app.on_key(key(KeyCode::Char('-')), &mut graph);
+
+        assert!(
+            app.status_msg.contains("www/zzz"),
+            "got: {}",
+            app.status_msg
+        );
+    }
+
+    // -------------------------------------------------------- field editing
+
+    /// Left and Right move the caret, and typing lands where it is rather than
+    /// always at the end.
+    #[test]
+    fn arrows_move_the_caret_and_typing_lands_there() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        for c in "php-ext".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        assert_eq!(app.text_cursor, 7, "caret follows what was typed");
+
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Left), &mut graph);
+        }
+        assert_eq!(app.text_cursor, 4);
+
+        app.on_key(key(KeyCode::Char('X')), &mut graph);
+        assert_eq!(app.text_buffer, "php-Xext");
+        assert_eq!(app.text_cursor, 5, "caret sits after what was inserted");
+
+        app.on_key(key(KeyCode::Right), &mut graph);
+        app.on_key(key(KeyCode::Char('Y')), &mut graph);
+        assert_eq!(app.text_buffer, "php-XeYxt");
+    }
+
+    /// Backspace takes the character behind the caret, not the last one typed.
+    #[test]
+    fn backspace_rubs_out_behind_the_caret() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        for c in "phpx-ext".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Left), &mut graph);
+        }
+        app.on_key(key(KeyCode::Backspace), &mut graph);
+
+        assert_eq!(app.text_buffer, "php-ext");
+        assert_eq!(app.text_cursor, 3);
+
+        // Delete takes the one in front instead
+        app.on_key(key(KeyCode::Delete), &mut graph);
+        assert_eq!(app.text_buffer, "phpext");
+        assert_eq!(app.text_cursor, 3, "the caret does not move");
+    }
+
+    #[test]
+    fn the_caret_is_clamped_and_home_end_reach_the_edges() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+        for c in "abc".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+
+        for _ in 0..9 {
+            app.on_key(key(KeyCode::Left), &mut graph);
+        }
+        assert_eq!(app.text_cursor, 0);
+        app.on_key(key(KeyCode::Backspace), &mut graph);
+        assert_eq!(app.text_buffer, "abc", "nothing behind the caret to take");
+
+        for _ in 0..9 {
+            app.on_key(key(KeyCode::Right), &mut graph);
+        }
+        assert_eq!(app.text_cursor, 3);
+        app.on_key(key(KeyCode::Delete), &mut graph);
+        assert_eq!(app.text_buffer, "abc", "nothing in front of it either");
+
+        app.on_key(key(KeyCode::Home), &mut graph);
+        assert_eq!(app.text_cursor, 0);
+        app.on_key(key(KeyCode::End), &mut graph);
+        assert_eq!(app.text_cursor, 3);
+    }
+
+    /// Paths and origins can carry multibyte characters, and editing by byte
+    /// offset would split one and panic.
+    #[test]
+    fn editing_is_safe_across_multibyte_characters() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        for c in "grüße".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        assert_eq!(app.text_cursor, 5);
+
+        app.on_key(key(KeyCode::Left), &mut graph);
+        app.on_key(key(KeyCode::Backspace), &mut graph);
+        assert_eq!(app.text_buffer, "grüe");
+
+        app.on_key(key(KeyCode::Home), &mut graph);
+        app.on_key(key(KeyCode::Delete), &mut graph);
+        assert_eq!(app.text_buffer, "rüe");
+    }
+
+    /// The search bar is a field too, and keeps its query between visits, so the
+    /// caret has to pick up after it rather than at zero.
+    #[test]
+    fn the_search_bar_edits_like_the_prompts_do() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "soap".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Left), &mut graph);
+        app.on_key(key(KeyCode::Char('X')), &mut graph);
+        assert_eq!(graph.search_query, "soaXp");
+
+        app.on_key(key(KeyCode::Enter), &mut graph);
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        assert_eq!(
+            app.text_cursor, 5,
+            "re-entering search should put the caret after the existing query"
+        );
+    }
+
+    // ---------------------------------------------------------------- search
+
+    /// Narrowing the results should leave the cursor at the top of them, not on
+    /// whatever the old row number now points at.
+    #[test]
+    fn narrowing_the_search_moves_the_cursor_into_the_results() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        // Sit well down the list, inside www/zzz
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/zzz", "GAMMA")));
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "aaa".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+
+        assert_eq!(graph.listed_port_count(), 1, "only www/aaa matches");
+        let selected = app.list_state.selected().unwrap();
+        assert!(
+            selected < graph.visible_rows.len(),
+            "cursor left outside the list"
+        );
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "port www/aaa",
+            "should be at the top of the results"
+        );
+    }
+
+    /// While the port under the cursor still matches, the cursor stays on it.
+    #[test]
+    fn the_cursor_stays_put_while_its_port_still_matches() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/zzz", "BETA")));
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zzz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "option BETA",
+            "www/zzz still matches, so nothing should have moved"
+        );
+    }
+
+    /// A query matching nothing must not leave the cursor pointing past the end.
+    #[test]
+    fn a_search_matching_nothing_is_survivable() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/zzz", "GAMMA")));
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "no-such-port".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        assert!(graph.visible_rows.is_empty());
+
+        // Rubbing the query out brings the list back without a panic
+        for _ in 0..12 {
+            app.on_key(key(KeyCode::Backspace), &mut graph);
+        }
+        assert_eq!(graph.listed_port_count(), 2);
+        assert!(app.list_state.selected().unwrap() < graph.visible_rows.len());
+    }
+
+    /// Esc clears the filter and puts the cursor back on the port it was in.
+    #[test]
+    fn escaping_search_restores_the_list_and_the_cursor() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/zzz", "BETA")));
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zzz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Esc), &mut graph);
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(graph.search_query.is_empty());
+        assert_eq!(graph.listed_port_count(), 2);
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+    }
+
+    /// The results are browsable while the bar is still open — the point being
+    /// that a query need not be committed to before looking at what it found.
+    #[test]
+    fn the_list_can_be_walked_while_the_query_is_still_being_typed() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zzz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        assert_eq!(under_cursor(&graph, &app), "port www/zzz");
+        assert_eq!(app.input_mode, InputMode::Search, "still typing");
+
+        app.on_key(key(KeyCode::Down), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "option ALPHA");
+        app.on_key(key(KeyCode::Down), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+        app.on_key(key(KeyCode::Up), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "option ALPHA");
+    }
+
+    /// Moving is not typing: the arrows must not reach the field, or browsing
+    /// the results would rewrite the query that produced them.
+    #[test]
+    fn walking_the_results_leaves_the_query_and_the_caret_alone() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zzz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        let caret = app.text_cursor;
+
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+        ] {
+            app.on_key(key(code), &mut graph);
+        }
+
+        assert_eq!(graph.search_query, "zzz");
+        assert_eq!(app.text_cursor, caret);
+        assert_eq!(app.input_mode, InputMode::Search);
+    }
+
+    /// Clamping follows the *filtered* list, so holding Down cannot walk off the
+    /// last match into rows the filter is hiding.
+    #[test]
+    fn walking_off_the_end_of_the_results_stops_at_the_last_one() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "aaa".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        let last = graph.visible_rows.len() - 1;
+
+        for _ in 0..40 {
+            app.on_key(key(KeyCode::Down), &mut graph);
+        }
+        assert_eq!(app.list_state.selected(), Some(last));
+        assert_eq!(
+            graph.listed_port_count(),
+            1,
+            "www/zzz is still hidden, so there was nowhere further to go"
+        );
+
+        for _ in 0..40 {
+            app.on_key(key(KeyCode::Up), &mut graph);
+        }
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    /// Where you browsed to is where you are left when the filter locks.
+    #[test]
+    fn a_row_walked_to_while_typing_survives_enter() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zzz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Down), &mut graph);
+        app.on_key(key(KeyCode::Down), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+
+        app.on_key(key(KeyCode::Enter), &mut graph);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+    }
+
+    /// Typing after browsing re-anchors on the row browsed to, rather than
+    /// throwing the cursor back to the top of a still-matching port.
+    #[test]
+    fn typing_on_after_browsing_keeps_the_row_it_landed_on() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "zz".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Down), &mut graph);
+        app.on_key(key(KeyCode::Down), &mut graph);
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+
+        // www/zzz still matches the longer query
+        app.on_key(key(KeyCode::Char('z')), &mut graph);
+        assert_eq!(graph.search_query, "zzz");
+        assert_eq!(under_cursor(&graph, &app), "option BETA");
+    }
+
+    /// A locked filter leaves the list narrowed with the search bar gone, so the
+    /// header has to keep saying why.
+    #[test]
+    fn the_header_reports_an_active_filter() {
+        let mut graph = spot_graph();
+        let mut app = App::new(None);
+
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        for c in "aaa".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Enter), &mut graph);
+        assert_eq!(app.input_mode, InputMode::Normal, "filter is locked");
+
+        let out = draw(|f| render(f, &graph, &mut app));
+        assert!(
+            out.contains("1 of 2 ports matching"),
+            "the header must show the filter is on:\n{out}"
+        );
+    }
+
+    /// A control chord still must not type itself into a buffer.
+    #[test]
+    fn other_control_chords_do_not_reach_the_buffer() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        for c in "php".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(ctrl('a'), &mut graph);
+        app.on_key(ctrl('s'), &mut graph);
+
+        assert_eq!(app.text_buffer, "php");
+    }
+
+    // -------------------------------------------------------------- autosave
+
+    fn temp_config(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bgone_auto_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("bgone.toml")
+    }
+
+    /// With a config file known, joining a group writes it out there and then;
+    /// no separate trip through the manager.
+    #[test]
+    fn adding_to_a_group_saves_when_a_config_is_known() {
+        let path = temp_config("add");
+        let _ = std::fs::remove_file(&path);
+
+        let mut graph = test_graph();
+        let mut app = App::new(Some(path.clone()));
+
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph); // <new group...>
+        for c in "php".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        let written = std::fs::read_to_string(&path).expect("should have been saved");
+        assert!(written.contains("lang/php83-extensions"), "got: {written}");
+        assert!(app.status_msg.contains("saved"), "{}", app.status_msg);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Removing has to save too. If adding persisted and removing did not, a
+    /// delete followed by a quit would leave the member in the file.
+    #[test]
+    fn removing_from_a_group_saves_as_well() {
+        let path = temp_config("remove");
+        let _ = std::fs::remove_file(&path);
+
+        let mut graph = test_graph();
+        graph.groups.insert(
+            "php".into(),
+            vec![
+                "lang/php83-extensions".into(),
+                "lang/php84-extensions".into(),
+            ],
+        );
+        let mut app = App::new(Some(path.clone()));
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(ctrl('g'), &mut graph);
+        assert_eq!(app.input_mode, InputMode::GroupManage);
+
+        app.on_key(key(KeyCode::Down), &mut graph);
+        app.on_key(key(KeyCode::Char('d')), &mut graph);
+
+        let written = std::fs::read_to_string(&path).expect("should have been saved");
+        assert!(
+            !written.contains("php83"),
+            "the removal must reach the file: {written}"
+        );
+        assert!(written.contains("php84"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Without a config file there is nowhere to write, and stopping to demand
+    /// a path mid-edit would be worse than saying so.
+    #[test]
+    fn adding_without_a_config_says_it_is_unsaved_rather_than_prompting() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+
+        app.on_key(ctrl('g'), &mut graph);
+        app.on_key(key(KeyCode::Enter), &mut graph);
+        for c in "php".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut graph);
+        }
+        app.on_key(key(KeyCode::Enter), &mut graph);
+
+        assert_eq!(app.input_mode, InputMode::Normal, "must not interrupt");
+        assert_eq!(graph.groups["php"], vec!["lang/php83-extensions"]);
+        assert!(app.status_msg.contains("unsaved"), "{}", app.status_msg);
     }
 
     /// A group with no name would be unusable and unremovable from the manager.
@@ -1932,9 +2878,25 @@ mod tests {
         assert!(out.contains("No groups yet"), "got:\n{out}");
     }
 
+    /// The caret has to be visible, or moving it is guesswork.
+    #[test]
+    fn the_prompt_marks_where_the_caret_is() {
+        // Caret in the middle: the character it sits on is picked out
+        let out = draw(|f| render_prompt(f, "New group", "Name:", "abcdef", 3));
+        assert!(out.contains("abcdef"), "got:\n{out}");
+
+        // Caret past the end still renders, on a blank cell
+        let out = draw(|f| render_prompt(f, "New group", "Name:", "abc", 3));
+        assert!(out.contains("abc"), "got:\n{out}");
+
+        // ...and an empty field is fine
+        let out = draw(|f| render_prompt(f, "New group", "Name:", "", 0));
+        assert!(out.contains("Name:"), "got:\n{out}");
+    }
+
     #[test]
     fn prompt_shows_the_question_and_what_has_been_typed() {
-        let out = draw(|f| render_prompt(f, "New group", "Name a group:", "php-ext"));
+        let out = draw(|f| render_prompt(f, "New group", "Name a group:", "php-ext", 7));
         assert!(out.contains("New group"));
         assert!(out.contains("Name a group:"));
         assert!(out.contains("php-ext"));

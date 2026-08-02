@@ -31,7 +31,7 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * **System Option Preloading**: Reads existing configuration files from `/var/db/ports/<category>_<port>/options` and `/etc/make.conf` on startup so previously saved preferences are preserved.
 * **Authoritative Port Details**: For the ports you are actually configuring, `bgone` asks the tree itself via `make describe-json`. It catches the roughly 1% of ports whose options the Makefile sweep cannot see — those inheriting through `MASTERDIR` — which are precisely the ones `poudriere options` would keep prompting for, and supplies the real `PKGNAME` for the file header. Cached until a port's Makefiles change; skip it with `--no-describe`.
 * **`make config` File Format**: Writes the same `OPTIONS_FILE_SET+=` / `OPTIONS_FILE_UNSET+=` files `make config` and `poudriere options` write, listing every option the port defines — which is what stops `make config-conditional` (and so `poudriere options` and `poudriere bulk`) from re-opening the dialog. Files in the older `WITH_`/`WITHOUT_` format are still read back.
-* **In-TUI Search (`/`)**: Filter rows by port origin, option name, description, or group name.
+* **In-TUI Search (`/`)**: Narrows the list to ports whose origin contains what you type — `postgres`, `databases/`, `py-`. Options are not searched, and a matching port is shown whole rather than reduced to the rows that matched. `Up`/`Down` (and `PgUp`/`PgDn`) move through the results while the bar is still open, so you can look before committing; `Enter` keeps the filter and the header reports it, `Esc` clears it. Filtering is a view: a hidden port keeps its options and is still written on save.
 * **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole list preserves view preferences across state updates.
 * **Familiar Controls**: Follows `bsddialog(1)` conventions—an `OK` / `Cancel` button row, `Space` to toggle, `Tab` to move focus, `Esc` to cancel—with a confirmation prompt guarding unsaved changes.
 * **Dry-Run Output**: Preview the exact files and flags that would be written before making changes on disk.
@@ -124,6 +124,15 @@ only 2 ports had options the sweep missed entirely — both inheriting through
 are exactly the ports that keep re-opening the dialog. It also supplies the real
 `PKGNAME` (`pkgconf-2.4.3_1,1`, `py312-black-26.5.1`), which the sweep gets wrong
 for 88% of ports, though only the file header consumes that.
+
+What the describe pass cannot recover is *presentation*. `describe-json` reports
+which options exist and which are on by default, but carries no descriptions and
+no `SINGLE`/`MULTI`/`RADIO` grouping — those only come from the Makefile sweep,
+matched by name. A slave port therefore configures correctly but reads poorly: on
+a current tree 1,127 ports set `MASTERDIR` and 1,043 of them (93%) index with no
+options at all, so they are presented as a flat list of undescribed checkboxes
+even where the master defines a radio group. The options written are right; only
+the labels and the grouping are missing.
 
 Pass `--no-describe` to skip it. Without a readable tree `bgone` skips the pass
 automatically and says so.
@@ -282,9 +291,26 @@ need not match the port the choice was made on. A group may name a port that is
 not in the current list — it is skipped for now and kept for a run that includes
 it.
 
-Groups live in the `[groups]` table of the config and are only remembered once
-saved. Saving with no `--config` given asks where to put one. A save rewrites
-only that table, so comments and settings you put in the file by hand survive it.
+Groups live in the `[groups]` table of the config. When `--config` names one,
+joining or leaving a group writes it out immediately — there is no separate save
+step. Without one, changes last for the session only, until you save from the
+manager, which asks where to put a config. Either way a save rewrites only that
+table, so comments and settings you put in the file by hand survive it.
+
+### Typing in a field
+
+The search bar and both group prompts edit alike:
+
+| Key | Action |
+| --- | --- |
+| **`Left` / `Right`** | Move the caret; typing and rubbing out happen there, not at the end |
+| **`Home` / `End`** | Jump to either edge |
+| **`Backspace`** (or `Ctrl + H`) | Take the character behind the caret |
+| **`Delete`** | Take the one in front of it |
+
+Backspace answers to `Ctrl + H` as well, because terminals disagree about which
+byte the key sends: most emit DEL, some emit BS, and crossterm reports the second
+as `Ctrl + H`.
 
 > `Ctrl + Shift + G` is deliberately not used. A terminal sends byte `0x07` for
 > both it and `Ctrl + G`, so the Shift cannot be recovered — the same reason
@@ -406,7 +432,9 @@ This is a workaround for a real limitation rather than a stylistic choice. Termi
 
 ## Testing
 
-`bgone` includes an integration test suite covering Makefile parsing, SQLite caching, graph building, file exporting, shared state across repeated ports, key handling (scope escalation, focus cycling, sibling navigation, unsaved-change detection), and every documented command-line switch.
+171 tests across three suites: unit tests beside the code they cover, an integration suite, and a command-line suite.
+
+Between them they cover Makefile parsing — including what the regex sweep does with the `.if`, `.for` and `MASTERDIR` constructs it cannot evaluate — SQLite caching, graph building, live reachability, file exporting, shared state across repeated ports, group synchronisation, search filtering, key handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
 
 Tests run inside isolated temporary directories and clean up automatically on completion:
 

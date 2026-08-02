@@ -41,8 +41,15 @@ KEYBINDINGS:
  CHOOSING OPTIONS
    Space              Turn the highlighted option on or off, or pick it when
                       it belongs to a radio group
-   / or Ctrl + F      Filter rows by name, description or group
-                      (Enter keeps the filter, Esc clears it)
+   / or Ctrl + F      Narrow the list to ports whose origin contains what you
+                      type: postgres, databases/, py-. Options are not searched,
+                      and a port that matches is shown whole. Enter keeps the
+                      filter, Esc clears it, and the header says how many ports
+                      a kept filter is showing.
+
+                      Up / Down / PgUp / PgDn move through the results while
+                      the bar is still open, so there is no need to commit to a
+                      query before looking at what it found.
 
  GROUPS
    Ports in a group keep their option choices in step: setting an option on
@@ -56,8 +63,23 @@ KEYBINDINGS:
                       file. A terminal cannot tell Ctrl + Shift + G from
                       Ctrl + G, so scope escalates by repetition here as well.
 
-   Groups are stored in the --config file and are only remembered once saved.
-   Saving with no --config given asks where to put one.
+   Groups are stored in the --config file. With one given, joining or leaving
+   a group writes it out straight away; with none, changes last only for the
+   session until you save from the manager, which asks where to put one.
+
+   Backspace also answers to Ctrl + H, since terminals disagree about which
+   byte the key sends.
+
+ TYPING IN A FIELD
+   The search bar and the group prompts all edit the same way.
+
+   Left / Right       Move the caret; typing and rubbing out happen there
+                      rather than always at the end
+   Home / End         Jump to either edge
+   Up / Down          In the search bar only, move the list cursor rather than
+                      the caret. The other prompts use them for their own lists.
+   Backspace          Take the character behind the caret
+   Delete             Take the one in front of it
 
  BUTTONS AND EXITING
    Tab / Shift + Tab  Move the highlight between the list and the

@@ -135,6 +135,19 @@ pub struct VisibleRow {
     pub node_id: NodeId,
 }
 
+/// A row named in terms that survive the row list being rebuilt.
+///
+/// Row *numbers* do not survive: expanding or collapsing renumbers everything
+/// below the change, so holding the number still slides the highlight onto
+/// something unrelated. These identities are indices into `ports` and
+/// `option_nodes`, which a rebuild does not touch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowAnchor {
+    Port(usize),
+    Option(usize),
+    Section { port: usize, kind: SectionKind },
+}
+
 /// One entry in a port's `required by` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiredBy {
@@ -315,12 +328,10 @@ impl DependencyGraph {
                 conn.prepare("SELECT origin FROM ports WHERE origin GLOB ?1 ORDER BY origin")?;
             let rows = stmt.query_map(params![pat], |row| row.get::<_, String>(0))?;
 
-            for r in rows {
-                if let Ok(origin) = r {
-                    matched = true;
-                    if seen.insert(origin.clone()) {
-                        resolved_origins.push(origin);
-                    }
+            for origin in rows.flatten() {
+                matched = true;
+                if seen.insert(origin.clone()) {
+                    resolved_origins.push(origin);
                 }
             }
 
@@ -330,12 +341,10 @@ impl DependencyGraph {
                     conn.prepare("SELECT origin FROM ports WHERE origin LIKE ?1 ORDER BY origin")?;
                 let rows_like =
                     stmt_like.query_map(params![like_pat], |row| row.get::<_, String>(0))?;
-                for r in rows_like {
-                    if let Ok(origin) = r {
-                        matched = true;
-                        if seen.insert(origin.clone()) {
-                            resolved_origins.push(origin);
-                        }
+                for origin in rows_like.flatten() {
+                    matched = true;
+                    if seen.insert(origin.clone()) {
+                        resolved_origins.push(origin);
                     }
                 }
             }
@@ -677,6 +686,14 @@ impl DependencyGraph {
             .unwrap_or(false)
     }
 
+    /// How many ports the list is actually showing, which a search narrows.
+    pub fn listed_port_count(&self) -> usize {
+        self.visible_rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Port { .. }))
+            .count()
+    }
+
     /// How many ports are currently pulled in.
     pub fn live_count(&self) -> usize {
         self.live.iter().filter(|l| **l).count()
@@ -723,6 +740,49 @@ impl DependencyGraph {
         }
 
         self.live = live;
+    }
+
+    /// Names the row at `index` so it can be found again after a rebuild.
+    ///
+    /// Relationship entries and the "no options" note anchor to the port whose
+    /// block they sit in. They are exactly the rows an expand or collapse is
+    /// most likely to hide, and the port is where the reader would want to end
+    /// up anyway.
+    pub fn anchor_at(&self, index: usize) -> Option<RowAnchor> {
+        let row = self.visible_rows.get(index)?;
+        Some(match row.node_id {
+            NodeId::Port(id) => RowAnchor::Port(id),
+            NodeId::Option(id) => RowAnchor::Option(id),
+            NodeId::Section { port, kind } => RowAnchor::Section { port, kind },
+            NodeId::Ref | NodeId::Info => RowAnchor::Port(self.enclosing_port(index)?),
+        })
+    }
+
+    /// The port whose block the row at `index` belongs to.
+    pub fn enclosing_port(&self, index: usize) -> Option<usize> {
+        self.visible_rows
+            .get(..=index)?
+            .iter()
+            .rev()
+            .find_map(|row| match row.node_id {
+                NodeId::Port(id) => Some(id),
+                _ => None,
+            })
+    }
+
+    /// Where `anchor` is now, falling outwards to its port when the row it named
+    /// is no longer shown — which is what collapsing something the cursor was
+    /// inside does.
+    pub fn row_of_anchor(&self, anchor: &RowAnchor) -> Option<usize> {
+        let find = |want: NodeId| self.visible_rows.iter().position(|r| r.node_id == want);
+        match *anchor {
+            RowAnchor::Port(id) => find(NodeId::Port(id)),
+            RowAnchor::Option(id) => find(NodeId::Option(id))
+                .or_else(|| find(NodeId::Port(self.option_nodes[id].parent_port))),
+            RowAnchor::Section { port, kind } => {
+                find(NodeId::Section { port, kind }).or_else(|| find(NodeId::Port(port)))
+            }
+        }
     }
 
     /// Index into `ports` for an origin, for resolving a jump.
@@ -1007,31 +1067,21 @@ impl DependencyGraph {
         // immutably; otherwise every port would have to be cloned to satisfy the
         // borrow checker, which dominates the cost on a large list.
         let mut rows = Vec::with_capacity(self.visible_rows.len());
+        let query = self.search_query.to_lowercase();
 
         for port_id in 0..self.ports.len() {
+            // Searching narrows which *ports* are listed, on their origin alone,
+            // and a port that matches is shown whole.
+            //
+            // Filtering row by row instead severed options from the port they
+            // belong to — an option matching on its description survived while
+            // its port header did not, leaving orphans under whatever port
+            // happened to be above — and left section headers standing with
+            // their entries gone.
+            if !query.is_empty() && !self.ports[port_id].origin.to_lowercase().contains(&query) {
+                continue;
+            }
             self.flatten_port(port_id, &mut rows);
-        }
-
-        // Apply active search filter
-        if !self.search_query.is_empty() {
-            let query = self.search_query.to_lowercase();
-            rows.retain(|row| match &row.kind {
-                RowKind::Port { origin, .. } => origin.to_lowercase().contains(&query),
-                RowKind::Option {
-                    name,
-                    description,
-                    group_name,
-                    ..
-                } => {
-                    name.to_lowercase().contains(&query)
-                        || description.to_lowercase().contains(&query)
-                        || group_name.to_lowercase().contains(&query)
-                }
-                RowKind::DependsOn { origin, .. }
-                | RowKind::RequiresEntry { origin }
-                | RowKind::RequiredByEntry { origin, .. } => origin.to_lowercase().contains(&query),
-                RowKind::SectionHeader { .. } | RowKind::Info { .. } => true,
-            });
         }
 
         self.visible_rows = rows;
