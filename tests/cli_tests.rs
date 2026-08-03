@@ -746,3 +746,53 @@ fn test_saving_replaces_the_groups_table() {
     );
     assert!(Config::parse(&written).unwrap().groups.is_empty());
 }
+
+/// Every long option exists in the README.
+///
+/// This has drifted twice: `--jail-arch` and friends, then the `--poudriere-*`
+/// family, both landed in `--help` while the README's option listing went stale.
+/// A flag nobody can find is not far off a flag that does not exist — the whole
+/// reason the first index on a real builder resolved as the host was that its
+/// arguments were documented somewhere the walkthrough never sent you.
+///
+/// Checked mechanically rather than by remembering, in the same spirit as
+/// `test_every_key_on_the_footer_is_explained_in_help`.
+#[test]
+fn test_every_long_option_appears_in_the_readme() {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("README.md should be beside Cargo.toml");
+
+    // Scoped to the option listing rather than the whole file. Mentioning a
+    // flag in a walkthrough is not the same as listing it where someone goes
+    // looking for what exists — and "documented, but not where you would look"
+    // is precisely how this drifted the first time.
+    let listing = readme
+        .split("### Command-Line Options")
+        .nth(1)
+        .and_then(|rest| rest.split("### Examples").next())
+        .expect("README should have a Command-Line Options section ending at Examples");
+
+    let command = <Cli as clap::CommandFactory>::command();
+    let mut flags: Vec<String> = Vec::new();
+    fn collect(cmd: &clap::Command, into: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                into.push(format!("--{long}"));
+            }
+        }
+    }
+    collect(&command, &mut flags);
+    for sub in command.get_subcommands() {
+        collect(sub, &mut flags);
+    }
+
+    let missing: Vec<&String> = flags
+        .iter()
+        .filter(|flag| !listing.contains(flag.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these options are in --help but not in the README's option listing: {missing:?}"
+    );
+}

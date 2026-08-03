@@ -4,6 +4,7 @@ pub mod db;
 pub mod exporter;
 pub mod graph;
 pub mod indexer;
+pub mod poudriere;
 pub mod reader;
 pub mod resolve;
 pub mod ui;

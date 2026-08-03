@@ -84,6 +84,29 @@ bgone index --ports-dir /usr/ports
 
 ```
 
+**If you are building with poudriere, name the jail and let `bgone` read the
+rest.** Which options a port defines can depend on the architecture and OS
+version, so a cache built as the host does not necessarily describe the jail you
+are building for:
+
+```bash
+bgone index --poudriere-jail freebsd_14-4x64 --poudriere-ports HEAD
+```
+
+That reads poudriere's own configuration for the architecture (`amd64`), the OS
+release (`14.4`), the `__FreeBSD_version` (`1404000`) and the ports tree path —
+so none of them can disagree with the jail the way a hand-copied value can. What
+the cache was resolved as is recorded in it and printed when you configure.
+
+Nothing invokes `poudriere`; its configuration is a file-per-property store
+under `/usr/local/etc/poudriere.d`, and `bgone` reads it directly. Use
+`--poudriere-etc` if yours lives elsewhere (`poudriere -e`). Naming a jail that
+does not exist is an error listing the ones that do.
+
+You can still spell any of it out — see [Matching the jail rather than the
+host](#matching-the-jail-rather-than-the-host) — and an explicit value always
+beats a derived one.
+
 If you update your ports tree (`git pull` or `portsnap`), rebuild the index with `--force`:
 
 ```bash
@@ -211,6 +234,11 @@ Options:
   -r, --force-reset         Discard previous DB cache and rebuild schema
   -i, --ignore-missing      Warn instead of bailing out on unmatched ports (unless nothing matches)
   -f, --file <FILE>         Read target origins/patterns from a file
+      --poudriere-etc <DIR>  poudriere's config root [default: /usr/local/etc]
+      --poudriere-jail <JAIL>  Take arch/OS version from this jail
+      --poudriere-ports <TREE> Take the tree path, and name the options dir
+      --poudriere-set <SET>    The poudriere set, if you use one
+      --poudriere-optionsdir <NAME>  Name the options dir outright (like -o)
   -h, --help                Print help information
   -V, --version             Print version information
 
@@ -278,6 +306,10 @@ file        = "/usr/local/etc/poudriere.d/port-list"
 ports_dir   = "/usr/local/etc/poudriere.d/ports/HEAD"
 ignore_missing = true
 
+# Or name the jail and let the four resolution settings come from it
+poudriere_jail  = "freebsd_14-4x64"
+poudriere_ports = "HEAD"
+
 [groups]
 php-extensions = ["lang/php83-extensions", "lang/php84-extensions"]
 ```
@@ -286,7 +318,12 @@ Keys mirror the long option names with dashes turned into underscores, so
 `--options-dir` is `options_dir`. `ports_dir` belongs to `bgone index` but is
 written at the top level like the rest.
 
-Precedence runs **defaults → config → arguments you actually typed**. A setting
+Precedence runs **defaults → poudriere spec in the config → settings in the
+config → poudriere spec on the command line → arguments you actually typed**.
+Within each of the two sources, something written explicitly beats something
+derived from a jail; between them, the command line wins. So a
+`--poudriere-jail` typed at the prompt does override a `jail_arch` in the file —
+naming a jail on the command line is a deliberate act. A setting
 the file leaves out is simply unspecified; the file is a delta over the defaults,
 never a full description of a run, and omitting something is never itself an
 error. A key that is *misspelled*, on the other hand, is refused by name — a
@@ -345,6 +382,23 @@ and `bgone` becomes a drop-in replacement for `poudriere options`:
 ```bash
 bgone -o /usr/local/etc/poudriere.d/HEAD-options -f /usr/local/etc/poudriere.d/port-list
 ```
+
+Name the jail and tree rather than indexing as the host:
+
+```bash
+bgone index --poudriere-jail freebsd_14-4x64 --poudriere-ports HEAD
+bgone --poudriere-ports HEAD -f /usr/local/etc/poudriere.d/port-list
+```
+
+The second line writes to `HEAD-options`, because `bgone` composes the options
+directory exactly as `poudriere options` does — the non-empty of jail, tree and
+set joined with `-`, then `-options`. So `bgone` writes where `poudriere options`
+with the same flags would write, and naming only the tree gives you the
+tree-keyed directory discussed below. `--poudriere-set` and
+`--poudriere-optionsdir` mirror `-z` and `-o`.
+
+`bgone index` without those flags resolves the tree as the machine you run it
+on, which is only right when that machine matches the jail.
 
 At build time `poudriere` copies the **first** of these that exists into the jail's
 `/var/db/ports` — it does not merge them:

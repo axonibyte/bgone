@@ -34,6 +34,7 @@ fn main() -> Result<()> {
             env.osversion = osversion.clone();
             env.opsys = opsys.clone();
             env.osrel = osrel.clone();
+            env.via_jail = cli.poudriere_jail.clone();
 
             println!(
                 "[*] Indexing ports tree at {:?} as {}...",
@@ -88,6 +89,15 @@ fn main() -> Result<()> {
             };
 
             if !targets.is_empty() {
+                // Which options a port defines can vary with ARCH and OSVERSION,
+                // so a cache is only right for the target it was resolved as.
+                // Said every run rather than only on a mismatch, because bgone
+                // cannot know which jail you are about to build for — only you
+                // can spot that "host" is the wrong answer.
+                match db::get_meta(&conn, "resolved_as").as_deref() {
+                    Some(target) => println!("[*] Cache resolved as: {target}"),
+                    None => println!("[*] Cache resolved as: unknown (indexed by an older bgone)"),
+                }
                 println!("[*] Loading existing system options...");
                 let sys_opts =
                     reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());

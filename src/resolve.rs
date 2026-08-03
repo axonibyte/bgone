@@ -138,6 +138,9 @@ pub struct MakeEnv {
     pub osversion: Option<String>,
     pub opsys: Option<String>,
     pub osrel: Option<String>,
+    /// The poudriere jail these were read from, when they were derived rather
+    /// than typed. Carried only so the cache can say where it came from.
+    pub via_jail: Option<String>,
 }
 
 impl MakeEnv {
@@ -150,6 +153,7 @@ impl MakeEnv {
             osversion: None,
             opsys: None,
             osrel: None,
+            via_jail: None,
         }
     }
 
@@ -182,10 +186,15 @@ impl MakeEnv {
         .flatten()
         .collect();
 
-        if parts.is_empty() {
+        let target = if parts.is_empty() {
             "host".to_string()
         } else {
             parts.join(" ")
+        };
+
+        match &self.via_jail {
+            Some(jail) => format!("{target} (poudriere jail {jail})"),
+            None => target,
         }
     }
 }
@@ -807,5 +816,12 @@ mod tests {
         env.arch = Some("aarch64".into());
         env.osversion = Some("1404000".into());
         assert_eq!(env.describe_target(), "ARCH=aarch64 OSVERSION=1404000");
+
+        // Where it came from, when it was not typed by hand
+        env.via_jail = Some("freebsd_14-4x64".into());
+        assert_eq!(
+            env.describe_target(),
+            "ARCH=aarch64 OSVERSION=1404000 (poudriere jail freebsd_14-4x64)"
+        );
     }
 }

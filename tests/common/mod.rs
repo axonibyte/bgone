@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -210,4 +210,63 @@ pub fn add_unevaluated_port(conn: &Connection, origin: &str) {
         rusqlite::params![origin],
     )
     .unwrap();
+}
+
+// ------------------------------------------------------------ poudriere fixture
+//
+// poudriere's state is a file-per-property attribute store, so building one in
+// a temp directory reproduces it exactly rather than standing in for it. What
+// these write is what `poudriere jail -c` and `poudriere ports -c` write.
+
+/// Creates `<etc>/poudriere.d` and returns the etc path to pass as
+/// `--poudriere-etc`.
+pub fn poudriere_etc(temp: &TempDir, name: &str) -> PathBuf {
+    let etc = temp.join(name);
+    fs::create_dir_all(etc.join("poudriere.d")).unwrap();
+    etc
+}
+
+fn attr(etc: &Path, kind: &str, name: &str, property: &str, value: &str) {
+    let dir = etc.join("poudriere.d").join(kind).join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(property), format!("{value}\n")).unwrap();
+}
+
+/// A jail, with its headers, as `poudriere jail -c` leaves it.
+///
+/// `arch` is written in poudriere's stored form, `host.target`.
+pub fn poudriere_jail(etc: &Path, name: &str, arch: &str, version: &str, freebsd_version: &str) {
+    let mnt = etc.join("jails-mnt").join(name);
+    fs::create_dir_all(mnt.join("usr/include/sys")).unwrap();
+    fs::write(
+        mnt.join("usr/include/sys/param.h"),
+        format!("#define __FreeBSD_version {freebsd_version}\n"),
+    )
+    .unwrap();
+
+    attr(etc, "jails", name, "arch", arch);
+    attr(etc, "jails", name, "version", version);
+    attr(etc, "jails", name, "mnt", &mnt.to_string_lossy());
+}
+
+/// A jail whose metadata exists but whose filesystem does not — the shape you
+/// get when a dataset is not mounted.
+pub fn poudriere_jail_without_headers(etc: &Path, name: &str) {
+    attr(etc, "jails", name, "arch", "amd64.amd64");
+    attr(etc, "jails", name, "version", "14.4-RELEASE");
+    attr(
+        etc,
+        "jails",
+        name,
+        "mnt",
+        &etc.join("gone").to_string_lossy(),
+    );
+}
+
+/// A ports tree. Returns the path its `mnt` points at.
+pub fn poudriere_tree(etc: &Path, name: &str) -> PathBuf {
+    let mnt = etc.join("ports-mnt").join(name);
+    fs::create_dir_all(&mnt).unwrap();
+    attr(etc, "ports", name, "mnt", &mnt.to_string_lossy());
+    mnt
 }
