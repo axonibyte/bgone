@@ -97,6 +97,14 @@ pub struct Unresolved {
 }
 
 pub const REASON_MALFORMED: &str = "MALFORMED";
+/// The entry has a first field and a colon, but nothing after it.
+///
+/// Distinct from `MALFORMED` because the cause is specific and different: the
+/// port wrote `libtdb.so:${SAMBA_TDB_PORT}` and the variable is unset in this
+/// configuration, so the origin expanded away. Nothing is recoverable — unlike
+/// an empty `@flavour`, there is no origin left — but "a variable in this port
+/// is unset" is a different thing to chase than "this line is malformed".
+pub const REASON_EMPTY_ORIGIN: &str = "EMPTY_ORIGIN";
 pub const REASON_ABSOLUTE: &str = "ABSOLUTE_PATH";
 pub const REASON_UNEXPANDED: &str = "UNEXPANDED_VAR";
 pub const REASON_NO_SUCH_PORT: &str = "NO_SUCH_PORT";
@@ -213,7 +221,7 @@ pub fn parse_dep_entry(entry: &str) -> std::result::Result<(String, Option<Strin
     // `[^:]*` for the origin field: everything up to the next colon, if any.
     let origin_field = rest.split(':').next().unwrap_or("");
     if origin_field.is_empty() {
-        return Err(REASON_MALFORMED);
+        return Err(REASON_EMPTY_ORIGIN);
     }
     if origin_field.starts_with('/') {
         return Err(REASON_ABSOLUTE);
@@ -628,7 +636,12 @@ mod tests {
             Err(REASON_UNEXPANDED)
         );
         assert_eq!(parse_dep_entry("no-colon-at-all"), Err(REASON_MALFORMED));
-        assert_eq!(parse_dep_entry("test:"), Err(REASON_MALFORMED));
+        // `libtdb.so:${SAMBA_TDB_PORT}` with the variable unset
+        assert_eq!(parse_dep_entry("libtdb.so:"), Err(REASON_EMPTY_ORIGIN));
+        // No colon at all: not a depends entry in the first place. This is what
+        // a stray `\` merging two assignments produces — the swallowed
+        // `JOSE_RUN_DEPENDS=` arrives as a word in the previous option's list.
+        assert_eq!(parse_dep_entry("JOSE_RUN_DEPENDS="), Err(REASON_MALFORMED));
         assert_eq!(parse_dep_entry("test:@flavour"), Err(REASON_MALFORMED));
         assert_eq!(parse_dep_entry(""), Err(REASON_MALFORMED));
     }
