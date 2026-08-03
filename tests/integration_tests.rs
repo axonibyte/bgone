@@ -4,10 +4,10 @@ use common::TempDir;
 
 use rusqlite::Connection;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use bgone::cli::parse_ports_file;
 use bgone::db;
-use bgone::describe;
 use bgone::exporter;
 use bgone::graph::{
     next_sibling_index, prev_sibling_index, DependencyGraph, NodeId, Provenance, RowKind,
@@ -15,6 +15,7 @@ use bgone::graph::{
 };
 use bgone::indexer;
 use bgone::reader::SystemOptions;
+use bgone::resolve;
 use bgone::ui::{
     next_focus, prev_focus, recenter_offset, tree_op, Focus, RecenterPosition, TreeOp,
 };
@@ -116,16 +117,25 @@ fn test_exporter_writes_valid_options_files() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
-        [],
-    ).unwrap();
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('www/apache24', 'HTTP2', 1, 'Enable HTTP2', 'DEFINE', ''),
-                ('www/apache24', 'DOCS', 0, 'Build Docs', 'DEFINE', '')",
-        [],
-    ).unwrap();
+    common::add_option(
+        &conn,
+        "www/apache24",
+        "HTTP2",
+        true,
+        "Enable HTTP2",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "www/apache24",
+        "DOCS",
+        false,
+        "Build Docs",
+        "DEFINE",
+        "",
+    );
+    common::set_pkgname(&conn, "www/apache24", "apache-2.4.58");
 
     let sys_opts = SystemOptions::default();
     let graph =
@@ -158,37 +168,36 @@ fn test_exporter_writes_valid_options_files() {
     assert!(make_content.contains("OPTIONS_UNSET+=DOCS"));
 }
 
-/// The indexer only reads PORTVERSION, so ports setting DISTVERSION land in the
-/// cache with a placeholder or empty version. Neither may reach the file as a
-/// dangling `name-`.
+/// `PKGNAME` is whatever make reported, verbatim.
+///
+/// It used to be stitched together from PORTNAME and PORTVERSION whenever the
+/// tree had not been read, which was wrong for 88% of ports — no PORTREVISION,
+/// no PORTEPOCH, and no USES-synthesised prefix — and needed a rule for hiding
+/// the placeholder version that produced. Nothing is reconstructed now, so the
+/// only thing left to check is that the header says what the cache holds.
 #[test]
-fn test_exporter_omits_unknown_versions_from_the_pkgname_header() {
+fn test_exporter_writes_the_package_name_make_reported() {
     let temp = TempDir::new("exporter_versions");
     let options_dir = temp.path.join("ports");
 
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES
-            ('www/nginx', 'nginx', '', 'Web Server'),
-            ('www/brotli', 'brotli', 'latest', 'Compression'),
-            ('www/known', 'known', '1.2.3', 'Known Version')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('www/nginx', 'HTTPV3', 0, '', 'DEFINE', ''),
-                ('www/brotli', 'STATIC', 0, '', 'DEFINE', ''),
-                ('www/known', 'DOCS', 0, '', 'DEFINE', '')",
-        [],
-    ).unwrap();
+    for (origin, opt, pkgname) in [
+        // The forms a reconstruction could not produce: a revision, an epoch,
+        // and a USES-synthesised prefix.
+        ("www/nginx", "HTTPV3", "nginx-1.30.4_1,3"),
+        ("devel/py-black", "STATIC", "py312-black-26.5.1"),
+        ("www/known", "DOCS", "known-1.2.3"),
+    ] {
+        common::add_option(&conn, origin, opt, false, "", "DEFINE", "");
+        common::set_pkgname(&conn, origin, pkgname);
+    }
 
     let sys_opts = SystemOptions::default();
     let patterns = vec![
         "www/nginx".to_string(),
-        "www/brotli".to_string(),
+        "devel/py-black".to_string(),
         "www/known".to_string(),
     ];
     let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
@@ -196,9 +205,52 @@ fn test_exporter_omits_unknown_versions_from_the_pkgname_header() {
 
     let read = |port: &str| fs::read_to_string(options_dir.join(port).join("options")).unwrap();
 
-    assert!(read("www_nginx").contains("_OPTIONS_READ=nginx\n"));
-    assert!(read("www_brotli").contains("_OPTIONS_READ=brotli\n"));
+    assert!(read("www_nginx").contains("_OPTIONS_READ=nginx-1.30.4_1,3\n"));
+    assert!(read("devel_py-black").contains("_OPTIONS_READ=py312-black-26.5.1\n"));
     assert!(read("www_known").contains("_OPTIONS_READ=known-1.2.3\n"));
+}
+
+/// An option name that means different things to different ports is left out of
+/// the global snippet rather than written both ways.
+///
+/// Deduping on `(name, enabled)` used to emit `OPTIONS_SET+=DOCS` *and*
+/// `OPTIONS_UNSET+=DOCS` whenever two ports disagreed, leaving the outcome to
+/// whichever `bsd.options.mk` applied last. The per-port files already say
+/// exactly what each port wants, so the ambiguous name is simply omitted.
+#[test]
+fn test_the_global_snippet_omits_options_the_ports_disagree_about() {
+    let temp = TempDir::new("exporter_globals");
+    let options_dir = temp.path.join("ports");
+    let make_conf = temp.path.join("make.conf");
+
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    // DOCS disagrees; SSL is on everywhere; NLS is off everywhere.
+    common::add_option(&conn, "www/one", "DOCS", true, "", "DEFINE", "");
+    common::add_option(&conn, "www/one", "SSL", true, "", "DEFINE", "");
+    common::add_option(&conn, "www/one", "NLS", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/two", "DOCS", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/two", "SSL", true, "", "DEFINE", "");
+    common::add_option(&conn, "www/two", "NLS", false, "", "DEFINE", "");
+
+    let patterns = vec!["www/one".to_string(), "www/two".to_string()];
+    let graph =
+        DependencyGraph::load_from_db(&conn, &patterns, &SystemOptions::default(), false).unwrap();
+    exporter::export_options(&graph, &options_dir, false, Some(&make_conf)).unwrap();
+
+    let content = fs::read_to_string(&make_conf).unwrap();
+    assert!(content.contains("OPTIONS_SET+=SSL"));
+    assert!(content.contains("OPTIONS_UNSET+=NLS"));
+    assert!(
+        !content.contains("DOCS"),
+        "the ports disagree about DOCS, so it must not be stated globally either way:\n{content}"
+    );
+
+    // The per-port files still say exactly what each port wants
+    let read = |p: &str| fs::read_to_string(options_dir.join(p).join("options")).unwrap();
+    assert!(read("www_one").contains("OPTIONS_FILE_SET+=DOCS"));
+    assert!(read("www_two").contains("OPTIONS_FILE_UNSET+=DOCS"));
 }
 
 /// What the exporter writes must be what the reader reads back, otherwise a
@@ -211,16 +263,25 @@ fn test_exported_options_round_trip_through_the_reader() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
-        [],
-    ).unwrap();
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('www/apache24', 'HTTP2', 1, 'Enable HTTP2', 'DEFINE', ''),
-                ('www/apache24', 'DOCS', 0, 'Build Docs', 'DEFINE', '')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "www/apache24");
+    common::add_option(
+        &conn,
+        "www/apache24",
+        "HTTP2",
+        true,
+        "Enable HTTP2",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "www/apache24",
+        "DOCS",
+        false,
+        "Build Docs",
+        "DEFINE",
+        "",
+    );
 
     let sys_opts = SystemOptions::default();
     let graph =
@@ -247,15 +308,16 @@ fn test_exporter_dry_run_creates_no_files() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('sysutils/tmux', 'tmux', '3.3', 'Terminal Multiplexer')",
-        [],
-    ).unwrap();
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('sysutils/tmux', 'UTF8BIDI', 1, 'Support UTF8 BIDI', 'DEFINE', '')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "sysutils/tmux");
+    common::add_option(
+        &conn,
+        "sysutils/tmux",
+        "UTF8BIDI",
+        true,
+        "Support UTF8 BIDI",
+        "DEFINE",
+        "",
+    );
 
     let sys_opts = SystemOptions::default();
     let graph =
@@ -277,401 +339,287 @@ fn test_exporter_dry_run_creates_no_files() {
 // 3. INDEXER & DB TESTS (Parallel Processing & Parser)
 // ============================================================================
 
+/// A stand-in for make that replays a canned reply per port.
+///
+/// The real thing evaluates 38,000 lines of ports framework; a test that only
+/// cares about how a reply becomes rows should not need it, or a ports tree, or
+/// FreeBSD. The stub answers from a file beside the port's Makefile, so a
+/// fixture reads as "this is what make says about this port".
+fn stub_make(dir: &Path) -> PathBuf {
+    let path = dir.join("stub-make");
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         while [ $# -gt 0 ]; do\n\
+           if [ \"$1\" = \"-C\" ]; then shift; cat \"$1/.reply\"; exit 0; fi\n\
+           shift\n\
+         done\n\
+         exit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// Writes a port directory whose canned reply says exactly `fields`.
+fn mock_port(root: &Path, origin: &str, fields: &[(&str, String)]) {
+    let dir = root.join(origin);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Makefile"), "# evaluated by the stub\n").unwrap();
+
+    let reply: String = fields
+        .iter()
+        .map(|(k, v)| format!("{k}{}{v}\n", resolve::US))
+        .collect();
+    fs::write(dir.join(".reply"), reply).unwrap();
+}
+
+/// A list-valued reply field: records separated, two fields each.
+fn rec(items: &[(&str, &str)]) -> String {
+    items
+        .iter()
+        .map(|(a, b)| format!("{a}{}{b}{}", resolve::US, resolve::RS))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn indexed_env(root: &Path, stub: &Path) -> resolve::MakeEnv {
+    let mut env = resolve::MakeEnv::new(root);
+    env.make = stub.to_path_buf();
+    env
+}
+
 #[test]
-fn test_indexer_parses_ports_dir_into_sqlite() {
+fn test_indexer_stores_what_make_reports() {
     let temp = TempDir::new("indexer");
-    let ports_root = temp.path.join("ports");
+    let root = temp.path.join("ports");
+    fs::create_dir_all(&root).unwrap();
+    let stub = stub_make(&temp.path);
 
-    // Construct mock ports directory tree
-    let nginx_dir = ports_root.join("www").join("nginx");
-    fs::create_dir_all(&nginx_dir).unwrap();
-
-    let makefile_content = r#"
-PORTNAME=   nginx
-PORTVERSION=1.24.0
-COMMENT=    Robust HTTP and reverse proxy server
-
-OPTIONS_DEFINE=   HTTP2 SSL DEBUG
-OPTIONS_SINGLE=   GZIP
-OPTIONS_SINGLE_GZIP= GZIP_DEF GZIP_ALT
-OPTIONS_DEFAULT=  HTTP2 GZIP_DEF
-
-HTTP2_DESC=       Enable HTTP2 protocol support
-SSL_DESC=         Enable SSL protocol support
-
-HTTP2_RUN_DEPENDS= www/nghttp2
-
-LIB_DEPENDS=  libpcre2-8.so:devel/pcre2
-BUILD_DEPENDS= pkgconf:devel/pkgconf
-RUN_DEPENDS=  ${LOCALBASE}/bin/nowhere:devel/nonexistent
-"#;
-    fs::write(nginx_dir.join("Makefile"), makefile_content).unwrap();
-
-    // The ports the Makefile above depends on. Only dependencies pointing at
-    // ports that actually exist survive indexing.
-    for (category, port) in [("www", "nghttp2"), ("devel", "pcre2"), ("devel", "pkgconf")] {
-        let dir = ports_root.join(category).join(port);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("Makefile"),
-            format!("PORTNAME=   {}\nPORTVERSION=1.0\n", port),
-        )
-        .unwrap();
+    mock_port(
+        &root,
+        "www/nginx",
+        &[
+            ("PKGNAME", "nginx-1.24.0_1".into()),
+            ("PKGBASE", "nginx".into()),
+            ("FLAVORS", String::new()),
+            ("OPTIONS", "HTTP2 SSL DEBUG GZIP_DEF GZIP_ALT".into()),
+            ("DEFAULTS", "HTTP2 GZIP_DEF".into()),
+            (
+                "DESC",
+                rec(&[("HTTP2", "Enable HTTP2"), ("SSL", "Enable SSL")]),
+            ),
+            ("GRP_SINGLE", rec(&[("GZIP", "GZIP_DEF GZIP_ALT")])),
+            ("DEP_LIB", "libpcre2-8.so:devel/pcre2".into()),
+            ("DEP_BUILD", "pkgconf:devel/pkgconf".into()),
+            // The path form the old regex used to mistake for an origin
+            (
+                "DEP_RUN",
+                "${LOCALBASE}/bin/nowhere:devel/nonexistent".into(),
+            ),
+            ("OPTDEP_RUN_ON", rec(&[("HTTP2", "nghttp2>=1:www/nghttp2")])),
+        ],
+    );
+    for origin in ["www/nghttp2", "devel/pcre2", "devel/pkgconf"] {
+        mock_port(
+            &root,
+            origin,
+            &[
+                (
+                    "PKGNAME",
+                    format!("{}-1.0", origin.split('/').nth(1).unwrap()),
+                ),
+                ("OPTIONS", String::new()),
+            ],
+        );
     }
 
     let mut conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
-
-    let stats = indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+    let stats = indexer::index_ports_dir(&mut conn, &indexed_env(&root, &stub)).unwrap();
 
     assert_eq!(stats.ports_indexed, 4);
-    assert_eq!(stats.options_indexed, 5); // HTTP2, SSL, DEBUG, GZIP_DEF, GZIP_ALT
-    assert_eq!(stats.option_deps_indexed, 1); // HTTP2 -> www/nghttp2
+    assert_eq!(stats.options_indexed, 5);
+    assert_eq!(stats.failed, 0);
 
-    // devel/pcre2 and devel/pkgconf, but not devel/nonexistent
-    assert_eq!(stats.port_deps_indexed, 2);
+    // Identity comes from make, so PKGNAME carries the revision the old
+    // reconstruction could never produce.
+    let pkgname: String = conn
+        .query_row(
+            "SELECT pkgname FROM ports WHERE origin = 'www/nginx'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkgname, "nginx-1.24.0_1");
 
-    let dep_types: Vec<(String, String)> = conn
-        .prepare("SELECT dep_origin, dep_type FROM port_deps WHERE port_origin = 'www/nginx' ORDER BY dep_origin")
+    // Grouping and descriptions survive
+    let (gt, gn): (String, String) = conn
+        .query_row(
+            "SELECT o.group_type, o.group_name FROM options o
+             JOIN ports p ON p.id = o.port_id
+             WHERE p.origin = 'www/nginx' AND o.name = 'GZIP_ALT'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((gt.as_str(), gn.as_str()), ("SINGLE", "GZIP"));
+
+    // Edges point at ports, with their real class.
+    let edges: Vec<(String, String, Option<String>)> = conn
+        .prepare(
+            "SELECT t.origin, e.class, o.name FROM dep_edge e
+             JOIN ports f ON f.id = e.from_port_id
+             JOIN ports t ON t.id = e.to_port_id
+             LEFT JOIN options o ON o.id = e.via_option_id
+             WHERE f.origin = 'www/nginx' ORDER BY t.origin",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        edges,
+        vec![
+            ("devel/pcre2".to_string(), "LIB".to_string(), None),
+            ("devel/pkgconf".to_string(), "BUILD".to_string(), None),
+            (
+                "www/nghttp2".to_string(),
+                "RUN".to_string(),
+                Some("HTTP2".to_string())
+            ),
+        ],
+        "the class is recorded, not invented, and option edges name their option"
+    );
+
+    // `devel/nonexistent` is not in the tree. It is recorded rather than
+    // silently dropped, which is what makes 'nothing failed to resolve'
+    // checkable.
+    let unresolved: Vec<(String, String)> = conn
+        .prepare("SELECT raw_entry, reason FROM unresolved_dep WHERE port_origin = 'www/nginx'")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(
-        dep_types,
-        vec![
-            ("devel/pcre2".to_string(), "LIB".to_string()),
-            ("devel/pkgconf".to_string(), "BUILD".to_string()),
-        ]
+        unresolved,
+        vec![("devel/nonexistent".to_string(), "NO_SUCH_PORT".to_string())]
     );
-
-    // `HTTP2_RUN_DEPENDS` is option-conditional and must not also be recorded
-    // as an unconditional dependency
-    let nghttp2_unconditional: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM port_deps WHERE dep_origin = 'www/nghttp2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(nghttp2_unconditional, 0);
-
-    // Query SQLite database directly to verify values
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ports WHERE origin = 'www/nginx'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-
-    let http2_default: i32 = conn
-        .query_row(
-            "SELECT default_state FROM options WHERE port_origin = 'www/nginx' AND option_name = 'HTTP2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(http2_default, 1);
-
-    let debug_default: i32 = conn
-        .query_row(
-            "SELECT default_state FROM options WHERE port_origin = 'www/nginx' AND option_name = 'DEBUG'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(debug_default, 0);
 }
 
-// ============================================================================
-// 3b. THE MAKEFILE SWEEP MEETS CONSTRUCTS IT CANNOT EVALUATE
-//
-// The indexer is a line-oriented regex sweep, not bmake. It never evaluates
-// `.if`, never expands `.for`, and never follows `.include` or `MASTERDIR`.
-// That is deliberate: `make describe-json` is run against the ports actually
-// targeted and is authoritative for which options exist, so the sweep only has
-// to be fast and approximately right.
-//
-// What follows pins what it does with the constructs it cannot evaluate, so
-// that changing any of it is a visible decision rather than an accident. Each
-// test says which way the approximation errs, because the two directions are
-// not equally safe: collecting an option that does not exist is harmless —
-// `bsd.options.mk` guards `OPTIONS_FILE_SET` with a membership test — whereas
-// missing one that does is what keeps `config-conditional` re-prompting.
-// ============================================================================
-
-/// A slave port keeps its options in the master's Makefile, so the sweep, which
-/// reads only the port's own directory, finds none of them.
+/// A port that failed to evaluate is retried on the next index, not remembered
+/// as failed.
 ///
-/// Measured against the tree: 1,127 ports set `MASTERDIR`, and 1,043 of them
-/// (93%) come out of indexing with no options at all. `describe-json` supplies
-/// the names and defaults for whichever of them get targeted. What it cannot
-/// supply is descriptions or `SINGLE`/`MULTI`/`RADIO` grouping, so a slave port
-/// is configured as a flat list even where its master has a radio group — the
-/// degradation this test exists to make explicit rather than incidental.
+/// Only a successful evaluation writes a `port_mtime` row, so a failure leaves
+/// nothing to compare against and the port is always stale. That matters
+/// because most failures are environmental — no ports tree, a make that cannot
+/// read it — and caching them would make a transient problem permanent.
 #[test]
-fn test_a_slave_port_inherits_no_options_from_its_master() {
-    let temp = TempDir::new("slave_port");
-    let ports_root = temp.path.join("ports");
+fn test_a_failed_port_is_retried_rather_than_remembered_as_failed() {
+    let temp = TempDir::new("retry");
+    let root = temp.path.join("ports");
+    fs::create_dir_all(&root).unwrap();
+    let stub = stub_make(&temp.path);
 
-    let master = ports_root.join("mail").join("postfixadmin33");
-    fs::create_dir_all(&master).unwrap();
-    fs::write(
-        master.join("Makefile"),
-        r#"
-PORTNAME=   postfixadmin
-PORTVERSION=3.3.13
-COMMENT=    Web based virtual user administration
-
-OPTIONS_DEFINE=     DOCS FPM
-OPTIONS_SINGLE=     DB
-OPTIONS_SINGLE_DB=  MYSQL PGSQL
-OPTIONS_DEFAULT=    DOCS MYSQL
-
-FPM_DESC=   Use PHP-FPM
-MYSQL_DESC= MySQL backend
-PGSQL_DESC= PostgreSQL backend
-"#,
-    )
-    .unwrap();
-
-    // The real shape of a slave: a suffix, a pointer, and an include
-    let slave = ports_root.join("mail").join("postfixadmin33-lite");
-    fs::create_dir_all(&slave).unwrap();
-    fs::write(
-        slave.join("Makefile"),
-        r#"
-PKGNAMESUFFIX=  -lite
-MASTERDIR=      ${.CURDIR}/../postfixadmin33
-.include "${MASTERDIR}/Makefile"
-"#,
-    )
-    .unwrap();
+    // No `.reply`, so the stub exits non-zero: make cannot answer for it.
+    let dir = root.join("www/app");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Makefile"), "# unreadable\n").unwrap();
 
     let mut conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
-    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+    let env = indexed_env(&root, &stub);
 
-    let options_of = |origin: &str| -> Vec<String> {
-        conn.prepare("SELECT option_name FROM options WHERE port_origin = ?1 ORDER BY option_name")
-            .unwrap()
-            .query_map([origin], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
+    let first = indexer::index_ports_dir(&mut conn, &env).unwrap();
+    assert_eq!(first.failed, 1);
+    assert_eq!(first.options_indexed, 0);
 
-    assert_eq!(
-        options_of("mail/postfixadmin33"),
-        vec!["DOCS", "FPM", "MYSQL", "PGSQL"],
-        "the master's own options are found normally"
-    );
-    assert!(
-        options_of("mail/postfixadmin33-lite").is_empty(),
-        "the sweep does not follow MASTERDIR, so the slave has nothing"
-    );
-
-    // The slave is still indexed as a port; only its options are missing, which
-    // is what makes the omission silent rather than obvious.
-    let indexed: i64 = conn
+    let resolved: i32 = conn
         .query_row(
-            "SELECT COUNT(*) FROM ports WHERE origin = 'mail/postfixadmin33-lite'",
+            "SELECT resolved FROM ports WHERE origin = 'www/app'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(indexed, 1);
-
-    // ---- what describe-json then rescues, and what it does not ----
-    cache_details(
-        &conn,
-        "mail/postfixadmin33-lite",
-        "postfixadmin-lite-3.3.13",
-        "DOCS FPM MYSQL PGSQL",
-        "DOCS MYSQL",
-    );
-
-    let graph = DependencyGraph::load_from_db(
-        &conn,
-        &["mail/postfixadmin33-lite".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
-
-    let opt = |name: &str| {
-        graph
-            .option_nodes
-            .iter()
-            .find(|o| o.name == name)
-            .unwrap_or_else(|| panic!("{name} missing after the merge"))
-    };
-
-    // Rescued: every option exists, with the tree's defaults
-    assert_eq!(graph.option_nodes.len(), 4);
-    assert!(opt("DOCS").enabled);
-    assert!(opt("MYSQL").enabled);
-    assert!(!opt("FPM").enabled);
-    assert!(!opt("PGSQL").enabled);
-
-    // Not rescued: describe-json carries neither of these, and the index had
-    // nothing to match them against. MYSQL/PGSQL are a radio group in the
-    // master and are presented here as two independent checkboxes.
-    assert_eq!(opt("MYSQL").description, "");
-    assert_eq!(opt("PGSQL").description, "");
-    assert_eq!(opt("MYSQL").group_type, "DEFINE");
-    assert_eq!(opt("PGSQL").group_type, "DEFINE");
-    assert_eq!(opt("MYSQL").group_name, "");
-}
-
-/// Conditionals are not evaluated, so an option defined in either branch of an
-/// `.if` is collected from *both*. It errs towards over-collecting, which is
-/// the harmless direction.
-#[test]
-fn test_options_from_every_branch_of_a_conditional_are_collected() {
-    let temp = TempDir::new("branches");
-    let ports_root = temp.path.join("ports");
-    let port = ports_root.join("www").join("branchy");
-    fs::create_dir_all(&port).unwrap();
-
-    fs::write(
-        port.join("Makefile"),
-        r#"
-PORTNAME=   branchy
-PORTVERSION=1.0
-COMMENT=    Defines different options per architecture
-
-OPTIONS_DEFINE= COMMON
-.if ${ARCH} == amd64
-OPTIONS_DEFINE+=    SIMD
-.else
-OPTIONS_DEFINE+=    PORTABLE
-.endif
-
-.if ${OPSYS} == FreeBSD
-OPTIONS_DEFINE+=    JAIL
-.endif
-"#,
-    )
-    .unwrap();
-
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
-
-    let names: Vec<String> = conn
-        .prepare("SELECT option_name FROM options WHERE port_origin = 'www/branchy' ORDER BY option_name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-
-    assert_eq!(
-        names,
-        vec!["COMMON", "JAIL", "PORTABLE", "SIMD"],
-        "both arms of the .if are taken, and the .endif is not honoured"
-    );
-}
-
-/// Scalar assignments are last-one-wins across branches, and the operator is
-/// honoured rather than everything being treated as `+=`.
-///
-/// Treating them all as `+=` would accumulate every branch at once, and any
-/// expansion using the variable would come out as nonsense — the
-/// `subversion-lts-lts-lts-lts-lts` case the parser documents.
-#[test]
-fn test_a_variable_set_in_several_branches_takes_the_last_one() {
-    let temp = TempDir::new("last_wins");
-    let ports_root = temp.path.join("ports");
-    let port = ports_root.join("www").join("varsy");
-    fs::create_dir_all(&port).unwrap();
-
-    fs::write(
-        port.join("Makefile"),
-        r#"
-PORTNAME=   varsy
-.if ${FLAVOR} == lts
-SUFFIX=     -lts
-.else
-SUFFIX=     -current
-.endif
-PORTVERSION=1.0${SUFFIX}
-COMMENT=    Version carries whichever suffix was assigned last
-"#,
-    )
-    .unwrap();
-
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
-
-    let version: String = conn
+    assert_eq!(resolved, 0, "the port exists but is marked unevaluated");
+    let logged: i64 = conn
         .query_row(
-            "SELECT version FROM ports WHERE origin = 'www/varsy'",
+            "SELECT COUNT(*) FROM unresolved_dep WHERE port_origin = 'www/app' AND reason = 'EVAL_FAILED'",
             [],
             |r| r.get(0),
         )
         .unwrap();
+    assert_eq!(logged, 1);
 
-    assert_eq!(
-        version, "1.0-current",
-        "the last assignment wins; concatenating both would give 1.0-lts-current"
+    // Make it answerable. The Makefile itself is untouched, so nothing about
+    // mtime says to retry — the absence of a recorded success is what does.
+    mock_port(
+        &root,
+        "www/app",
+        &[
+            ("PKGNAME", "app-1.0".into()),
+            ("OPTIONS", "ALPHA".into()),
+            ("DEFAULTS", "ALPHA".into()),
+        ],
     );
+
+    let second = indexer::index_ports_dir(&mut conn, &env).unwrap();
+    assert_eq!(second.cached, 0, "a failure is never treated as up to date");
+    assert_eq!(second.failed, 0);
+    assert_eq!(second.options_indexed, 1);
+
+    let resolved: i32 = conn
+        .query_row(
+            "SELECT resolved FROM ports WHERE origin = 'www/app'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(resolved, 1);
+    let logged: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM unresolved_dep WHERE port_origin = 'www/app'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged, 0, "the stale failure is cleared, not left behind");
 }
 
-/// `.for` loops are not expanded, so options generated by one are dropped
-/// entirely — the *unsafe* direction, and the reason describe-json is not
-/// optional for these ports.
-///
-/// The loop variable is never bound, so `${O}` expands to the empty string and
-/// fails the option-name check. 60 ports in the tree build options this way.
+/// Re-indexing skips ports whose Makefiles have not changed.
 #[test]
-fn test_options_generated_by_a_for_loop_are_dropped() {
-    let temp = TempDir::new("for_loop");
-    let ports_root = temp.path.join("ports");
-    let port = ports_root.join("www").join("loopy");
-    fs::create_dir_all(&port).unwrap();
-
-    fs::write(
-        port.join("Makefile"),
-        r#"
-PORTNAME=   loopy
-PORTVERSION=1.0
-COMMENT=    Builds its option list with a .for
-
-OPTIONS_DEFINE= KEPT
-.for O in ALPHA BETA GAMMA
-OPTIONS_DEFINE+=    ${O}
-${O}_DESC=          Support for ${O}
-.endfor
-"#,
-    )
-    .unwrap();
+fn test_unchanged_ports_are_not_re_evaluated() {
+    let temp = TempDir::new("incremental");
+    let root = temp.path.join("ports");
+    fs::create_dir_all(&root).unwrap();
+    let stub = stub_make(&temp.path);
+    mock_port(
+        &root,
+        "www/app",
+        &[
+            ("PKGNAME", "app-1.0".into()),
+            ("OPTIONS", "ALPHA".into()),
+            ("DEFAULTS", "ALPHA".into()),
+        ],
+    );
 
     let mut conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
-    indexer::index_ports_dir(&mut conn, &ports_root).unwrap();
+    let env = indexed_env(&root, &stub);
 
-    let names: Vec<String> = conn
-        .prepare(
-            "SELECT option_name FROM options WHERE port_origin = 'www/loopy' ORDER BY option_name",
-        )
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let first = indexer::index_ports_dir(&mut conn, &env).unwrap();
+    assert_eq!(first.cached, 0);
+    assert_eq!(first.options_indexed, 1);
 
-    assert_eq!(
-        names,
-        vec!["KEPT"],
-        "ALPHA/BETA/GAMMA are lost: the loop variable is unbound, so ${{O}} \
-         expands to nothing and the empty name is rejected"
-    );
+    let second = indexer::index_ports_dir(&mut conn, &env).unwrap();
+    assert_eq!(second.cached, 1, "nothing changed, so nothing is re-run");
+    assert_eq!(second.options_indexed, 0);
 }
 
 // ============================================================================
@@ -683,18 +631,27 @@ fn test_graph_radio_group_mutual_exclusion() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('databases/db', 'db', '1.0', 'Database')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "databases/db");
 
     // Insert two options in the same SINGLE group
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('databases/db', 'ENGINE_A', 1, 'Engine A', 'SINGLE', 'ENGINE'),
-                ('databases/db', 'ENGINE_B', 0, 'Engine B', 'SINGLE', 'ENGINE')",
-        [],
-    ).unwrap();
+    common::add_option(
+        &conn,
+        "databases/db",
+        "ENGINE_A",
+        true,
+        "Engine A",
+        "SINGLE",
+        "ENGINE",
+    );
+    common::add_option(
+        &conn,
+        "databases/db",
+        "ENGINE_B",
+        false,
+        "Engine B",
+        "SINGLE",
+        "ENGINE",
+    );
 
     let sys_opts = SystemOptions::default();
     let mut graph =
@@ -723,18 +680,35 @@ fn test_graph_search_filtering() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('net/curl', 'curl', '8.0', 'Data transfer tool')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "net/curl");
 
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('net/curl', 'HTTP2', 1, 'Enable HTTP2 support', 'DEFINE', ''),
-                ('net/curl', 'OPENSSL', 1, 'Use OpenSSL backend', 'DEFINE', ''),
-                ('net/curl', 'COOKIES', 0, 'Enable Cookie support', 'DEFINE', '')",
-        [],
-    ).unwrap();
+    common::add_option(
+        &conn,
+        "net/curl",
+        "HTTP2",
+        true,
+        "Enable HTTP2 support",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "net/curl",
+        "OPENSSL",
+        true,
+        "Use OpenSSL backend",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "net/curl",
+        "COOKIES",
+        false,
+        "Enable Cookie support",
+        "DEFINE",
+        "",
+    );
 
     let sys_opts = SystemOptions::default();
     let mut graph =
@@ -787,13 +761,8 @@ fn test_graph_glob_pattern_resolution() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES
-         ('www/py-django', 'py-django', '4.2', 'Web Framework'),
-         ('www/py-requests', 'py-requests', '2.31', 'HTTP Library')",
-        [],
-    )
-    .unwrap();
+    common::add_port(&conn, "www/py-django");
+    common::add_port(&conn, "www/py-requests");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/py-*".to_string()];
@@ -837,16 +806,11 @@ www/py-*, net/curl
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES
-         ('www/apache24', 'apache', '2.4', 'Server'),
-         ('databases/postgresql16-server', 'pg', '16.0', 'DB'),
-         ('lang/python311', 'python', '3.11', 'Lang'),
-         ('www/py-django', 'django', '4.2', 'Web'),
-         ('net/curl', 'curl', '8.0', 'Tool')",
-        [],
-    )
-    .unwrap();
+    common::add_port(&conn, "www/apache24");
+    common::add_port(&conn, "databases/postgresql16-server");
+    common::add_port(&conn, "lang/python311");
+    common::add_port(&conn, "www/py-django");
+    common::add_port(&conn, "net/curl");
 
     let targets = parse_ports_file(&ports_file).unwrap();
 
@@ -862,10 +826,7 @@ fn test_multiple_ports_with_one_unknown_returns_error() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "www/apache24");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
@@ -882,10 +843,7 @@ fn test_ignore_missing_flag_warns_and_continues() {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/apache24', 'apache', '2.4.58', 'Web Server')",
-        [],
-    ).unwrap();
+    common::add_port(&conn, "www/apache24");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
@@ -904,33 +862,58 @@ fn shared_dependency_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES
-         ('www/root1', 'root1', '1.0', 'First root'),
-         ('www/root2', 'root2', '1.0', 'Second root'),
-         ('devel/shared', 'shared', '1.0', 'Shared dependency')",
-        [],
-    )
-    .unwrap();
+    common::add_port(&conn, "www/root1");
+    common::add_port(&conn, "www/root2");
+    common::add_port(&conn, "devel/shared");
 
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('www/root1', 'USE_SHARED', 1, 'Pull in shared', 'DEFINE', ''),
-                ('www/root2', 'ALSO_SHARED', 1, 'Pull in shared', 'DEFINE', ''),
-                ('devel/shared', 'THREADS', 0, 'Threading support', 'DEFINE', ''),
-                ('devel/shared', 'ENGINE_A', 1, 'Engine A', 'SINGLE', 'ENGINE'),
-                ('devel/shared', 'ENGINE_B', 0, 'Engine B', 'SINGLE', 'ENGINE')",
-        [],
-    )
-    .unwrap();
+    common::add_option(
+        &conn,
+        "www/root1",
+        "USE_SHARED",
+        true,
+        "Pull in shared",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "www/root2",
+        "ALSO_SHARED",
+        true,
+        "Pull in shared",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "devel/shared",
+        "THREADS",
+        false,
+        "Threading support",
+        "DEFINE",
+        "",
+    );
+    common::add_option(
+        &conn,
+        "devel/shared",
+        "ENGINE_A",
+        true,
+        "Engine A",
+        "SINGLE",
+        "ENGINE",
+    );
+    common::add_option(
+        &conn,
+        "devel/shared",
+        "ENGINE_B",
+        false,
+        "Engine B",
+        "SINGLE",
+        "ENGINE",
+    );
 
-    conn.execute(
-        "INSERT INTO option_deps (port_origin, option_name, dep_origin, dep_type) VALUES
-         ('www/root1', 'USE_SHARED', 'devel/shared', 'RUN'),
-         ('www/root2', 'ALSO_SHARED', 'devel/shared', 'RUN')",
-        [],
-    )
-    .unwrap();
+    common::add_option_dep(&conn, "www/root1", "USE_SHARED", "devel/shared");
+    common::add_option_dep(&conn, "www/root2", "ALSO_SHARED", "devel/shared");
 
     conn
 }
@@ -959,40 +942,14 @@ fn dep_graph_db(option_edges: &[(&str, &str, &str)], port_edges: &[(&str, &str)]
     origins.dedup();
 
     for origin in &origins {
-        let name = origin.split('/').nth(1).unwrap();
-        conn.execute(
-            "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-            rusqlite::params![origin, name],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-             VALUES (?1, 'DOCS', 1, '', 'DEFINE', '')",
-            rusqlite::params![origin],
-        )
-        .unwrap();
+        common::add_option(&conn, origin, "DOCS", true, "", "DEFINE", "");
     }
-
     for (from, opt, to) in option_edges {
-        conn.execute(
-            "INSERT OR IGNORE INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-             VALUES (?1, ?2, 1, '', 'DEFINE', '')",
-            rusqlite::params![from, opt],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO option_deps (port_origin, option_name, dep_origin, dep_type) VALUES (?1, ?2, ?3, 'RUN')",
-            rusqlite::params![from, opt, to],
-        )
-        .unwrap();
+        common::add_option(&conn, from, opt, true, "", "DEFINE", "");
+        common::add_option_dep(&conn, from, opt, to);
     }
-
     for (from, to) in port_edges {
-        conn.execute(
-            "INSERT INTO port_deps (port_origin, dep_origin, dep_type) VALUES (?1, ?2, 'LIB')",
-            rusqlite::params![from, to],
-        )
-        .unwrap();
+        common::add_port_dep(&conn, from, to);
     }
 
     conn
@@ -1260,197 +1217,282 @@ fn test_relationship_rows_carry_resolvable_jump_targets() {
 }
 
 // ============================================================================
-// 4d. PORT DETAILS FROM THE TREE (describe-json)
+// 4e. OPTION SEMANTICS (implications, conflicts, off-polarity dependencies)
+//
+// bsddialog enforces these, so a configurator meant to replace it has to. None
+// were modelled before: the parser could not see them, and the schema had
+// nowhere to put them.
 // ============================================================================
 
-/// Writes a `port_details` row as though `make describe-json` had been run.
-fn cache_details(conn: &Connection, origin: &str, pkgname: &str, complete: &str, defaults: &str) {
-    let pkgbase = pkgname.rsplit_once('-').map(|(b, _)| b).unwrap_or(pkgname);
-    conn.execute(
-        "INSERT OR REPLACE INTO port_details
-         (port_origin, pkgbase, pkgname, complete_options_list, options_default, source_mtime)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-        rusqlite::params![origin, pkgbase, pkgname, complete, defaults],
-    )
-    .unwrap();
+fn find_option(graph: &DependencyGraph, origin: &str, name: &str) -> usize {
+    graph
+        .option_nodes
+        .iter()
+        .position(|o| o.port_origin == origin && o.name == name)
+        .unwrap_or_else(|| panic!("no option {name} on {origin}"))
 }
 
-#[test]
-fn test_describe_json_parses_an_unflavoured_port() {
-    let json = r#"{ "uses":["cpe"], "complete_options_list":["DOCS","SSL","X11"],
-        "options_default":["SSL"], "pkgbase":"nginx", "pkgname":"nginx-1.24.0_2",
-        "portversion":"1.24.0", "www":"https://nginx.org" }"#;
-
-    let d = describe::parse_describe_json(json, "www/nginx", 1234).unwrap();
-
-    assert_eq!(d.pkgname, "nginx-1.24.0_2");
-    assert_eq!(d.pkgbase, "nginx");
-    assert_eq!(d.complete_options_list, vec!["DOCS", "SSL", "X11"]);
-    assert_eq!(d.options_default, vec!["SSL"]);
-    assert_eq!(d.source_mtime, 1234);
+fn is_on(graph: &DependencyGraph, origin: &str, name: &str) -> bool {
+    graph.option_nodes[find_option(graph, origin, name)].enabled
 }
 
-/// A port with FLAVORS emits one document per flavour, keyed by flavour name.
-#[test]
-fn test_describe_json_parses_a_flavoured_port() {
-    let json = r#"{
-        "py311-django": { "complete_options_list":["DOCS"], "options_default":[""],
-                          "pkgbase":"py311-django", "pkgname":"py311-django-4.2.11" },
-        "py39-django":  { "complete_options_list":["DOCS"], "options_default":[""],
-                          "pkgbase":"py39-django", "pkgname":"py39-django-4.2.11" }
-    }"#;
-
-    let d = describe::parse_describe_json(json, "www/py-django", 7).unwrap();
-
-    assert!(d.pkgname.ends_with("-django-4.2.11"));
-    assert_eq!(d.complete_options_list, vec!["DOCS"]);
-    // An empty make variable renders as [""], which is not an option named ""
-    assert!(d.options_default.is_empty());
+fn toggle(graph: &mut DependencyGraph, origin: &str, name: &str) {
+    let row = graph
+        .visible_rows
+        .iter()
+        .position(|r| match &r.kind {
+            RowKind::Option { name: n, .. } => {
+                n == name && graph.option_nodes[find_option(graph, origin, name)].name == *n
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("no visible row for {origin}/{name}"));
+    graph.toggle_option(row);
 }
 
+/// `NJS_IMPLIES=STREAM` means the two cannot be built apart, so turning NJS on
+/// turns STREAM on with it — as `bsd.options.mk` would, rather than writing an
+/// options file the framework then quietly overrides.
 #[test]
-fn test_describe_json_rejects_unusable_output() {
-    assert!(describe::parse_describe_json("not json", "www/x", 0).is_err());
-    assert!(describe::parse_describe_json("{}", "www/x", 0).is_err());
-    assert!(describe::parse_describe_json(r#"{"pkgname":""}"#, "www/x", 0).is_err());
-}
+fn test_turning_an_option_on_turns_on_what_it_implies() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
 
-/// An option the Makefile sweep could not see still reaches the options file.
-///
-/// `security/ossec-hids-agent` is a measured instance: it inherits through
-/// `MASTERDIR`, the sweep finds no options for it at all, and the tree reports
-/// `DOCS INOTIFY LUA`. Rare — about 1% of ports — but while it lasts
-/// `config-conditional` keeps re-opening the dialog for that port.
-#[test]
-fn test_options_only_the_tree_knows_about_are_written() {
-    let temp = TempDir::new("described_options");
-    let options_dir = temp.path.join("ports");
+    common::add_option(&conn, "www/nginx", "NJS", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/nginx", "STREAM", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/nginx", "HTTP", false, "", "DEFINE", "");
+    common::add_implies(&conn, "www/nginx", "NJS", "STREAM");
+    // Transitive: STREAM itself implies HTTP
+    common::add_implies(&conn, "www/nginx", "STREAM", "HTTP");
 
-    let conn = dep_graph_db(&[], &[]);
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment)
-         VALUES ('security/ossec-hids-agent', 'ossec-hids-agent', 'latest', '')",
-        [],
-    )
-    .unwrap();
-    // The sweep finds nothing: the options live in the master's Makefile
-    // What the tree reports, plus a PKGNAME the sweep could not reconstruct
-    cache_details(
+    let mut graph = DependencyGraph::load_from_db(
         &conn,
-        "security/ossec-hids-agent",
-        "ossec-hids-agent-3.8.0",
-        "DOCS INOTIFY LUA",
-        "INOTIFY",
-    );
-
-    let sys_opts = SystemOptions::default();
-    let graph = DependencyGraph::load_from_db(
-        &conn,
-        &["security/ossec-hids-agent".to_string()],
-        &sys_opts,
+        &["www/nginx".to_string()],
+        &SystemOptions::default(),
         false,
     )
     .unwrap();
+    graph.expand_all();
 
-    exporter::export_options(&graph, &options_dir, false, None).unwrap();
-    let content = fs::read_to_string(
-        options_dir
-            .join("security_ossec-hids-agent")
-            .join("options"),
-    )
-    .unwrap();
+    assert!(!is_on(&graph, "www/nginx", "STREAM"));
+    toggle(&mut graph, "www/nginx", "NJS");
 
-    // The real PKGNAME, not a reconstruction
-    assert!(content.contains("_OPTIONS_READ=ossec-hids-agent-3.8.0"));
-    assert!(content.contains("_FILE_COMPLETE_OPTIONS_LIST=DOCS INOTIFY LUA"));
-
-    // Every option named, or config-conditional prompts again
-    for opt in ["DOCS", "INOTIFY", "LUA"] {
-        assert!(
-            content.contains(&format!("OPTIONS_FILE_SET+={opt}"))
-                || content.contains(&format!("OPTIONS_FILE_UNSET+={opt}")),
-            "{opt} missing from the options file"
-        );
-    }
-
-    // Defaults come from the tree, and DOCS is on even though OPTIONS_DEFAULT
-    // does not list it — bsd.options.mk turns it on whenever a port defines it
-    assert!(content.contains("OPTIONS_FILE_SET+=DOCS"));
-    assert!(content.contains("OPTIONS_FILE_SET+=INOTIFY"));
-    assert!(content.contains("OPTIONS_FILE_UNSET+=LUA"));
+    assert!(is_on(&graph, "www/nginx", "NJS"));
+    assert!(is_on(&graph, "www/nginx", "STREAM"), "NJS implies STREAM");
+    assert!(
+        is_on(&graph, "www/nginx", "HTTP"),
+        "and STREAM implies HTTP, so it follows through"
+    );
 }
 
-/// An option the tree reports but the regex missed must not be written as UNSET
-/// when it is on by default — that would silently turn it off.
+/// Two options that imply each other must not spin.
 #[test]
-fn test_a_defaulted_option_the_regex_missed_is_not_silently_disabled() {
-    let temp = TempDir::new("described_defaults");
-    let options_dir = temp.path.join("ports");
+fn test_mutually_implying_options_terminate() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    common::add_option(&conn, "www/app", "A", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/app", "B", false, "", "DEFINE", "");
+    common::add_implies(&conn, "www/app", "A", "B");
+    common::add_implies(&conn, "www/app", "B", "A");
 
-    let conn = dep_graph_db(&[], &[]);
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/app2', 'app2', '1.0', '')",
-        [],
-    )
-    .unwrap();
-    cache_details(&conn, "www/app2", "app2-1.0", "ALPHA BETA", "ALPHA");
-
-    let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/app2".to_string()], &sys_opts, false).unwrap();
-
-    exporter::export_options(&graph, &options_dir, false, None).unwrap();
-    let content = fs::read_to_string(options_dir.join("www_app2").join("options")).unwrap();
-
-    assert!(content.contains("OPTIONS_FILE_SET+=ALPHA"));
-    assert!(content.contains("OPTIONS_FILE_UNSET+=BETA"));
-}
-
-/// Descriptions and radio grouping are not in describe-json, so they keep
-/// coming from the Makefile parse and must survive the merge.
-#[test]
-fn test_merge_keeps_descriptions_and_grouping_from_the_index() {
-    let conn = dep_graph_db(&[], &[]);
-    conn.execute(
-        "INSERT INTO ports (origin, name, version, comment) VALUES ('www/app3', 'app3', '1.0', '')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-         VALUES ('www/app3', 'ENGINE_A', 1, 'Engine A', 'SINGLE', 'ENGINE'),
-                ('www/app3', 'ENGINE_B', 0, 'Engine B', 'SINGLE', 'ENGINE')",
-        [],
-    )
-    .unwrap();
-    cache_details(
+    let mut graph = DependencyGraph::load_from_db(
         &conn,
-        "www/app3",
-        "app3-1.0",
-        "ENGINE_A ENGINE_B HIDDEN",
-        "ENGINE_A",
+        &["www/app".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+    graph.expand_all();
+    toggle(&mut graph, "www/app", "A");
+
+    assert!(is_on(&graph, "www/app", "A"));
+    assert!(is_on(&graph, "www/app", "B"));
+}
+
+/// `DEBUG_PREVENTS=STREAM`: turning DEBUG on turns STREAM off.
+#[test]
+fn test_turning_an_option_on_turns_off_what_it_prevents() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    common::add_option(&conn, "www/app", "DEBUG", false, "", "DEFINE", "");
+    common::add_option(&conn, "www/app", "STREAM", true, "", "DEFINE", "");
+    common::add_prevents(&conn, "www/app", "DEBUG", "STREAM");
+
+    let mut graph = DependencyGraph::load_from_db(
+        &conn,
+        &["www/app".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+    graph.expand_all();
+
+    assert!(is_on(&graph, "www/app", "STREAM"));
+    toggle(&mut graph, "www/app", "DEBUG");
+    assert!(is_on(&graph, "www/app", "DEBUG"));
+    assert!(
+        !is_on(&graph, "www/app", "STREAM"),
+        "a prevented option is turned off rather than the press being refused"
+    );
+}
+
+/// An option naming something the port does not define is ignored rather than
+/// treated as an error — ports do it, and there is nothing to set.
+#[test]
+fn test_implying_an_option_the_port_does_not_have_is_harmless() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+    common::add_option(&conn, "www/app", "A", false, "", "DEFINE", "");
+    common::add_implies(&conn, "www/app", "A", "NOT_HERE");
+
+    let mut graph = DependencyGraph::load_from_db(
+        &conn,
+        &["www/app".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+    graph.expand_all();
+    toggle(&mut graph, "www/app", "A");
+    assert!(is_on(&graph, "www/app", "A"));
+}
+
+/// `FOO_LIB_DEPENDS_OFF` pulls a port in when the option is *unset*, so the
+/// reachable set follows the opposite edge. The old parser could not see these
+/// at all.
+#[test]
+fn test_an_off_polarity_dependency_is_pulled_in_when_the_option_is_off() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    common::add_option(&conn, "www/app", "BUNDLED", true, "", "DEFINE", "");
+    common::add_option(&conn, "devel/system-lib", "DOCS", true, "", "DEFINE", "");
+    // With BUNDLED off the port needs the system library instead.
+    common::add_option_dep_with(
+        &conn,
+        "www/app",
+        "BUNDLED",
+        "devel/system-lib",
+        "LIB",
+        "OFF",
     );
 
-    let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/app3".to_string()], &sys_opts, false).unwrap();
+    let mut graph = DependencyGraph::load_from_db(
+        &conn,
+        &["www/app".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+    graph.expand_all();
 
-    let by_name = |name: &str| {
+    assert!(
+        !graph.is_live("devel/system-lib"),
+        "BUNDLED is on, so the system library is not needed"
+    );
+
+    toggle(&mut graph, "www/app", "BUNDLED");
+    assert!(
+        graph.is_live("devel/system-lib"),
+        "turning BUNDLED off is what pulls the system library in"
+    );
+}
+
+// ============================================================================
+// 4f. PORTS MAKE COULD NOT EVALUATE
+//
+// A port whose evaluation failed has no options through no fault of its own.
+// Rendering it exactly like a port that defines none would recreate the silent
+// gap the resolver exists to remove, so it is called out instead.
+// ============================================================================
+
+/// A port that could not be evaluated is distinguishable from one that simply
+/// has no options — on the row, and in the message inside it.
+#[test]
+fn test_an_unevaluated_port_says_so_rather_than_looking_empty() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    // Two ports with nothing in them, for opposite reasons.
+    common::add_port(&conn, "www/genuinely-empty");
+    common::add_unevaluated_port(&conn, "www/unreadable");
+
+    let patterns = vec![
+        "www/genuinely-empty".to_string(),
+        "www/unreadable".to_string(),
+    ];
+    let mut graph =
+        DependencyGraph::load_from_db(&conn, &patterns, &SystemOptions::default(), false).unwrap();
+    graph.expand_all();
+
+    let resolved_of = |graph: &DependencyGraph, origin: &str| {
         graph
-            .option_nodes
+            .visible_rows
             .iter()
-            .find(|o| o.name == name)
-            .unwrap_or_else(|| panic!("{name} missing"))
+            .find_map(|r| match &r.kind {
+                RowKind::Port {
+                    origin: o,
+                    resolved,
+                    ..
+                } if o == origin => Some(*resolved),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{origin} not listed"))
     };
+    assert!(resolved_of(&graph, "www/genuinely-empty"));
+    assert!(!resolved_of(&graph, "www/unreadable"));
 
-    assert_eq!(by_name("ENGINE_A").description, "Engine A");
-    assert_eq!(by_name("ENGINE_A").group_type, "SINGLE");
-    assert_eq!(by_name("ENGINE_A").group_name, "ENGINE");
+    let messages: Vec<String> = graph
+        .visible_rows
+        .iter()
+        .filter_map(|r| match &r.kind {
+            RowKind::Info { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 2);
+    assert!(
+        messages.iter().any(|m| m.contains("No options defined")),
+        "the genuinely empty port keeps its old wording: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("could not evaluate")),
+        "the unreadable one says why it is empty: {messages:?}"
+    );
+}
 
-    // The one only the tree knew about arrives ungrouped and undescribed
-    assert_eq!(by_name("HIDDEN").description, "");
-    assert_eq!(by_name("HIDDEN").group_type, "DEFINE");
-    assert!(!by_name("HIDDEN").enabled);
+/// The warning is driven off the live set, so a port stranded by an option
+/// being off is not reported as a gap in what gets written.
+#[test]
+fn test_only_live_unevaluated_ports_are_reported() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    common::add_option(&conn, "www/app", "EXTRA", true, "", "DEFINE", "");
+    common::add_unevaluated_port(&conn, "devel/broken");
+    common::add_option_dep(&conn, "www/app", "EXTRA", "devel/broken");
+
+    let mut graph = DependencyGraph::load_from_db(
+        &conn,
+        &["www/app".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap();
+    graph.expand_all();
+
+    assert_eq!(graph.unevaluated_ports(), vec!["devel/broken"]);
+
+    // Turning EXTRA off strands devel/broken, which is then not part of the
+    // build and so not something to warn about.
+    let row = graph
+        .visible_rows
+        .iter()
+        .position(|r| matches!(&r.kind, RowKind::Option { name, .. } if name == "EXTRA"))
+        .unwrap();
+    graph.toggle_option(row);
+
+    assert!(graph.unevaluated_ports().is_empty());
 }
 
 // ============================================================================
@@ -2085,27 +2127,8 @@ fn group_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn, true).unwrap();
 
-    for origin in [
-        "lang/php83-extensions",
-        "lang/php84-extensions",
-        "lang/php85-extensions",
-        "www/unrelated",
-    ] {
-        let name = origin.split('/').nth(1).unwrap();
-        conn.execute(
-            "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-            rusqlite::params![origin, name],
-        )
-        .unwrap();
-    }
-
-    let add = |origin: &str, opt: &str, default: i32, gt: &str, gn: &str| {
-        conn.execute(
-            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-             VALUES (?1, ?2, ?3, '', ?4, ?5)",
-            rusqlite::params![origin, opt, default, gt, gn],
-        )
-        .unwrap();
+    let add = |origin: &str, opt: &str, default: bool, gt: &str, gn: &str| {
+        common::add_option(&conn, origin, opt, default, "", gt, gn);
     };
 
     for origin in [
@@ -2113,19 +2136,34 @@ fn group_db() -> Connection {
         "lang/php84-extensions",
         "lang/php85-extensions",
     ] {
-        add(origin, "SOAP", 0, "DEFINE", "");
+        add(origin, "SOAP", false, "DEFINE", "");
     }
     // Only php83 has this one, so the others must be left alone
-    add("lang/php83-extensions", "ONLY_ON_83", 0, "DEFINE", "");
+    add("lang/php83-extensions", "ONLY_ON_83", false, "DEFINE", "");
 
     // A radio group php83 and php84 both have, but php84 has an extra member
     for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
-        add(origin, "MYSQL", 1, "SINGLE", "DB");
-        add(origin, "PGSQL", 0, "SINGLE", "DB");
+        add(origin, "MYSQL", true, "SINGLE", "DB");
+        add(origin, "PGSQL", false, "SINGLE", "DB");
     }
-    add("lang/php84-extensions", "SQLITE", 0, "SINGLE", "DB");
+    add("lang/php84-extensions", "SQLITE", false, "SINGLE", "DB");
 
-    add("www/unrelated", "SOAP", 0, "DEFINE", "");
+    add("www/unrelated", "SOAP", false, "DEFINE", "");
+    conn
+}
+
+fn search_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn, true).unwrap();
+
+    for (origin, opt, desc) in [
+        ("databases/postgresql16-server", "SSL", "Secure sockets"),
+        ("devel/git", "DOCS", "Postgres support"),
+        ("www/nginx", "POSTGRES", "Database backend"),
+    ] {
+        common::add_option(&conn, origin, opt, true, desc, "DEFINE", "");
+    }
+    common::add_port_dep(&conn, "www/nginx", "databases/postgresql16-server");
     conn
 }
 
@@ -2371,42 +2409,6 @@ fn test_without_groups_a_toggle_touches_only_its_own_port() {
     for origin in ["lang/php84-extensions", "lang/php85-extensions"] {
         assert_eq!(enabled_of(&graph, origin, "SOAP"), Some(false), "{origin}");
     }
-}
-
-// ============================================================================
-// 11. SEARCH (narrows which ports are listed, on their origin)
-// ============================================================================
-
-/// Three ports where the word "postgres" appears in a *different* place for
-/// each: one origin, one option description, one option name.
-fn search_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-
-    for (origin, opt, desc) in [
-        ("databases/postgresql16-server", "SSL", "Secure sockets"),
-        ("devel/git", "DOCS", "Postgres support"),
-        ("www/nginx", "POSTGRES", "Database backend"),
-    ] {
-        conn.execute(
-            "INSERT INTO ports (origin, name, version, comment) VALUES (?1, ?2, '1.0', '')",
-            rusqlite::params![origin, origin.split('/').nth(1).unwrap()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO options (port_origin, option_name, default_state, description, group_type, group_name)
-             VALUES (?1, ?2, 1, ?3, 'DEFINE', '')",
-            rusqlite::params![origin, opt, desc],
-        )
-        .unwrap();
-    }
-    conn.execute(
-        "INSERT INTO port_deps (port_origin, dep_origin, dep_type)
-         VALUES ('www/nginx', 'databases/postgresql16-server', 'LIB')",
-        [],
-    )
-    .unwrap();
-    conn
 }
 
 fn searched(graph: &mut DependencyGraph, query: &str) -> Vec<String> {

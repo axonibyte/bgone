@@ -1,9 +1,10 @@
 pub mod cli;
 pub mod config;
 pub mod db;
-pub mod describe;
 pub mod exporter;
 pub mod graph;
 pub mod indexer;
+pub mod poudriere;
 pub mod reader;
+pub mod resolve;
 pub mod ui;

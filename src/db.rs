@@ -1,7 +1,15 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+/// Bumped whenever an existing cache would be *wrong* or *incomplete*, not only
+/// when the table layout changes.
+///
+/// 8 replaces the tables the regex sweep filled. Dependency targets are no
+/// longer strings that might name a port — they are foreign keys to one, so a
+/// dangling edge is unrepresentable rather than pruned afterwards. Options carry
+/// their real grouping and implications, and anything that could not be resolved
+/// is recorded in `unresolved_dep` instead of being dropped.
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 /// Initializes the SQLite database schema.
 /// Drops outdated tables if the schema version on disk is incompatible
@@ -22,13 +30,20 @@ pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
             );
         }
 
+        // Dropped children-first: the edge tables hold the foreign keys.
         conn.execute_batch(
             "
             DROP TABLE IF EXISTS port_files;
             DROP TABLE IF EXISTS port_conflicts;
             DROP TABLE IF EXISTS port_details;
+            DROP TABLE IF EXISTS port_mtime;
+            DROP TABLE IF EXISTS unresolved_dep;
+            DROP TABLE IF EXISTS dep_edge;
+            DROP TABLE IF EXISTS option_implies;
+            DROP TABLE IF EXISTS option_prevents;
             DROP TABLE IF EXISTS port_deps;
             DROP TABLE IF EXISTS option_deps;
+            DROP TABLE IF EXISTS port_flavour;
             DROP TABLE IF EXISTS options;
             DROP TABLE IF EXISTS ports;
             DROP TABLE IF EXISTS meta;
@@ -43,73 +58,107 @@ pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
         PRAGMA busy_timeout = 5000;
         PRAGMA foreign_keys = ON;
 
+        -- `id` exists so edges can reference a port rather than name one.
+        -- `resolved` distinguishes a port make could evaluate from one that only
+        -- exists as a directory; an edge may point at either, and the difference
+        -- is what tells a missing dependency from an unbuildable one.
         CREATE TABLE IF NOT EXISTS ports (
-            origin TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            version TEXT NOT NULL,
-            comment TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin TEXT NOT NULL UNIQUE,
+            pkgbase TEXT NOT NULL DEFAULT '',
+            pkgname TEXT NOT NULL DEFAULT '',
+            resolved INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- A flavoured port builds several packages from one directory, each with
+        -- its own PKGNAME. Dependencies name them with an `@flavour` suffix.
+        --
+        -- Flavours are recorded but do not become separate nodes, because
+        -- options are not per-flavour: `bsd.options.mk:182` keys the options
+        -- file on `OPTIONS_NAME`, which defaults to PKGORIGIN with the slash
+        -- turned into an underscore — so py-setuptools@py311 and @py312 both
+        -- read and write
+        -- `devel_py-setuptools/options`. Configuring per flavour would write a
+        -- file the framework never reads.
+        CREATE TABLE IF NOT EXISTS port_flavour (
+            port_id INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+            flavour TEXT NOT NULL,
+            pkgname TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (port_id, flavour)
         );
 
         CREATE TABLE IF NOT EXISTS options (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            port_origin TEXT NOT NULL,
-            option_name TEXT NOT NULL,
-            default_state INTEGER NOT NULL,
-            description TEXT,
-            group_type TEXT DEFAULT 'DEFINE',
-            group_name TEXT DEFAULT '',
-            FOREIGN KEY(port_origin) REFERENCES ports(origin) ON DELETE CASCADE,
-            UNIQUE(port_origin, option_name)
+            port_id INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            group_type TEXT NOT NULL DEFAULT 'DEFINE',
+            group_name TEXT NOT NULL DEFAULT '',
+            default_on INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(port_id, name)
         );
 
-        CREATE TABLE IF NOT EXISTS option_deps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            port_origin TEXT NOT NULL,
-            option_name TEXT NOT NULL,
-            dep_origin TEXT NOT NULL,
-            dep_type TEXT NOT NULL,
-            FOREIGN KEY(port_origin) REFERENCES ports(origin) ON DELETE CASCADE
+        -- FOO_IMPLIES / FOO_PREVENTS. Stored by name rather than by option id
+        -- because a port may name an option it does not itself define.
+        CREATE TABLE IF NOT EXISTS option_implies (
+            option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
+            implies_name TEXT NOT NULL,
+            PRIMARY KEY (option_id, implies_name)
         );
 
-        -- Dependencies a port pulls in regardless of which options are set,
-        -- i.e. the plain {PKG,EXTRACT,PATCH,FETCH,BUILD,LIB,RUN,TEST}_DEPENDS
-        -- that make up _UNIFIED_DEPENDS. `poudriere options` recurses over
-        -- these as well as the option-conditional ones in option_deps.
-        CREATE TABLE IF NOT EXISTS port_deps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            port_origin TEXT NOT NULL,
-            dep_origin TEXT NOT NULL,
-            dep_type TEXT NOT NULL,
-            FOREIGN KEY(port_origin) REFERENCES ports(origin) ON DELETE CASCADE,
-            UNIQUE(port_origin, dep_origin)
+        CREATE TABLE IF NOT EXISTS option_prevents (
+            option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
+            prevents_name TEXT NOT NULL,
+            PRIMARY KEY (option_id, prevents_name)
         );
 
-        -- What the ports tree itself reports for a port, via `make describe-json`.
-        -- The regex sweep cannot see options a port inherits from a MASTERDIR
-        -- slave relationship or from Mk/Uses machinery, nor can it reconstruct
-        -- PKGNAME, so these are read from the tree for the ports being
-        -- configured and cached until their Makefiles change.
-        CREATE TABLE IF NOT EXISTS port_details (
-            port_origin TEXT PRIMARY KEY,
-            pkgbase TEXT NOT NULL,
-            pkgname TEXT NOT NULL,
-            complete_options_list TEXT NOT NULL,
-            options_default TEXT NOT NULL,
+        -- One row per resolved dependency.
+        --
+        -- `to_port_id` is a foreign key, so an edge pointing at nothing cannot
+        -- be stored at all. That is the whole point of the table: the previous
+        -- schema held target *strings*, wrote whatever a regex produced, and
+        -- deleted the ones that named no port afterwards.
+        --
+        -- `polarity` carries the `_OFF` forms, which apply when the option is
+        -- unset and were invisible to the old sweep.
+        CREATE TABLE IF NOT EXISTS dep_edge (
+            from_port_id  INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+            to_port_id    INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+            to_flavour    TEXT,
+            class         TEXT NOT NULL,
+            via_option_id INTEGER REFERENCES options(id) ON DELETE CASCADE,
+            polarity      TEXT NOT NULL DEFAULT 'ON'
+        );
+
+        -- Depends entries that named nothing this cache can point at, kept so
+        -- that `SELECT COUNT(*) FROM unresolved_dep` answers 'did anything fail
+        -- to resolve' instead of it being a claim.
+        CREATE TABLE IF NOT EXISTS unresolved_dep (
+            port_origin TEXT NOT NULL,
+            raw_entry   TEXT NOT NULL,
+            reason      TEXT NOT NULL
+        );
+
+        -- When each port's Makefiles were last seen, so re-indexing after a
+        -- tree update re-evaluates only what changed. Keyed by origin rather
+        -- than port id so a row survives the port table being rebuilt.
+        CREATE TABLE IF NOT EXISTS port_mtime (
+            origin TEXT PRIMARY KEY,
             source_mtime INTEGER NOT NULL
         );
 
         -- Small key/value store. Holds the ports tree path used at index time so
-        -- later runs can find the tree again without being told twice.
+        -- later runs can find the tree again without being told twice, and the
+        -- ARCH/OSVERSION the cache was resolved as.
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
 
-
-
-        CREATE INDEX IF NOT EXISTS idx_options_port ON options(port_origin);
-        CREATE INDEX IF NOT EXISTS idx_deps_port_opt ON option_deps(port_origin, option_name);
-        CREATE INDEX IF NOT EXISTS idx_port_deps_port ON port_deps(port_origin);
+        CREATE INDEX IF NOT EXISTS idx_options_port ON options(port_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_from ON dep_edge(from_port_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_via ON dep_edge(via_option_id);
+        CREATE INDEX IF NOT EXISTS idx_flavour_port ON port_flavour(port_id);
         ",
     )?;
 

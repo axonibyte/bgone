@@ -1,5 +1,6 @@
 use crate::config::Config;
-use anyhow::Result;
+use crate::poudriere::Poudriere;
+use anyhow::{bail, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::fs;
@@ -131,15 +132,6 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Skip asking the ports tree about the targeted ports.
-    ///
-    /// That pass exists to catch the roughly 1% of ports whose options the
-    /// Makefile sweep cannot see, which are the ones poudriere would keep
-    /// prompting for. Skipping it avoids a one-time cost on a cold cache and
-    /// costs nothing else beyond exact package names in the written headers.
-    #[arg(long)]
-    pub no_describe: bool,
-
     /// Discard previous database cache and rebuild schema
     #[arg(short = 'r', long)]
     pub force_reset: bool,
@@ -152,6 +144,38 @@ pub struct Cli {
     #[arg(short = 'f', long, value_name = "FILE")]
     pub file: Option<PathBuf>,
 
+    /// poudriere's configuration root, holding `poudriere.d`.
+    ///
+    /// Only consulted when one of the other --poudriere-* arguments is given.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "/usr/local/etc",
+        global = true
+    )]
+    pub poudriere_etc: PathBuf,
+
+    /// Take the architecture and OS version from this poudriere jail.
+    ///
+    /// Saves transcribing --jail-arch, --osversion and --osrel, and cannot
+    /// disagree with the jail the way a hand-copied value can.
+    #[arg(long, value_name = "JAIL", global = true)]
+    pub poudriere_jail: Option<String>,
+
+    /// Take the ports tree path from this poudriere ports tree, and name the
+    /// options directory after it.
+    #[arg(long, value_name = "TREE", global = true)]
+    pub poudriere_ports: Option<String>,
+
+    /// The poudriere set, if you use one. Only affects the options directory.
+    #[arg(long, value_name = "SET", global = true)]
+    pub poudriere_set: Option<String>,
+
+    /// Name the options directory outright rather than composing it from the
+    /// jail, tree and set — the same escape hatch as `poudriere options -o`.
+    #[arg(long, value_name = "NAME", global = true)]
+    pub poudriere_optionsdir: Option<String>,
+
     /// Target port origin(s) or glob pattern(s) (e.g. www/apache24 "www/py-*")
     #[arg(value_name = "ORIGIN")]
     pub origins: Vec<String>,
@@ -159,7 +183,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Index a local FreeBSD ports tree directory into SQLite
+    /// Evaluate a local FreeBSD ports tree into SQLite.
+    ///
+    /// Every port is evaluated by make, which is what makes the result exact:
+    /// `.if`, `.for`, MASTERDIR, `.include` and Mk/Uses all resolve because the
+    /// ports framework resolves them. It is the slow part of using bgone, and
+    /// the only part that needs a ports tree — configuring afterwards reads
+    /// nothing but the cache.
     Index {
         /// Path to the ports tree root
         #[arg(short, long, default_value = "/usr/ports")]
@@ -168,6 +198,26 @@ pub enum Commands {
         /// Discard previous database cache before indexing
         #[arg(short, long)]
         force: bool,
+
+        /// Resolve as this architecture rather than the host's.
+        ///
+        /// Which options a port defines can depend on it — `OPTIONS_DEFINE_${ARCH}`,
+        /// `OPTIONS_EXCLUDE_${OPSYS}` — so a cache built on amd64 does not
+        /// necessarily describe an aarch64 jail.
+        #[arg(long, value_name = "ARCH")]
+        jail_arch: Option<String>,
+
+        /// Resolve as this OSVERSION (e.g. 1404000 for FreeBSD 14.4)
+        #[arg(long, value_name = "N")]
+        osversion: Option<String>,
+
+        /// Resolve as this OPSYS (default: the host's)
+        #[arg(long, value_name = "NAME")]
+        opsys: Option<String>,
+
+        /// Resolve as this OSREL (e.g. 14.4)
+        #[arg(long, value_name = "VERSION")]
+        osrel: Option<String>,
     },
 }
 
@@ -187,9 +237,7 @@ pub fn parse_with_config() -> Result<(Cli, Option<Config>)> {
         None => None,
     };
 
-    if let Some(config) = &config {
-        cli.apply_config(&matches, config);
-    }
+    cli.resolve(&matches, config.as_ref())?;
 
     Ok((cli, config))
 }
@@ -206,9 +254,7 @@ where
 {
     let matches = Cli::command().try_get_matches_from(args)?;
     let mut cli = Cli::from_arg_matches(&matches)?;
-    if let Some(config) = config {
-        cli.apply_config(&matches, config);
-    }
+    cli.resolve(&matches, config)?;
     Ok(cli)
 }
 
@@ -221,8 +267,208 @@ fn was_passed(matches: &ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
+/// What a poudriere spec resolves to, once the attribute store has been read.
+///
+/// Every field is optional because a spec need not name everything: a jail
+/// alone yields the resolution target, a tree alone yields a ports directory
+/// and an options directory.
+#[derive(Debug, Default, Clone)]
+struct Derived {
+    jail_arch: Option<String>,
+    osversion: Option<String>,
+    osrel: Option<String>,
+    ports_dir: Option<PathBuf>,
+    options_dir: Option<PathBuf>,
+}
+
+/// Reads one tier's poudriere spec.
+///
+/// `None` when the tier names nothing, which is the common case — most runs
+/// mention poudriere at neither tier and this never touches the filesystem.
+fn derive(
+    etc: &Path,
+    jail: Option<&str>,
+    tree: Option<&str>,
+    set: Option<&str>,
+    optionsdir: Option<&str>,
+) -> Result<Option<Derived>> {
+    if jail.is_none() && tree.is_none() && set.is_none() && optionsdir.is_none() {
+        return Ok(None);
+    }
+
+    let poudriere = Poudriere::new(etc);
+    if !poudriere.is_available() {
+        bail!(
+            "--poudriere-* was given but {} does not exist. \
+             Drop the argument to configure without poudriere.",
+            poudriere.root().display()
+        );
+    }
+
+    let mut derived = Derived::default();
+
+    if let Some(jail) = jail {
+        // A named jail that is not there is an error, not a fallback: you asked
+        // for something specific.
+        let facts = poudriere.jail(jail)?;
+        derived.jail_arch = Some(facts.arch);
+        derived.osrel = Some(facts.osrel);
+        derived.osversion = Some(facts.osversion);
+    }
+
+    if let Some(tree) = tree {
+        derived.ports_dir = Some(poudriere.ports_dir(tree)?);
+    }
+
+    derived.options_dir = Some(match optionsdir {
+        Some(name) => poudriere.named_options_dir(name),
+        None => poudriere.options_dir(jail, tree, set),
+    });
+
+    Ok(Some(derived))
+}
+
+/// The first tier that says anything.
+///
+/// Precedence is expressed by ordering candidates rather than by overwriting in
+/// sequence. Overwriting cannot express four tiers here: `was_passed` only
+/// distinguishes "typed on the command line" from everything else, so once a
+/// derived value has been written there is nothing left to stop the config tier
+/// replacing it.
+fn first_set<T>(candidates: [Option<T>; 4]) -> Option<T> {
+    candidates.into_iter().flatten().next()
+}
+
 impl Cli {
+    /// Resolves every setting against all five tiers, in order:
+    ///
+    /// 1. arguments typed on the command line
+    /// 2. values derived from a `--poudriere-*` spec given on the command line
+    /// 3. settings written explicitly in the config file
+    /// 4. values derived from a poudriere spec in the config file
+    /// 5. clap's own defaults, already in place
+    ///
+    /// Outer key is command-line-beats-config; inner key is
+    /// explicit-beats-derived. So a `--poudriere-jail` typed at the prompt does
+    /// override a `jail_arch` written in the config — naming a jail on the
+    /// command line is a deliberate act, and command-line-beats-config is the
+    /// rule that stays predictable when the two interleave.
+    fn resolve(&mut self, matches: &ArgMatches, config: Option<&Config>) -> Result<()> {
+        let cli_spec = derive(
+            &self.poudriere_etc,
+            self.poudriere_jail.as_deref(),
+            self.poudriere_ports.as_deref(),
+            self.poudriere_set.as_deref(),
+            self.poudriere_optionsdir.as_deref(),
+        )?;
+
+        let cfg_spec = match config {
+            Some(config) => {
+                let etc = config
+                    .poudriere_etc
+                    .clone()
+                    .unwrap_or_else(|| self.poudriere_etc.clone());
+                derive(
+                    &etc,
+                    config.poudriere_jail.as_deref(),
+                    config.poudriere_ports.as_deref(),
+                    config.poudriere_set.as_deref(),
+                    config.poudriere_optionsdir.as_deref(),
+                )?
+            }
+            None => None,
+        };
+
+        // Tier 1 is "was it typed", which for a top-level argument is answered
+        // by the top-level matches and for a subcommand argument by the
+        // subcommand's own — the top-level matches has no id for those at all.
+        let sub = matches.subcommand_matches("index");
+
+        macro_rules! tiers {
+            ($id:literal, $sub:expr, $derived:ident, $cfg:expr, $current:expr) => {{
+                let typed = if $sub {
+                    sub.map(|m| was_passed(m, $id)).unwrap_or(false)
+                } else {
+                    was_passed(matches, $id)
+                };
+                first_set([
+                    if typed { Some($current) } else { None },
+                    cli_spec.as_ref().and_then(|d| d.$derived.clone()),
+                    $cfg,
+                    cfg_spec.as_ref().and_then(|d| d.$derived.clone()),
+                ])
+            }};
+        }
+
+        // Top-level: the options directory.
+        let options_dir = tiers!(
+            "options_dir",
+            false,
+            options_dir,
+            config.and_then(|c| c.options_dir.clone()),
+            self.options_dir.clone()
+        );
+        if let Some(value) = options_dir {
+            self.options_dir = value;
+        }
+
+        // Subcommand: everything `index` resolves the tree with.
+        if let Some(Commands::Index {
+            ports_dir,
+            jail_arch,
+            osversion,
+            osrel,
+            opsys,
+            ..
+        }) = self.command.as_mut()
+        {
+            if let Some(value) = tiers!(
+                "ports_dir",
+                true,
+                ports_dir,
+                config.and_then(|c| c.ports_dir.clone()),
+                ports_dir.clone()
+            ) {
+                *ports_dir = value;
+            }
+
+            macro_rules! opt_tiers {
+                ($field:ident, $id:literal, $derived:ident) => {
+                    if let Some(value) = first_set([
+                        sub.filter(|m| was_passed(m, $id))
+                            .and_then(|_| $field.clone()),
+                        cli_spec.as_ref().and_then(|d| d.$derived.clone()),
+                        config.and_then(|c| c.$field.clone()),
+                        cfg_spec.as_ref().and_then(|d| d.$derived.clone()),
+                    ]) {
+                        *$field = Some(value);
+                    }
+                };
+            }
+
+            opt_tiers!(jail_arch, "jail_arch", jail_arch);
+            opt_tiers!(osversion, "osversion", osversion);
+            opt_tiers!(osrel, "osrel", osrel);
+
+            // OPSYS is never derived: every poudriere jail is FreeBSD, so there
+            // is nothing a spec could tell us that the default does not.
+            if !sub.map(|m| was_passed(m, "opsys")).unwrap_or(false) {
+                if let Some(value) = config.and_then(|c| c.opsys.clone()) {
+                    *opsys = Some(value);
+                }
+            }
+        }
+
+        if let Some(config) = config {
+            self.apply_config(matches, config);
+        }
+        Ok(())
+    }
+
     /// Applies `config` to every argument the command line did not set.
+    ///
+    /// Only the settings poudriere never derives reach here; the rest are
+    /// resolved by [`Cli::resolve`] before this runs, and are not touched again.
     fn apply_config(&mut self, matches: &ArgMatches, config: &Config) {
         // Each argument resolves on its own, so a config supplying `file` and a
         // command line supplying origins leaves both in play — `collect_targets`
@@ -245,25 +491,12 @@ impl Cli {
         }
 
         fill!(db_path, "db_path");
-        fill!(options_dir, "options_dir");
         fill!(opt make_conf, "make_conf");
         fill!(opt file, "file");
         fill!(origins, "origins");
         fill!(dry_run, "dry_run");
-        fill!(no_describe, "no_describe");
         fill!(force_reset, "force_reset");
         fill!(ignore_missing, "ignore_missing");
-
-        // `ports_dir` belongs to the subcommand, so its source lives there too
-        if let (Some(Commands::Index { ports_dir, .. }), Some(sub)) =
-            (self.command.as_mut(), matches.subcommand_matches("index"))
-        {
-            if !was_passed(sub, "ports_dir") {
-                if let Some(value) = config.ports_dir.clone() {
-                    *ports_dir = value;
-                }
-            }
-        }
     }
 
     /// Collects every requested target, merging positional origins with the

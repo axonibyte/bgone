@@ -35,11 +35,30 @@ pub struct Config {
     pub file: Option<PathBuf>,
     pub origins: Option<Vec<String>>,
     pub dry_run: Option<bool>,
-    pub no_describe: Option<bool>,
     pub force_reset: Option<bool>,
     pub ignore_missing: Option<bool>,
     /// Belongs to the `index` subcommand rather than the top level.
     pub ports_dir: Option<PathBuf>,
+
+    /// Resolution target. These had no config representation until the
+    /// poudriere layer needed a tier to sit above: a value derived from a
+    /// poudriere spec in the config has to lose to one written here explicitly,
+    /// and it cannot lose to something that does not exist.
+    pub jail_arch: Option<String>,
+    pub osversion: Option<String>,
+    pub opsys: Option<String>,
+    pub osrel: Option<String>,
+
+    /// Name a poudriere jail, ports tree and set instead of the four settings
+    /// above and the two paths. Anything written explicitly wins over what
+    /// these derive.
+    pub poudriere_etc: Option<PathBuf>,
+    pub poudriere_jail: Option<String>,
+    pub poudriere_ports: Option<String>,
+    pub poudriere_set: Option<String>,
+    /// Mirrors `poudriere options -o`: name the options directory outright
+    /// rather than composing it from jail/tree/set.
+    pub poudriere_optionsdir: Option<String>,
     #[serde(default)]
     pub groups: Groups,
 }

@@ -1,55 +1,13 @@
 // The modules live in the library crate; the binary is a thin front end over
 // it. Declaring them here as well would compile everything twice and report
 // anything only the tests use as dead code.
-use bgone::{cli, db, describe, exporter, graph, indexer, reader, ui};
+use bgone::{cli, db, exporter, graph, indexer, reader, resolve, ui};
 
 use anyhow::Result;
 use clap::CommandFactory;
 use cli::{Cli, Commands};
 use rusqlite::Connection;
-use std::path::PathBuf;
 use std::time::Instant;
-
-/// Asks the ports tree about the ports being configured, so their option lists
-/// and package names come from the tree rather than from a regex.
-///
-/// Best effort: without a readable tree bgone still works, it just keeps the
-/// indexed approximation, which can leave `poudriere` prompting for ports whose
-/// options the Makefile parse could not see.
-fn describe_working_set(conn: &mut Connection, dep_graph: &graph::DependencyGraph) {
-    let ports_dir = match db::get_meta(conn, "ports_dir").map(PathBuf::from) {
-        Some(dir) if dir.is_dir() => dir,
-        Some(dir) => {
-            eprintln!(
-                "[!] Ports tree {:?} is gone; using indexed data only. Re-run 'bgone index'.",
-                dir
-            );
-            return;
-        }
-        None => {
-            eprintln!("[!] No ports tree recorded; using indexed data only. Re-run 'bgone index'.");
-            return;
-        }
-    };
-
-    let origins: Vec<String> = dep_graph.ports.iter().map(|p| p.origin.clone()).collect();
-    println!(
-        "[*] Reading details for {} ports from the tree...",
-        origins.len()
-    );
-    let start = Instant::now();
-
-    match describe::describe_ports(conn, &ports_dir, &origins) {
-        Ok(stats) => println!(
-            "[+] {} read, {} already current, {} unavailable in {:.2?}",
-            stats.described,
-            stats.cached,
-            stats.failed,
-            start.elapsed()
-        ),
-        Err(e) => eprintln!("[!] Could not read port details: {e}"),
-    }
-}
 
 fn main() -> Result<()> {
     let (cli, config) = cli::parse_with_config()?;
@@ -60,26 +18,63 @@ fn main() -> Result<()> {
     db::init_db(&conn, force_reset)?;
 
     match &cli.command {
-        Some(Commands::Index { ports_dir, .. }) => {
-            println!("[*] Indexing ports tree at {:?}...", ports_dir);
-            let start = Instant::now();
-
-            let stats = indexer::index_ports_dir(&mut conn, ports_dir)?;
-
-            // Remembered so later runs can find the tree again to read port
-            // details from, without having to be told where it is twice
-            if let Ok(canonical) = ports_dir.canonicalize() {
-                db::set_meta(&conn, "ports_dir", &canonical.to_string_lossy())?;
-            }
+        Some(Commands::Index {
+            ports_dir,
+            jail_arch,
+            osversion,
+            opsys,
+            osrel,
+            ..
+        }) => {
+            let canonical = ports_dir
+                .canonicalize()
+                .unwrap_or_else(|_| ports_dir.clone());
+            let mut env = resolve::MakeEnv::new(&canonical);
+            env.arch = jail_arch.clone();
+            env.osversion = osversion.clone();
+            env.opsys = opsys.clone();
+            env.osrel = osrel.clone();
+            env.via_jail = cli.poudriere_jail.clone();
 
             println!(
-                "[+] Indexed {} ports, {} options, {} option dependencies, and {} unconditional dependencies in {:.2?}",
+                "[*] Indexing ports tree at {:?} as {}...",
+                canonical,
+                env.describe_target()
+            );
+            println!("[*] Every port is evaluated by make; this is the slow part.");
+            let start = Instant::now();
+
+            let stats = indexer::index_ports_dir(&mut conn, &env)?;
+
+            println!(
+                "[+] Indexed {} ports ({} unchanged), {} options and {} dependency edges in {:.2?}",
                 stats.ports_indexed,
+                stats.cached,
                 stats.options_indexed,
-                stats.option_deps_indexed,
-                stats.port_deps_indexed,
+                stats.edges_indexed,
                 start.elapsed()
             );
+            if stats.failed > 0 {
+                // Only the first few print their make error, because a tree
+                // make cannot read at all fails identically for every port in
+                // it. Once failures are per-port they are worth looking at
+                // individually, so say where the rest are rather than leaving
+                // them as a count.
+                println!(
+                    "[!] {} ports could not be evaluated; they will be retried on the next index.",
+                    stats.failed
+                );
+                println!(
+                    "[!]   sqlite3 {} \"SELECT port_origin FROM unresolved_dep WHERE reason='EVAL_FAILED'\"",
+                    cli.db_path.display()
+                );
+            }
+            if stats.unresolved > 0 {
+                println!(
+                    "[!] {} dependency entries resolved to nothing; see the unresolved_dep table",
+                    stats.unresolved
+                );
+            }
         }
         None => {
             let targets = match cli.collect_targets() {
@@ -94,6 +89,15 @@ fn main() -> Result<()> {
             };
 
             if !targets.is_empty() {
+                // Which options a port defines can vary with ARCH and OSVERSION,
+                // so a cache is only right for the target it was resolved as.
+                // Said every run rather than only on a mismatch, because bgone
+                // cannot know which jail you are about to build for — only you
+                // can spot that "host" is the wrong answer.
+                match db::get_meta(&conn, "resolved_as").as_deref() {
+                    Some(target) => println!("[*] Cache resolved as: {target}"),
+                    None => println!("[*] Cache resolved as: unknown (indexed by an older bgone)"),
+                }
                 println!("[*] Loading existing system options...");
                 let sys_opts =
                     reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
@@ -111,15 +115,32 @@ fn main() -> Result<()> {
                     }
                 };
 
-                // Loaded once from the indexed data to find out which ports are
-                // in play, then again once the tree has been asked about them.
-                // Reading details cannot change which ports are reachable, only
-                // what is known about them, so the second load sees the same set.
+                // One load. The cache already holds what the tree says, because
+                // `bgone index` evaluated every port with make; nothing here
+                // needs to go back to the ports tree, or even have one.
                 let mut dep_graph = load(&conn);
-                if !cli.no_describe {
-                    describe_working_set(&mut conn, &dep_graph);
-                    dep_graph = load(&conn);
+                // A port make could not read contributes no options, so nothing
+                // is written for it and poudriere will still prompt. Said once,
+                // up front, rather than left to be noticed as an empty port.
+                let unevaluated = dep_graph.unevaluated_ports();
+                if !unevaluated.is_empty() {
+                    eprintln!(
+                        "[!] {} port(s) could not be evaluated when the cache was built, so their \
+                         options are unknown: {}{}",
+                        unevaluated.len(),
+                        unevaluated
+                            .iter()
+                            .take(3)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if unevaluated.len() > 3 { ", ..." } else { "" }
+                    );
+                    eprintln!(
+                        "[!] Re-run 'bgone index' with a readable ports tree to fill them in."
+                    );
                 }
+
                 if let Some(config) = &config {
                     dep_graph.groups = config.groups.clone();
                 }
