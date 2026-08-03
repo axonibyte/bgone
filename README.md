@@ -2,7 +2,7 @@
 
 **A reactive TUI ports configurator for FreeBSD.**
 
-`bgone` modernizes the traditional `make config` workflow. It indexes FreeBSD port Makefiles into a local SQLite database and presents every port in a build — targets and dependencies alike — as one flat, alphabetised list you can navigate and configure in a single pass.
+`bgone` modernizes the traditional `make config` workflow. It evaluates FreeBSD ports with `make` — the same computation `poudriere` does — and presents every port in a build, targets and dependencies alike, as one flat, alphabetised list you can navigate and configure in a single pass.
 
 ---
 
@@ -14,7 +14,7 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * It is difficult to see how enabling an option on a parent port triggers options and dependencies several levels down.
 * Reviewing or changing previously saved options usually means stepping back through recursive menus.
 
-`bgone` indexes your ports tree into a local SQLite database and presents the whole build as one alphabetised list: every port appears exactly once, whether you asked for it or something else dragged it in. Relationships are shown as references you jump between rather than as nesting, so a dependency shared by five ports is one entry with one set of options, not five copies to keep in step. Toggle options, follow dependencies in either direction, and save to `/var/db/ports/` before starting a build.
+`bgone` asks your ports tree, with `make`, what each port is and what it needs, and presents the whole build as one alphabetised list: every port appears exactly once, whether you asked for it or something else dragged it in. Relationships are shown as references you jump between rather than as nesting, so a dependency shared by five ports is one entry with one set of options, not five copies to keep in step. Toggle options, follow dependencies in either direction, and save to `/var/db/ports/` before starting a build.
 
 ---
 
@@ -26,15 +26,17 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 * **Live Reachability**: Turn an option off and the port it pulled in leaves the list, along with anything only that port needed. Its selections stay in memory, so turning the option back on restores them rather than resetting. Ports outside the list are not written.
 * **Complete Dependency Coverage**: Walks the same edges `poudriere options` does — both the option-conditional dependencies (`OPT_LIB_DEPENDS`) and the unconditional ones (`_UNIFIED_DEPENDS`: `PKG`, `EXTRACT`, `PATCH`, `FETCH`, `BUILD`, `LIB`, `RUN` and `TEST`). The walk follows chains to their end rather than stopping at a fixed depth; it terminates by reaching a port already on the list, which a finite ports tree guarantees.
 * **Multiple Targets & Globs**: Configure several ports in one session by listing origins, passing shell-style patterns (`"www/py-*"`), or reading a list from a file (`-f`).
-* **Option Groups & Radios**: Supports standard checkboxes (`[X]`), mutual-exclusion radio groups (`(*)`), and group categories (`<CATEGORY>`).
-* **Multi-Core Parallel Indexing**: Uses `rayon` to parse Makefile dependencies concurrently across CPU cores into a local SQLite cache (`bgone_cache.db`).
+* **Option Groups & Radios**: Supports standard checkboxes (`[X]`), mutual-exclusion radio groups (`(*)`), and group categories (`<CATEGORY>`), listed together rather than scattered through the port's options by name. `OPTIONS_SINGLE` keeps exactly one member set; `OPTIONS_RADIO`, the optional form, also clears.
+* **No Index to Build**: Ports are evaluated when they are needed, in parallel across cores, and the reply is memoised against the exact question — port, target, Makefile age, option set. The first run over a build set costs seconds to a minute; every run after it is instant. `bgone index` exists only to pay that cost up front.
 * **System Option Preloading**: Reads existing configuration files from `/var/db/ports/<category>_<port>/options` and `/etc/make.conf` on startup so previously saved preferences are preserved.
-* **Resolved, not guessed**: every port is evaluated by `make` at index time, so `.if`, `.for`, `MASTERDIR`, `.include` and `Mk/Uses` injection all resolve — because the ports framework resolves them. Dependency targets are foreign keys to real ports, and anything that cannot be resolved is recorded rather than dropped.
+* **Resolved, not guessed**: every port is evaluated by `make`, so `.if`, `.for`, `MASTERDIR`, `.include` and `Mk/Uses` injection all resolve — because the ports framework resolves them. Anything that cannot be resolved is reported rather than dropped.
+* **Asked Again When It Matters**: a dependency added by `${opt}_USES` or an `.if ${PORT_OPTIONS:MFOO}` block does not exist until the option is set, so no single evaluation can find it. Turning an option on re-evaluates that port with exactly the options you chose, off the event loop, and anything new it names joins the list — configurable in the same session. This is what makes the set `bgone` writes equal the set `poudriere` computes.
 * **Option semantics**: `FOO_IMPLIES` and `FOO_PREVENTS` are enforced as you toggle, the way `bsddialog` does, so you cannot save a combination the framework would override.
 * **`make config` File Format**: Writes the same `OPTIONS_FILE_SET+=` / `OPTIONS_FILE_UNSET+=` files `make config` and `poudriere options` write, listing every option the port defines — which is what stops `make config-conditional` (and so `poudriere options` and `poudriere bulk`) from re-opening the dialog. Files in the older `WITH_`/`WITHOUT_` format are still read back.
 * **In-TUI Search (`/`)**: Narrows the list to ports whose origin contains what you type — `postgres`, `databases/`, `py-`. Options are not searched, and a matching port is shown whole rather than reduced to the rows that matched. `Up`/`Down` (and `PgUp`/`PgDn`) move through the results while the bar is still open, so you can look before committing; `Enter` keeps the filter and the header reports it, `Esc` clears it. Filtering is a view: a hidden port keeps its options and is still written on save.
 * **Sticky State Engine**: Expanding (`=`/`+`) or collapsing (`-`/`_`) nodes, sections, or the whole list preserves view preferences across state updates.
-* **Familiar Controls**: Follows `bsddialog(1)` conventions—an `OK` / `Cancel` button row, `Space` to toggle, `Tab` to move focus, `Esc` to cancel—with a confirmation prompt guarding unsaved changes.
+* **Familiar Controls**: Follows `bsddialog(1)` conventions—an `OK` / `Cancel` button row, `Space` to toggle, `Tab` to move focus, `Esc` to cancel. Leaving always confirms, offering `Save and exit` / `Discard` / `Cancel`; `Ctrl + S` writes the files out without leaving.
+* **Hide What Has No Choice (`Shift + H`)**: Most of a build set is leaf libraries defining no options at all. Hiding them leaves only the ports there is a decision to make about. A port `make` could not read is never hidden—its options are unknown rather than absent.
 * **Dry-Run Output**: Preview the exact files and flags that would be written before making changes on disk.
 
 ---
@@ -75,28 +77,32 @@ pkg install bgone
 
 ## Usage
 
-### 1. Indexing the Ports Tree
+### 1. Point it at a ports tree
 
-Before configuring ports, index your local ports tree into the SQLite cache:
+There is no index to build. `bgone` learns everything by evaluating ports with
+`make`, at the moment it needs to know:
 
 ```bash
-bgone index --ports-dir /usr/ports
-
+bgone -o /var/db/ports -f my-ports.txt
 ```
+
+`--ports-dir` says where the tree is (default `/usr/ports`). It is needed to
+*configure*, not only to preheat, because what a port depends on is a question
+only the tree can answer.
 
 **If you are building with poudriere, name the jail and let `bgone` read the
 rest.** Which options a port defines can depend on the architecture and OS
-version, so a cache built as the host does not necessarily describe the jail you
+version, so evaluating as the host does not necessarily describe the jail you
 are building for:
 
 ```bash
-bgone index --poudriere-jail freebsd_14-4x64 --poudriere-ports HEAD
+bgone --poudriere-jail freebsd_14-4x64 --poudriere-ports HEAD -f my-ports.txt
 ```
 
 That reads poudriere's own configuration for the architecture (`amd64`), the OS
-release (`14.4`), the `__FreeBSD_version` (`1404000`) and the ports tree path —
-so none of them can disagree with the jail the way a hand-copied value can. What
-the cache was resolved as is recorded in it and printed when you configure.
+release (`14.4`), the `__FreeBSD_version` (`1404000`), the ports tree path and
+the options directory — so none of them can disagree with the jail the way a
+hand-copied value can.
 
 Nothing invokes `poudriere`; its configuration is a file-per-property store
 under `/usr/local/etc/poudriere.d`, and `bgone` reads it directly. Use
@@ -107,81 +113,138 @@ You can still spell any of it out — see [Matching the jail rather than the
 host](#matching-the-jail-rather-than-the-host) — and an explicit value always
 beats a derived one.
 
-If you update your ports tree (`git pull` or `portsnap`), rebuild the index with `--force`:
+### 2. The cache is a memo, not a model
+
+`bgone_cache.db` holds one table. Each row is a reply `make` gave, against the
+question that produced it:
+
+| origin | target | mtime | options_key | reply |
+| --- | --- | --- | --- | --- |
+| `mail/sqlgrey` | `ARCH=amd64 OSVERSION=1404000` | 1738... | `` | `PKGNAME…` |
+| `mail/sqlgrey` | `ARCH=amd64 OSVERSION=1404000` | 1738... | ` MYSQL` | `PKGNAME…` |
+
+Everything that could make an answer wrong is in the key, so staleness stops
+being a concept. Update the tree and the mtime changes, so the old row is simply
+never reached. Configure for a different jail and the target changes, so is
+that one. There is nothing to invalidate and nothing to migrate; a miss costs a
+single evaluation.
+
+What that is worth, measured on `mail/sqlgrey` against a real tree (8 cores):
+
+| | cold | warm |
+| --- | --- | --- |
+| resolve the 70-port closure | 8.6 s | 21 ms |
+| turn MYSQL on: 870 more ports arrive | 55 s | 0.44 s |
+
+The first run over a set is the slow part, and it is the only slow part.
+
+Nothing about the ports domain is stored. `bgone` asks make a question and
+remembers the answer verbatim; parsing happens on the way out.
+
+This replaced a schema that modelled the tree — tables for ports, options,
+dependency edges, implications, flavours — indexed once per port at the
+maintainer's defaults. **That could not be made right**, and the failure was
+not subtle: `poudriere options` kept prompting for ports `bgone` had never
+written. See [Why one evaluation is not enough](#why-one-evaluation-is-not-enough).
+
+### 3. Preheating, if you want to
+
+`bgone index` is optional. It runs the same evaluations up front so a later
+session starts warm:
 
 ```bash
-bgone index --ports-dir /usr/ports --force
-
+bgone index -f my-ports.txt        # the ports you are about to configure
+bgone index --all                  # the whole tree; ~35,000 evaluations
 ```
 
-`--db-path` selects which cache to write, and may be given on either side of the subcommand:
+`--force` empties the memo first. Nothing is lost by that — it refills itself.
 
-```bash
-bgone index --ports-dir /usr/ports --db-path ~/.cache/bgone.db
+### Why one evaluation is not enough
 
+A port's dependencies are a function of its options, and `bsd.options.mk` lets a
+port express that two ways:
+
+```make
+MPI_LIB_DEPENDS=  libmpich.so:net/mpich     # declarative — visible to anyone
+MYSQL_USES=       mysql                     # procedural — visible to nobody
 ```
 
-A cache written by an older `bgone` whose schema no longer matches is discarded on
-open, and `bgone` says so. Re-run `bgone index` to rebuild it — nothing else is
-lost, since the cache only ever mirrors the ports tree.
+The first names its dependency in a variable, which any evaluation reports. The
+second adds `USES=mysql`, and `Mk/Uses/mysql.mk` adds a `LIB_DEPENDS` — but only
+when `MYSQL` is set *while make is reading the Makefile*. Evaluate `mail/sqlgrey`
+at its defaults and there is no MySQL client anywhere in the answer; force the
+option on and one appears:
 
-Indexing evaluates every port with `make`, which is the slow part of using
-`bgone` and the only part that needs a ports tree. Configuring afterwards reads
-nothing but the cache.
+```
+$ bmake -V '${LIB_DEPENDS_ALL}' OPTIONS_OVERRIDE=
+                                             (nothing)
+$ bmake -V '${LIB_DEPENDS_ALL}' OPTIONS_OVERRIDE=MYSQL
+libmysqlclient.so.24:databases/mysql84-client
+```
 
-That is a deliberate trade. The alternative — reading Makefiles with regexes —
-is far faster but cannot evaluate them, and the gap is not small: a port's
-option list can be built by a `.for` loop, inherited through `MASTERDIR`,
-injected by `Mk/Uses/*.mk`, or vary by architecture. Closing those one at a time
-means reimplementing `bmake`, and a port does not just evaluate its own
-Makefile: it evaluates `bsd.port.mk` (5,593 lines), `bsd.options.mk` and
+850 Makefiles in the tree use the `.if ${PORT_OPTIONS:M...}` form, which is the
+same problem. No schema can hold this: the answer space is exponential in the
+option count.
+
+So `bgone` asks again. `bsd.options.mk:301` special-cases `OPTIONS_OVERRIDE` —
+it replaces `PORT_OPTIONS` outright, ahead of the maintainer's defaults,
+`make.conf`, the per-port variables and any saved options file — which makes
+"evaluate this port with exactly these options" a single, exact question.
+
+Turn an option on and the port is asked again, off the event loop; anything new
+it names is added to the list and asked about in turn. The set `bgone` writes is
+then the set `poudriere` will compute, because it is the same computation.
+
+### What one evaluation does give
+
+One `make` invocation per port yields `PKGNAME`, flavours, the complete option
+list with descriptions and `SINGLE`/`MULTI`/`RADIO` grouping,
+`FOO_IMPLIES`/`FOO_PREVENTS`, and both kinds of dependency with their real class.
+
+Reimplementing that was considered and rejected. A port does not just evaluate
+its own Makefile: it evaluates `bsd.port.mk` (5,593 lines), `bsd.options.mk` and
 `Mk/Uses/*.mk` (19,981 lines across 140 files) — some 38,000 lines defining 702+
 variables, with 214 `!=` assignments that shell out to `sysctl`, `uname` and
 `pkg` while evaluating. So `bgone` asks the ports framework instead of imitating
-it, and pays for the answer once.
-
-One `make` invocation per port yields everything: `PKGNAME`, flavours, the
-complete option list with descriptions and `SINGLE`/`MULTI`/`RADIO` grouping,
-`FOO_IMPLIES`/`FOO_PREVENTS`, and both kinds of dependency with their real class.
-Results are keyed on Makefile mtime, so re-indexing after a tree update
-re-evaluates only what changed:
-
-```
-[+] Indexed 34954 ports (33112 unchanged), 37901 options and 95324 dependency edges in 41.20s
-```
+it.
 
 Dependencies are resolved rather than guessed. A depends entry is
 `test:origin[:target]` — `bsd.port.mk` extracts the origin with
 `${_UNIFIED_DEPENDS:C,([^:]*:[^:]*):?.*,\1,}` and so does `bgone`, taking the
-second colon-separated field and its optional `@flavour`. Every stored edge is a
-foreign key to a port row, so an edge pointing at nothing cannot be written; an
-entry that names no port is recorded in `unresolved_dep` with a reason rather
-than dropped, which makes "did anything fail to resolve" a query:
+second colon-separated field and its optional `@flavour`. An entry that names no
+port is reported rather than dropped.
 
-```
-sqlite3 bgone_cache.db "SELECT reason, COUNT(*) FROM unresolved_dep GROUP BY reason"
-```
+A set option's own `${opt}_${class}_DEPENDS` is folded by `bsd.options.mk` into
+the port's `${class}_DEPENDS_ALL`, so make reports it twice — once plainly and
+once against its option. `bgone` subtracts exactly what was folded in, keyed on
+the polarity each option was evaluated at. Recording both listed the dependency
+twice and, worse, kept the port in the build after the option that asked for it
+had been turned off.
+
 
 ### Matching the jail rather than the host
 
 Which options a port defines can depend on the architecture
-(`OPTIONS_DEFINE_${ARCH}`, `OPTIONS_EXCLUDE_${OPSYS}`), so a cache built on the
-host does not necessarily describe the jail you are building for. Pass the
-target's identity and the tree is evaluated as that jail:
+(`OPTIONS_DEFINE_${ARCH}`, `OPTIONS_EXCLUDE_${OPSYS}`), so evaluating as the host
+does not necessarily describe the jail you are building for. Pass the target's
+identity and the tree is evaluated as that jail:
 
 ```bash
-bgone index -p /usr/ports --jail-arch aarch64 --osversion 1404000 --osrel 14.4
+bgone -p /usr/ports --jail-arch aarch64 --osversion 1404000 --osrel 14.4 -f ports.txt
 ```
 
-What the cache was resolved as is recorded in it.
+The target is part of every memo key, so answers for one jail can never be
+mistaken for another's. Switching jails simply misses and re-evaluates; there is
+nothing to invalidate.
 
-The evaluation also runs with `PORT_DBDIR`, `__MAKE_CONF`, `OPTIONS_SET` and
-`OPTIONS_UNSET` neutralised, so what lands in the cache is the port as shipped.
-Your saved options and `make.conf` are read separately and applied on top —
-letting them reach `make` here would bake the indexing host's configuration into
-the cache and then count it twice.
+Evaluations run with `PORT_DBDIR`, `__MAKE_CONF`, `OPTIONS_SET` and
+`OPTIONS_UNSET` neutralised, so the baseline is the port as it ships. Your saved
+options and `make.conf` are read separately and applied on top, and what they
+come to is passed back to `make` as `OPTIONS_OVERRIDE` when it differs — letting
+them reach `make` implicitly would bake this host's configuration in and then
+count it twice.
 
-### 2. Configuring Ports
+### 4. Configuring Ports
 
 To launch the TUI for a specific port origin:
 
@@ -219,7 +282,7 @@ By default an origin or pattern that matches nothing aborts the run. Pass `-i` t
 Usage: bgone [OPTIONS] [ORIGIN]... [COMMAND]
 
 Commands:
-  index  Index a local FreeBSD ports tree directory into SQLite
+  index  Fill the cache ahead of time, so a later session starts warm
   help   Print this message or the help of the given subcommand(s)
 
 Arguments:
@@ -231,9 +294,14 @@ Options:
   -o, --options-dir <PATH>  Directory to read/write FreeBSD option files [default: /var/db/ports]
   -m, --make-conf <PATH>    Optional path to read/export global make.conf overrides
   -n, --dry-run             Perform a dry-run without writing files to disk
-  -r, --force-reset         Discard previous DB cache and rebuild schema
+  -r, --force-reset         Empty the cache before starting
   -i, --ignore-missing      Warn instead of bailing out on unmatched ports (unless nothing matches)
   -f, --file <FILE>         Read target origins/patterns from a file
+  -p, --ports-dir <PATH>    Path to the ports tree root [default: /usr/ports]
+      --jail-arch <ARCH>    Resolve as this architecture rather than the host's
+      --osversion <N>       Resolve as this OSVERSION (e.g. 1404000)
+      --opsys <NAME>        Resolve as this OPSYS
+      --osrel <VERSION>     Resolve as this OSREL (e.g. 14.4)
       --poudriere-etc <DIR>  poudriere's config root [default: /usr/local/etc]
       --poudriere-jail <JAIL>  Take arch/OS version from this jail
       --poudriere-ports <TREE> Take the tree path, and name the options dir
@@ -244,19 +312,15 @@ Options:
 
 ```
 
-`bgone index` takes its own switches:
+Everything above is global, so it applies to `bgone index` as well and may be
+given on either side of it. The subcommand adds only two switches of its own:
 
 ```text
 Usage: bgone index [OPTIONS]
 
 Options:
-  -p, --ports-dir <PATH>    Path to the ports tree root [default: /usr/ports]
-  -f, --force               Discard previous database cache before indexing
-      --jail-arch <ARCH>    Resolve as this architecture rather than the host's
-      --osversion <N>       Resolve as this OSVERSION (e.g. 1404000)
-      --opsys <NAME>        Resolve as this OPSYS
-      --osrel <VERSION>     Resolve as this OSREL (e.g. 14.4)
-  -d, --db-path <PATH>      Path to SQLite cache DB [default: bgone_cache.db]
+  -f, --force               Empty the cache before preheating
+  -a, --all                 Preheat every port in the tree (~35,000 evaluations)
 
 ```
 
@@ -347,6 +411,17 @@ radio choice is resolved against each member's *own* group of alternatives, whic
 need not match the port the choice was made on. A group may name a port that is
 not in the current list — it is skipped for now and kept for a run that includes
 it.
+
+A port *joining* a group takes on the choices the members already there have
+made, since being in the group is the statement that it should be configured
+like them. Otherwise the group would claim to be in step while its newest member
+disagreed with all of it until the next toggle happened to reach it. Names the
+joining port does not define are skipped, names only it has are left as they
+were, and the first port in a group has nobody to copy and keeps what it had.
+
+Every port in a group carries the group's name on its row, in cyan. Membership
+changes what a keystroke does — `Space` here also moves every other member — so
+it has to be visible rather than remembered.
 
 Groups live in the `[groups]` table of the config. When `--config` names one,
 joining or leaving a group writes it out immediately — there is no separate save
@@ -448,8 +523,10 @@ did not mean to keep it.
 | **`/`** or **`Ctrl + F`** | Open search / filter bar |
 | **`Ctrl + L`** | Recenter the cursor row and repaint (see below) |
 | **`Ctrl + R`** | Repaint without moving the view |
-| **`Ctrl + S`** or **`s`** | Save configuration files and exit |
-| **`q`** / **`Esc`** | Exit, confirming first if there are unsaved changes |
+| **`Shift + H`** | Hide the ports that define no options, and show them again |
+| **`s`** | Save configuration files and exit |
+| **`Ctrl + S`** | Write the configuration files out and carry on |
+| **`q`** / **`Esc`** / **`Ctrl + C`** | Leave, always confirming first |
 
 ### The Button Row
 
@@ -461,18 +538,26 @@ The bottom of the screen carries a `dialog`-style button row:
 
 `Tab` cycles focus between the list and each button; `Left` / `Right` move between the buttons once the row has focus; `Enter` or `Space` presses the focused one. Each button's highlighted first character is its **letter hotkey**—press `o` for `OK` or `c` for `Cancel` from anywhere, no focus change needed. That is the same convention `dialog` uses, and it is derived from the label, so a button named `Help` would answer to `h`.
 
-`OK` saves and exits. `Cancel`, `q`, and `Esc` all exit without saving, but if you have unsaved option changes they raise a confirmation box first:
+`OK` saves and exits. `Cancel`, `q`, `Esc` and `Ctrl + C` all ask on the way out:
 
 ```text
-        ┌ Discard changes and quit? ───────────────┐
-        │                                          │
-        │      You have unsaved option changes.    │
-        │                                          │
-        │            < Yes >     < No >            │
-        └──────────────────────────────────────────┘
+   ┌ Leaving bgone ───────────────────────────────────┐
+   │                                                  │
+   │        You have unsaved option changes.          │
+   │                                                  │
+   │  < Save and exit >   < Discard >   < Cancel >    │
+   │                Esc again discards                │
+   └──────────────────────────────────────────────────┘
 ```
 
-`y` / `n` answer it directly, `Left` / `Right` / `Tab` move between the buttons, and `Esc` is the same as `No`. Toggling an option back to the value it was loaded with clears the unsaved-changes flag, so an edit you undo will not prompt.
+`s` / `d` / `c` answer it directly, `Left` / `Right` / `Tab` move between the
+buttons, and `Esc` or `Ctrl + C` a second time discards without waiting to be
+pointed at one. It is asked whether or not anything has changed: both keys are
+pressed by reflex and by habit from other programs, and neither should be able
+to end a session of picking through options on the first press.
+
+`Ctrl + S` writes the files out and stays where it is, so a long session's work
+is not all riding on getting out cleanly at the end of it.
 
 ### Scope by Repetition
 

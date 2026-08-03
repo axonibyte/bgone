@@ -177,16 +177,14 @@ fn index_with(etc: &Path, extra: &[&str], config: Option<&Config>) -> bgone::cli
     bgone::cli::resolve_from(args, config).unwrap()
 }
 
+/// The resolution target and the tree, which are top-level settings now: the
+/// configure run needs them just as much as a preheat does.
 fn index_fields(cli: &bgone::cli::Cli) -> (Option<String>, Option<String>, PathBuf) {
-    match &cli.command {
-        Some(bgone::cli::Commands::Index {
-            jail_arch,
-            osversion,
-            ports_dir,
-            ..
-        }) => (jail_arch.clone(), osversion.clone(), ports_dir.clone()),
-        _ => panic!("not an index invocation"),
-    }
+    (
+        cli.jail_arch.clone(),
+        cli.osversion.clone(),
+        cli.ports_dir.clone(),
+    )
 }
 
 /// Tier 2 over tier 5: naming a jail fills in what you would otherwise type.

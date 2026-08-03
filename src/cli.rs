@@ -23,6 +23,14 @@ KEYBINDINGS:
    ++ /  __           The whole list. Press + or _ a second time, with no
                       other key in between, to widen what you just did.
 
+ NARROWING THE LIST
+   Shift + H          Hide the ports that define no options at all, and show
+                      them again. Most of a build set is leaf libraries with
+                      nothing to decide about them; this leaves only the ports
+                      there is a choice to make about. A port make could not
+                      read is never hidden - its options are unknown rather
+                      than absent, which is the one thing worth seeing.
+
  MOVING AROUND
    Up / Down          One row (hold Ctrl to move five)
    Shift + Up / Down  Previous / next sibling, stepping over anything nested
@@ -60,6 +68,16 @@ KEYBINDINGS:
    Ctrl + G           Add the port under the cursor to a group, or start a new
                       one. Works from an option row too, acting on the port
                       that row belongs to.
+
+                      A port joining a group takes on the choices the members
+                      already there have made, since being in the group is the
+                      statement that it should be configured like them. Names
+                      it does not define are skipped, and names only it has are
+                      left as they were. The first port in a group has nobody
+                      to copy and keeps what it had.
+
+                      A port in a group is labelled with the group's name, in
+                      cyan, on its row.
    Ctrl + G  twice    Manage groups and membership, and save them to the config
                       file. A terminal cannot tell Ctrl + Shift + G from
                       Ctrl + G, so scope escalates by repetition here as well.
@@ -90,9 +108,14 @@ KEYBINDINGS:
                       < OK >, unless the cursor is on a relationship entry,
                       which it follows instead.
    o  /  c            Press < OK > / < Cancel > from anywhere
-   Ctrl + S  or  s    Save the options and exit (same as < OK >)
-   q  or  Esc         Exit without saving (same as < Cancel >). Asks you to
-                      confirm first if any option has changed.
+   s                  Save the options and exit (same as < OK >)
+   Ctrl + S           Write the options out and carry on. A long session's
+                      picking should not be riding on getting out cleanly at
+                      the end of it.
+   q / Esc / Ctrl + C Leave. Always asks first, whether or not anything has
+                      changed, offering < Save and exit >, < Discard > and
+                      < Cancel >; Esc or Ctrl + C a second time discards
+                      without waiting to be pointed at a button.
 
  REDRAWING
    Ctrl + L           Scroll the cursor row to the middle of the screen; press
@@ -119,6 +142,34 @@ pub struct Cli {
     /// Path to the SQLite cache database
     #[arg(short = 'd', long, default_value = "bgone_cache.db", global = true)]
     pub db_path: PathBuf,
+
+    /// Path to the ports tree root.
+    ///
+    /// Every fact about a port comes from evaluating it here with make, so this
+    /// is needed to configure and not only to preheat. `--poudriere-ports`
+    /// derives it from a poudriere tree instead of naming it.
+    #[arg(short = 'p', long, default_value = "/usr/ports", global = true)]
+    pub ports_dir: PathBuf,
+
+    /// Resolve as this architecture rather than the host's.
+    ///
+    /// Which options a port defines can depend on it — `OPTIONS_DEFINE_${ARCH}`,
+    /// `OPTIONS_EXCLUDE_${OPSYS}` — so what is right for amd64 does not
+    /// necessarily describe an aarch64 jail.
+    #[arg(long, value_name = "ARCH", global = true)]
+    pub jail_arch: Option<String>,
+
+    /// Resolve as this OSVERSION (e.g. 1404000 for FreeBSD 14.4)
+    #[arg(long, value_name = "N", global = true)]
+    pub osversion: Option<String>,
+
+    /// Resolve as this OPSYS (default: the host's)
+    #[arg(long, value_name = "NAME", global = true)]
+    pub opsys: Option<String>,
+
+    /// Resolve as this OSREL (e.g. 14.4)
+    #[arg(long, value_name = "VERSION", global = true)]
+    pub osrel: Option<String>,
 
     /// Directory to output FreeBSD option files
     #[arg(short, long, default_value = "/var/db/ports")]
@@ -183,41 +234,36 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Evaluate a local FreeBSD ports tree into SQLite.
+    /// Fill the cache ahead of time, so a later session starts warm.
     ///
-    /// Every port is evaluated by make, which is what makes the result exact:
-    /// `.if`, `.for`, MASTERDIR, `.include` and Mk/Uses all resolve because the
-    /// ports framework resolves them. It is the slow part of using bgone, and
-    /// the only part that needs a ports tree — configuring afterwards reads
-    /// nothing but the cache.
+    /// Optional. Nothing needs indexing before configuring: every fact is
+    /// learned by evaluating a port with make, and the cache remembers what make
+    /// said against the exact question asked — which port, resolved as what,
+    /// from Makefiles of what age, under which options. A configure run fills it
+    /// as it goes.
+    ///
+    /// This runs the same evaluations up front. With no targets it preheats the
+    /// same ports the configure run would; `--all` preheats the whole tree,
+    /// which takes a while and is rarely what you want.
     Index {
-        /// Path to the ports tree root
-        #[arg(short, long, default_value = "/usr/ports")]
-        ports_dir: PathBuf,
-
-        /// Discard previous database cache before indexing
+        /// Discard the cache before preheating
         #[arg(short, long)]
         force: bool,
 
-        /// Resolve as this architecture rather than the host's.
+        /// Preheat every port in the tree rather than the targets given.
         ///
-        /// Which options a port defines can depend on it — `OPTIONS_DEFINE_${ARCH}`,
-        /// `OPTIONS_EXCLUDE_${OPSYS}` — so a cache built on amd64 does not
-        /// necessarily describe an aarch64 jail.
-        #[arg(long, value_name = "ARCH")]
-        jail_arch: Option<String>,
+        /// Roughly 35,000 evaluations. A build set is a few hundred, so this is
+        /// worth it only if you configure across the whole tree.
+        #[arg(short, long)]
+        all: bool,
 
-        /// Resolve as this OSVERSION (e.g. 1404000 for FreeBSD 14.4)
-        #[arg(long, value_name = "N")]
-        osversion: Option<String>,
-
-        /// Resolve as this OPSYS (default: the host's)
-        #[arg(long, value_name = "NAME")]
-        opsys: Option<String>,
-
-        /// Resolve as this OSREL (e.g. 14.4)
-        #[arg(long, value_name = "VERSION")]
-        osrel: Option<String>,
+        /// Ports to preheat. Defaults to the same targets a configure run would
+        /// take, from `-f` and from origins given before the subcommand.
+        ///
+        /// Positional arguments cannot be global in clap, so this exists to let
+        /// `bgone index www/nginx` read the way it looks like it should.
+        #[arg(value_name = "ORIGIN")]
+        origins: Vec<String>,
     },
 }
 
@@ -264,6 +310,12 @@ where
 /// reports `DefaultValue` rather than nothing — which is what lets flags and
 /// valued arguments share this one test.
 fn was_passed(matches: &ArgMatches, id: &str) -> bool {
+    // `value_source` panics on an id the matches has never heard of, and a
+    // subcommand's matches only carries the *global* arguments — so asking it
+    // about a top-level one has to be a no rather than an abort.
+    if matches.try_get_raw(id).is_err() {
+        return false;
+    }
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
@@ -384,13 +436,15 @@ impl Cli {
         // subcommand's own — the top-level matches has no id for those at all.
         let sub = matches.subcommand_matches("index");
 
+        // Every one of these is global, so a value typed on the command line is
+        // in the top-level matches wherever it appeared — `bgone index -p …` and
+        // `bgone -p … index` resolve alike. `sub` is still consulted because
+        // clap records a global argument against the subcommand it was typed
+        // after as well.
         macro_rules! tiers {
-            ($id:literal, $sub:expr, $derived:ident, $cfg:expr, $current:expr) => {{
-                let typed = if $sub {
-                    sub.map(|m| was_passed(m, $id)).unwrap_or(false)
-                } else {
-                    was_passed(matches, $id)
-                };
+            ($id:literal, $derived:ident, $cfg:expr, $current:expr) => {{
+                let typed =
+                    was_passed(matches, $id) || sub.map(|m| was_passed(m, $id)).unwrap_or(false);
                 first_set([
                     if typed { Some($current) } else { None },
                     cli_spec.as_ref().and_then(|d| d.$derived.clone()),
@@ -400,62 +454,50 @@ impl Cli {
             }};
         }
 
-        // Top-level: the options directory.
-        let options_dir = tiers!(
+        if let Some(value) = tiers!(
             "options_dir",
-            false,
             options_dir,
             config.and_then(|c| c.options_dir.clone()),
             self.options_dir.clone()
-        );
-        if let Some(value) = options_dir {
+        ) {
             self.options_dir = value;
         }
 
-        // Subcommand: everything `index` resolves the tree with.
-        if let Some(Commands::Index {
+        if let Some(value) = tiers!(
+            "ports_dir",
             ports_dir,
-            jail_arch,
-            osversion,
-            osrel,
-            opsys,
-            ..
-        }) = self.command.as_mut()
-        {
-            if let Some(value) = tiers!(
-                "ports_dir",
-                true,
-                ports_dir,
-                config.and_then(|c| c.ports_dir.clone()),
-                ports_dir.clone()
-            ) {
-                *ports_dir = value;
-            }
+            config.and_then(|c| c.ports_dir.clone()),
+            self.ports_dir.clone()
+        ) {
+            self.ports_dir = value;
+        }
 
-            macro_rules! opt_tiers {
-                ($field:ident, $id:literal, $derived:ident) => {
-                    if let Some(value) = first_set([
-                        sub.filter(|m| was_passed(m, $id))
-                            .and_then(|_| $field.clone()),
-                        cli_spec.as_ref().and_then(|d| d.$derived.clone()),
-                        config.and_then(|c| c.$field.clone()),
-                        cfg_spec.as_ref().and_then(|d| d.$derived.clone()),
-                    ]) {
-                        *$field = Some(value);
-                    }
-                };
-            }
-
-            opt_tiers!(jail_arch, "jail_arch", jail_arch);
-            opt_tiers!(osversion, "osversion", osversion);
-            opt_tiers!(osrel, "osrel", osrel);
-
-            // OPSYS is never derived: every poudriere jail is FreeBSD, so there
-            // is nothing a spec could tell us that the default does not.
-            if !sub.map(|m| was_passed(m, "opsys")).unwrap_or(false) {
-                if let Some(value) = config.and_then(|c| c.opsys.clone()) {
-                    *opsys = Some(value);
+        macro_rules! opt_tiers {
+            ($field:ident, $id:literal, $derived:ident) => {
+                let typed =
+                    was_passed(matches, $id) || sub.map(|m| was_passed(m, $id)).unwrap_or(false);
+                if let Some(value) = first_set([
+                    if typed { self.$field.clone() } else { None },
+                    cli_spec.as_ref().and_then(|d| d.$derived.clone()),
+                    config.and_then(|c| c.$field.clone()),
+                    cfg_spec.as_ref().and_then(|d| d.$derived.clone()),
+                ]) {
+                    self.$field = Some(value);
                 }
+            };
+        }
+
+        opt_tiers!(jail_arch, "jail_arch", jail_arch);
+        opt_tiers!(osversion, "osversion", osversion);
+        opt_tiers!(osrel, "osrel", osrel);
+
+        // OPSYS is never derived: every poudriere jail is FreeBSD, so there is
+        // nothing a spec could tell us that the default does not.
+        let opsys_typed =
+            was_passed(matches, "opsys") || sub.map(|m| was_passed(m, "opsys")).unwrap_or(false);
+        if !opsys_typed {
+            if let Some(value) = config.and_then(|c| c.opsys.clone()) {
+                self.opsys = Some(value);
             }
         }
 

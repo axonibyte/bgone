@@ -1,38 +1,37 @@
+//! The cache, which is a memo and nothing more.
+//!
+//! Earlier versions modelled the ports tree here: tables for ports, options,
+//! dependency edges, implications, flavours. That could not be made right. A
+//! port's dependencies are a function of its options — `MYSQL_USES=mysql` and
+//! `.if ${PORT_OPTIONS:MFOO}` blocks produce nothing unless the option is set
+//! while make reads the Makefile — so describing a port takes one row per option
+//! set, and there are 2^n of those.
+//!
+//! So nothing about the ports domain is stored any more. [`crate::resolve`] asks
+//! make a question and gets a reply; this remembers the reply against the
+//! question, and [`crate::resolve::parse_reply`] — which is pure — turns it into
+//! facts on the way out. Staleness stops being a concept, because everything
+//! that could make an answer wrong is *in the key*: which port, resolved as
+//! what, from Makefiles of what age, under which options.
+
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
-/// Bumped whenever an existing cache would be *wrong* or *incomplete*, not only
-/// when the table layout changes.
-///
-/// 8 replaces the tables the regex sweep filled. Dependency targets are no
-/// longer strings that might name a port — they are foreign keys to one, so a
-/// dangling edge is unrepresentable rather than pruned afterwards. Options carry
-/// their real grouping and implications, and anything that could not be resolved
-/// is recorded in `unresolved_dep` instead of being dropped.
-const CURRENT_SCHEMA_VERSION: i32 = 8;
+/// Bumped when the memo's shape changes. A miss only costs an evaluation, so
+/// there is nothing to migrate — the table is dropped and refills itself.
+const CURRENT_SCHEMA_VERSION: i32 = 9;
 
-/// Initializes the SQLite database schema.
-/// Drops outdated tables if the schema version on disk is incompatible
-/// or if `force_reset` is explicitly requested.
+/// Opens the memo, creating or resetting it as needed.
 pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
     let on_disk_version: i32 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .unwrap_or(0);
 
     if force_reset || on_disk_version != CURRENT_SCHEMA_VERSION {
-        if on_disk_version != CURRENT_SCHEMA_VERSION && !force_reset {
-            // The cache is dropped, not repopulated — re-reading the ports tree
-            // is what `bgone index` does, and it needs a path to read it from.
-            println!(
-                "[*] Detected incompatible database schema (v{} -> v{}). Discarding the cache; \
-                 re-run 'bgone index' to rebuild it.",
-                on_disk_version, CURRENT_SCHEMA_VERSION
-            );
-        }
-
-        // Dropped children-first: the edge tables hold the foreign keys.
         conn.execute_batch(
             "
+            DROP TABLE IF EXISTS reply;
+            -- The tables that used to model the tree, dropped children-first
             DROP TABLE IF EXISTS port_files;
             DROP TABLE IF EXISTS port_conflicts;
             DROP TABLE IF EXISTS port_details;
@@ -56,109 +55,25 @@ pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA busy_timeout = 5000;
-        PRAGMA foreign_keys = ON;
 
-        -- `id` exists so edges can reference a port rather than name one.
-        -- `resolved` distinguishes a port make could evaluate from one that only
-        -- exists as a directory; an edge may point at either, and the difference
-        -- is what tells a missing dependency from an unbuildable one.
-        CREATE TABLE IF NOT EXISTS ports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            origin TEXT NOT NULL UNIQUE,
-            pkgbase TEXT NOT NULL DEFAULT '',
-            pkgname TEXT NOT NULL DEFAULT '',
-            resolved INTEGER NOT NULL DEFAULT 0
-        );
-
-        -- A flavoured port builds several packages from one directory, each with
-        -- its own PKGNAME. Dependencies name them with an `@flavour` suffix.
+        -- One make reply, against the question that produced it.
         --
-        -- Flavours are recorded but do not become separate nodes, because
-        -- options are not per-flavour: `bsd.options.mk:182` keys the options
-        -- file on `OPTIONS_NAME`, which defaults to PKGORIGIN with the slash
-        -- turned into an underscore — so py-setuptools@py311 and @py312 both
-        -- read and write
-        -- `devel_py-setuptools/options`. Configuring per flavour would write a
-        -- file the framework never reads.
-        CREATE TABLE IF NOT EXISTS port_flavour (
-            port_id INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-            flavour TEXT NOT NULL,
-            pkgname TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (port_id, flavour)
-        );
-
-        CREATE TABLE IF NOT EXISTS options (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            port_id INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            group_type TEXT NOT NULL DEFAULT 'DEFINE',
-            group_name TEXT NOT NULL DEFAULT '',
-            default_on INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(port_id, name)
-        );
-
-        -- FOO_IMPLIES / FOO_PREVENTS. Stored by name rather than by option id
-        -- because a port may name an option it does not itself define.
-        CREATE TABLE IF NOT EXISTS option_implies (
-            option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
-            implies_name TEXT NOT NULL,
-            PRIMARY KEY (option_id, implies_name)
-        );
-
-        CREATE TABLE IF NOT EXISTS option_prevents (
-            option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
-            prevents_name TEXT NOT NULL,
-            PRIMARY KEY (option_id, prevents_name)
-        );
-
-        -- One row per resolved dependency.
+        -- `target` is what the port was resolved as (ARCH, OSVERSION, ...),
+        -- because COMPLETE_OPTIONS_LIST varies with it. `mtime` is the newest of
+        -- the port's Makefiles, so a tree update simply misses. `options_key` is
+        -- the option set it was evaluated under, sorted, or empty for 'as the
+        -- port ships'.
         --
-        -- `to_port_id` is a foreign key, so an edge pointing at nothing cannot
-        -- be stored at all. That is the whole point of the table: the previous
-        -- schema held target *strings*, wrote whatever a regex produced, and
-        -- deleted the ones that named no port afterwards.
-        --
-        -- `polarity` carries the `_OFF` forms, which apply when the option is
-        -- unset and were invisible to the old sweep.
-        CREATE TABLE IF NOT EXISTS dep_edge (
-            from_port_id  INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-            to_port_id    INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
-            to_flavour    TEXT,
-            class         TEXT NOT NULL,
-            via_option_id INTEGER REFERENCES options(id) ON DELETE CASCADE,
-            polarity      TEXT NOT NULL DEFAULT 'ON'
-        );
-
-        -- Depends entries that named nothing this cache can point at, kept so
-        -- that `SELECT COUNT(*) FROM unresolved_dep` answers 'did anything fail
-        -- to resolve' instead of it being a claim.
-        CREATE TABLE IF NOT EXISTS unresolved_dep (
-            port_origin TEXT NOT NULL,
-            raw_entry   TEXT NOT NULL,
-            reason      TEXT NOT NULL
-        );
-
-        -- When each port's Makefiles were last seen, so re-indexing after a
-        -- tree update re-evaluates only what changed. Keyed by origin rather
-        -- than port id so a row survives the port table being rebuilt.
-        CREATE TABLE IF NOT EXISTS port_mtime (
-            origin TEXT PRIMARY KEY,
-            source_mtime INTEGER NOT NULL
-        );
-
-        -- Small key/value store. Holds the ports tree path used at index time so
-        -- later runs can find the tree again without being told twice, and the
-        -- ARCH/OSVERSION the cache was resolved as.
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_options_port ON options(port_id);
-        CREATE INDEX IF NOT EXISTS idx_edge_from ON dep_edge(from_port_id);
-        CREATE INDEX IF NOT EXISTS idx_edge_via ON dep_edge(via_option_id);
-        CREATE INDEX IF NOT EXISTS idx_flavour_port ON port_flavour(port_id);
+        -- WAL and a busy timeout because the walk evaluates in parallel and each
+        -- worker writes through its own connection.
+        CREATE TABLE IF NOT EXISTS reply (
+            origin      TEXT NOT NULL,
+            target      TEXT NOT NULL,
+            mtime       INTEGER NOT NULL,
+            options_key TEXT NOT NULL,
+            reply       TEXT NOT NULL,
+            PRIMARY KEY (origin, target, mtime, options_key)
+        ) WITHOUT ROWID;
         ",
     )?;
 
@@ -170,19 +85,51 @@ pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+/// A remembered reply, if this exact question has been asked before.
+pub fn get_reply(
+    conn: &Connection,
+    origin: &str,
+    target: &str,
+    mtime: i64,
+    options_key: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT reply FROM reply
+         WHERE origin = ?1 AND target = ?2 AND mtime = ?3 AND options_key = ?4",
+        params![origin, target, mtime, options_key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Remembers a reply, forgetting what this port said when its Makefiles were
+/// older.
+///
+/// Without that second step the memo would keep every answer the port has ever
+/// given across every tree update, and only the newest is reachable — the age is
+/// part of the key.
+pub fn put_reply(
+    conn: &Connection,
+    origin: &str,
+    target: &str,
+    mtime: i64,
+    options_key: &str,
+    reply: &str,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-        rusqlite::params![key, value],
+        "DELETE FROM reply WHERE origin = ?1 AND target = ?2 AND mtime <> ?3",
+        params![origin, target, mtime],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO reply (origin, target, mtime, options_key, reply)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![origin, target, mtime, options_key, reply],
     )?;
     Ok(())
 }
 
-pub fn get_meta(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = ?1",
-        rusqlite::params![key],
-        |row| row.get(0),
-    )
-    .ok()
+/// How many replies are remembered, for the preheat summary.
+pub fn reply_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM reply", [], |row| row.get(0))
+        .unwrap_or(0)
 }

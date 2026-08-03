@@ -3,11 +3,20 @@ use crate::graph::{
     next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, RowAnchor, RowKind,
     SectionKind,
 };
+use crate::oracle::{Options, Oracle, Question};
+use crate::reader::SystemOptions;
+use crate::resolve::PortFacts;
 use anyhow::Result;
 use crossterm::{
+    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    style::ResetColor,
+    // Aliased: ratatui has a `Clear` widget of its own, and both are in use here
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear as ClearScreen, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -23,6 +32,7 @@ use ratatui::{
 use std::collections::BTreeMap;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 /// The action keys shown along the bottom of the screen, one row per line.
 ///
@@ -35,7 +45,7 @@ use std::path::{Path, PathBuf};
 /// on an 80-column terminal, silently taking the last few keys with it. Editing
 /// keys first, then the ones that end or reposition the session.
 pub const FOOTER_ACTION_KEYS: &str = concat!(
-    " Space toggle | Enter jump | Bksp back | ^G group\n",
+    " Space toggle | Enter jump | Bksp back | ^G group | Shift+H hide\n",
     " Tab OK/Cancel | ^S save | q quit | ^L recenter | ^R redraw",
 );
 
@@ -85,18 +95,33 @@ pub fn prev_focus(focus: Focus) -> Focus {
     }
 }
 
-/// Button focus inside the "unsaved changes" confirmation box.
+/// Button focus inside the "leaving" confirmation box.
+///
+/// Three ways out rather than two. "Yes / No" only ever asked whether to throw
+/// the session away, so saving on the way out meant answering no, finding the
+/// OK button and pressing that instead — with the quit key still the obvious
+/// thing to have reached for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmChoice {
-    Yes,
-    No,
+    Save,
+    Discard,
+    Cancel,
 }
 
 impl ConfirmChoice {
-    pub fn toggle(self) -> Self {
+    pub fn next(self) -> Self {
         match self {
-            ConfirmChoice::Yes => ConfirmChoice::No,
-            ConfirmChoice::No => ConfirmChoice::Yes,
+            ConfirmChoice::Save => ConfirmChoice::Discard,
+            ConfirmChoice::Discard => ConfirmChoice::Cancel,
+            ConfirmChoice::Cancel => ConfirmChoice::Save,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            ConfirmChoice::Save => ConfirmChoice::Cancel,
+            ConfirmChoice::Discard => ConfirmChoice::Save,
+            ConfirmChoice::Cancel => ConfirmChoice::Discard,
         }
     }
 }
@@ -397,6 +422,40 @@ fn manage_rows(groups: &BTreeMap<String, Vec<String>>) -> Vec<ManageRow> {
     rows
 }
 
+/// First row of a `height`-tall window over `len` rows that contains `cursor`.
+///
+/// A dialog listing every group outgrew the screen as soon as there were more
+/// groups than rows, and what fell off the bottom was unreachable rather than
+/// merely unseen — the cursor could be moved onto it, but nothing showed where
+/// it had gone. The window scrolls just far enough to keep the cursor inside it,
+/// so it never moves while the cursor is already visible.
+fn scroll_window(len: usize, cursor: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    let last_start = len - height;
+    cursor.saturating_sub(height - 1).min(last_start)
+}
+
+/// The visible slice of a scrolled list, and a note saying where in the whole
+/// it sits. The note is `None` when all of it fits and there is nothing to say.
+///
+/// The slice is exactly `height` rows: a marker drawn *over* an edge row would
+/// hide the very entry the cursor had just been moved onto.
+fn windowed_lines(
+    lines: Vec<Line<'static>>,
+    cursor: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, Option<String>) {
+    if lines.len() <= height || height == 0 {
+        return (lines, None);
+    }
+    let start = scroll_window(lines.len(), cursor, height);
+    let end = (start + height).min(lines.len());
+    let note = format!("  showing {}-{} of {}", start + 1, end, lines.len());
+    (lines[start..end].to_vec(), Some(note))
+}
+
 /// A bordered box with a title and a hint line along the bottom.
 fn modal_block(title: &str) -> Block<'static> {
     Block::default()
@@ -412,16 +471,17 @@ fn render_group_assign(
     groups: &BTreeMap<String, Vec<String>>,
     cursor: usize,
 ) {
-    let height = (groups.len() as u16 + 6).min(f.size().height.saturating_sub(2));
-    let area = centered_rect(64, height.max(6), f.size());
+    // One row per group, plus <new group...>; the rest of the box is the
+    // heading, the blank line, the hints and the two borders.
+    let rows = groups.len() + 1;
+    let chrome = 6;
+    let height = (rows as u16 + chrome as u16).min(f.size().height.saturating_sub(2));
+    let area = centered_rect(64, height.max(chrome as u16 + 1), f.size());
     f.render_widget(Clear, area);
 
-    let mut lines = vec![Line::from(vec![
-        Span::raw("Add "),
-        Span::styled(target.to_string(), Style::default().fg(Color::White)),
-        Span::raw(" to:"),
-    ])];
+    let room = (area.height as usize).saturating_sub(chrome).max(1);
 
+    let mut items = Vec::new();
     for (i, (name, members)) in groups.iter().enumerate() {
         let already = members.iter().any(|m| m == target);
         let label = if already {
@@ -429,14 +489,25 @@ fn render_group_assign(
         } else {
             format!("{name}  ({} ports)", members.len())
         };
-        lines.push(selectable_line(&label, i == cursor, already));
+        items.push(selectable_line(&label, i == cursor, already));
     }
-    lines.push(selectable_line(
+    items.push(selectable_line(
         "<new group...>",
         cursor == groups.len(),
         false,
     ));
+    let (items, note) = windowed_lines(items, cursor, room);
+
+    let mut lines = vec![Line::from(vec![
+        Span::raw("Add "),
+        Span::styled(target.to_string(), Style::default().fg(Color::White)),
+        Span::raw(" to:"),
+    ])];
+    lines.extend(items);
     lines.push(Line::from(""));
+    if let Some(note) = note {
+        lines.push(Line::styled(note, Style::default().fg(Color::DarkGray)));
+    }
     lines.push(Line::styled(
         "Up/Down choose | Enter confirm | Esc cancel",
         Style::default().fg(Color::DarkGray),
@@ -471,13 +542,17 @@ fn render_group_manage(
     config_path: Option<&Path>,
 ) {
     let rows = manage_rows(groups);
-    let height = (rows.len() as u16 + 6).min(f.size().height.saturating_sub(2));
-    let area = centered_rect(70, height.max(7), f.size());
+    // Blank line, the "saves to" line, the hints and the two borders.
+    let chrome = 5;
+    let height = (rows.len().max(1) as u16 + chrome as u16).min(f.size().height.saturating_sub(2));
+    let area = centered_rect(70, height.max(chrome as u16 + 1), f.size());
     f.render_widget(Clear, area);
 
-    let mut lines = Vec::new();
+    let room = (area.height as usize).saturating_sub(chrome).max(1);
+
+    let mut items = Vec::new();
     if rows.is_empty() {
-        lines.push(Line::styled(
+        items.push(Line::styled(
             "  No groups yet. Ctrl+G on a port starts one.",
             Style::default().fg(Color::DarkGray),
         ));
@@ -486,14 +561,14 @@ fn render_group_manage(
         match row {
             ManageRow::Group(name) => {
                 let count = groups.get(name).map(|m| m.len()).unwrap_or(0);
-                lines.push(selectable_line(
+                items.push(selectable_line(
                     &format!("{name}  ({count} ports)"),
                     i == cursor,
                     false,
                 ));
             }
             ManageRow::Member { origin, .. } => {
-                lines.push(selectable_line(
+                items.push(selectable_line(
                     &format!("    {origin}"),
                     i == cursor,
                     false,
@@ -501,8 +576,13 @@ fn render_group_manage(
             }
         }
     }
+    let (items, note) = windowed_lines(items, cursor, room);
 
-    lines.push(Line::from(""));
+    let mut lines = items;
+    match note {
+        Some(note) => lines.push(Line::styled(note, Style::default().fg(Color::DarkGray))),
+        None => lines.push(Line::from("")),
+    }
     lines.push(Line::styled(
         match config_path {
             Some(path) => format!("  saves to {}", path.display()),
@@ -547,18 +627,24 @@ fn render_prompt(f: &mut Frame, title: &str, question: &str, buffer: &str, curso
     f.render_widget(Paragraph::new(body).block(modal_block(title)), area);
 }
 
-fn render_confirm_quit(f: &mut Frame, choice: ConfirmChoice) {
-    let area = centered_rect(44, 6, f.size());
+fn render_confirm_quit(f: &mut Frame, choice: ConfirmChoice, dirty: bool) {
+    let area = centered_rect(56, 7, f.size());
     f.render_widget(Clear, area);
 
     let body = Text::from(vec![
         Line::from(""),
-        Line::from("You have unsaved option changes."),
+        Line::from(if dirty {
+            "You have unsaved option changes."
+        } else {
+            "Nothing has changed since the last save."
+        }),
         Line::from(""),
         button_row(&[
-            ("Yes", choice == ConfirmChoice::Yes),
-            ("No", choice == ConfirmChoice::No),
+            ("Save and exit", choice == ConfirmChoice::Save),
+            ("Discard", choice == ConfirmChoice::Discard),
+            ("Cancel", choice == ConfirmChoice::Cancel),
         ]),
+        Line::styled("Esc again discards", Style::default().fg(Color::DarkGray)),
     ]);
 
     let modal = Paragraph::new(body)
@@ -568,7 +654,7 @@ fn render_confirm_quit(f: &mut Frame, choice: ConfirmChoice) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
-                .title(" Discard changes and quit? "),
+                .title(" Leaving bgone "),
         );
 
     f.render_widget(modal, area);
@@ -580,12 +666,77 @@ fn render_confirm_quit(f: &mut Frame, choice: ConfirmChoice) {
 /// handling is a plain function of (state, key) and can be exercised without a
 /// terminal. The dialogs went in without that and shipped with an unreachable
 /// group manager, which reading the code twice did not catch.
+/// Answers to a batch, in the order they were asked for.
+type Answers = Vec<(Question, std::result::Result<PortFacts, String>)>;
+
+/// Runs evaluations away from the event loop.
+///
+/// A toggle changes a port's option set, which changes what it depends on — and
+/// finding out means running `make`, which takes between 50 ms and 600 ms
+/// depending on the port. Doing that on the keystroke would stutter visibly on
+/// anything the size of `lang/php84`, so the request is posted and the answer
+/// collected on a later frame.
+///
+/// A batch at a time rather than a request at a time, so one round of the walk
+/// runs in parallel across cores through [`Oracle::facts_many`].
+struct Resolver {
+    tx: Sender<Vec<Question>>,
+    rx: Receiver<Answers>,
+}
+
+impl Resolver {
+    fn spawn(oracle: Oracle) -> Self {
+        let (tx, requests) = mpsc::channel::<Vec<Question>>();
+        let (answers, rx) = mpsc::channel::<Answers>();
+
+        std::thread::spawn(move || {
+            while let Ok(batch) = requests.recv() {
+                let replies = oracle.facts_many(&batch);
+                let out: Answers = batch
+                    .into_iter()
+                    .zip(replies)
+                    // The error is flattened to a string because `anyhow::Error`
+                    // is not `Send` in every shape it can take, and nothing on
+                    // the far side does anything with it but show it.
+                    .map(|(q, (_, r))| (q, r.map_err(|e| e.to_string())))
+                    .collect();
+                if answers.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self { tx, rx }
+    }
+}
+
+/// Writes the options out where they belong, reporting what it wrote.
+///
+/// Held as a function rather than done inline so that key handling stays a plain
+/// function of (state, key): the tests drive `Ctrl + S` with a closure that
+/// records the call, and neither they nor `on_key` need an options directory.
+pub type Saver = Box<dyn Fn(&DependencyGraph) -> Result<String>>;
+
+/// Brings the graph into agreement with the tree, blocking until it is.
+///
+/// Run before writing, because what gets written is exactly what is in the
+/// build: a question raised by the last keystroke may still be out with the
+/// worker, and a port pulled in by that toggle would otherwise be left out of
+/// the files — which is the failure this whole design exists to fix.
+///
+/// Returns the ports that arrived.
+pub type Settle = Box<dyn Fn(&mut DependencyGraph) -> Vec<String>>;
+
 struct App {
     input_mode: InputMode,
     focus: Focus,
     list_state: ListState,
     status_msg: String,
     confirm_choice: ConfirmChoice,
+    /// What `Ctrl + S` calls. Absent only in tests that never press it.
+    saver: Option<Saver>,
+    /// Run before a save, to settle anything the last keystroke raised.
+    settle: Option<Settle>,
     recenter_pos: Option<RecenterPosition>,
     last_tree_key: Option<char>,
     /// Rows the list can show, learned from the last frame drawn.
@@ -599,6 +750,15 @@ struct App {
     text_buffer: String,
     /// Caret position within whichever field is being typed into, in characters.
     text_cursor: usize,
+    /// Ports whose dependencies need asking about again, queued by key handling
+    /// and posted by the event loop.
+    ///
+    /// Held rather than sent so that `on_key` stays a plain function of (state,
+    /// key) with no channel of its own — the tests read this list instead of
+    /// standing up a worker and a ports tree.
+    pending: Vec<Question>,
+    /// How many questions are out with the worker, for the "resolving" note.
+    outstanding: usize,
 }
 
 impl App {
@@ -610,7 +770,9 @@ impl App {
             focus: Focus::List,
             list_state,
             status_msg: String::from("Ready"),
-            confirm_choice: ConfirmChoice::Yes,
+            confirm_choice: ConfirmChoice::Save,
+            saver: None,
+            settle: None,
             recenter_pos: None,
             last_tree_key: None,
             viewport_height: 0,
@@ -620,6 +782,15 @@ impl App {
             group_cursor: 0,
             text_buffer: String::new(),
             text_cursor: 0,
+            pending: Vec::new(),
+            outstanding: 0,
+        }
+    }
+
+    fn with_saver(config_path: Option<PathBuf>, saver: Saver) -> Self {
+        Self {
+            saver: Some(saver),
+            ..Self::new(config_path)
         }
     }
 }
@@ -676,10 +847,46 @@ impl App {
         fallback: usize,
     ) {
         let last = graph.visible_rows.len().saturating_sub(1);
+        // How far down the screen the cursor was sitting. Keeping the row still
+        // is only half of it: a change *above* the cursor renumbers it, and the
+        // list widget then scrolls by exactly enough to bring the new number
+        // back into view — which parks the same row against the bottom edge.
+        // Holding the offset the same distance behind it leaves the row where
+        // the eye already is.
+        let screen_row = self
+            .list_state
+            .selected()
+            .unwrap_or(0)
+            .saturating_sub(self.list_state.offset());
+
         let row = anchor
             .and_then(|a| graph.row_of_anchor(&a))
-            .unwrap_or(fallback);
-        self.list_state.select(Some(row.min(last)));
+            .unwrap_or(fallback)
+            .min(last);
+
+        self.list_state.select(Some(row));
+        *self.list_state.offset_mut() = row.saturating_sub(screen_row);
+    }
+
+    /// Queues a fresh question about every port whose options have just changed.
+    ///
+    /// What a port depends on is not derivable from what is already known about
+    /// it: `MYSQL_USES=mysql` and `.if ${PORT_OPTIONS:MFOO}` blocks produce
+    /// nothing at all until the option is set while make reads the Makefile. So
+    /// the port is asked about again, under the set now in force.
+    ///
+    /// A port already queued is not queued twice — holding a key down would
+    /// otherwise pile up questions whose answers are all superseded by the last.
+    fn ask_about(&mut self, graph: &DependencyGraph, origins: &[String]) {
+        for origin in origins {
+            let Some(port_id) = graph.port_index(origin) else {
+                continue;
+            };
+            let question = (origin.clone(), Options::Exactly(graph.option_set(port_id)));
+            if !self.pending.contains(&question) {
+                self.pending.push(question);
+            }
+        }
     }
 
     /// Moves the list cursor `delta` rows from `from`, clamped to the list.
@@ -769,13 +976,28 @@ impl App {
                                 .nth(self.group_cursor)
                                 .cloned()
                                 .unwrap_or_default();
-                            let members = graph.groups.entry(name.clone()).or_default();
-                            if members.contains(&target) {
+                            let already = graph
+                                .groups
+                                .get(&name)
+                                .map(|m| m.contains(&target))
+                                .unwrap_or(false);
+
+                            if already {
                                 self.status_msg = format!("{target} is already in {name}");
                             } else {
+                                // Read before the port is added, so it cannot
+                                // find itself as the member to copy from
+                                let adopted = graph.adopt_group_options(&name, &target);
+                                let members = graph.groups.entry(name.clone()).or_default();
                                 members.push(target.clone());
                                 members.sort();
-                                self.status_msg = format!("Added {target} to {name}");
+
+                                let did = match adopted {
+                                    0 => format!("Added {target} to {name}"),
+                                    1 => format!("Added {target} to {name}, matching 1 option"),
+                                    n => format!("Added {target} to {name}, matching {n} options"),
+                                };
+                                self.autosave_groups(graph, &did);
                             }
                             self.input_mode = InputMode::Normal;
                             self.group_target = None;
@@ -892,26 +1114,45 @@ impl App {
             },
 
             InputMode::ConfirmQuit => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Asking twice and getting the same answer means it: the second
+                // Esc or Ctrl+C leaves without waiting to be pointed at a
+                // button. Checked before the plain 'c' below, which is the
+                // Cancel hotkey and means the opposite.
+                KeyCode::Esc => return KeyOutcome::Finish(TuiAction::QuitWithoutSaving),
+                KeyCode::Char('c') | KeyCode::Char('C') if has_ctrl => {
                     return KeyOutcome::Finish(TuiAction::QuitWithoutSaving);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    return KeyOutcome::Finish(TuiAction::SaveAndQuit);
+                }
+                KeyCode::Char('d')
+                | KeyCode::Char('D')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => {
+                    return KeyOutcome::Finish(TuiAction::QuitWithoutSaving);
+                }
+                KeyCode::Char('c')
+                | KeyCode::Char('C')
+                | KeyCode::Char('n')
+                | KeyCode::Char('N') => {
                     self.input_mode = InputMode::Normal;
                     self.status_msg = String::from("Returned to configuration");
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::BackTab
-                | KeyCode::Up
-                | KeyCode::Down => {
-                    self.confirm_choice = self.confirm_choice.toggle();
+
+                KeyCode::Right | KeyCode::Tab | KeyCode::Down => {
+                    self.confirm_choice = self.confirm_choice.next();
                 }
+                KeyCode::Left | KeyCode::BackTab | KeyCode::Up => {
+                    self.confirm_choice = self.confirm_choice.prev();
+                }
+
                 KeyCode::Enter | KeyCode::Char(' ') => match self.confirm_choice {
-                    ConfirmChoice::Yes => {
+                    ConfirmChoice::Save => return KeyOutcome::Finish(TuiAction::SaveAndQuit),
+                    ConfirmChoice::Discard => {
                         return KeyOutcome::Finish(TuiAction::QuitWithoutSaving);
                     }
-                    ConfirmChoice::No => {
+                    ConfirmChoice::Cancel => {
                         self.input_mode = InputMode::Normal;
                         self.status_msg = String::from("Returned to configuration");
                     }
@@ -1035,6 +1276,27 @@ impl App {
                         _ => save_requested = true,
                     },
 
+                    // Write the options out and carry on. Distinct from the
+                    // < OK > button, which writes and leaves: keeping a long
+                    // session's work safe should not cost the session.
+                    KeyCode::Char('s') | KeyCode::Char('S') if has_ctrl => {
+                        // Settled first: what is written is what is in the
+                        // build, so the build has to be up to date with the
+                        // options as they now stand.
+                        if let Some(settle) = &self.settle {
+                            let anchor = graph.anchor_at(selected_index);
+                            settle(graph);
+                            self.restore_anchor(graph, anchor);
+                        }
+                        self.status_msg = match &self.saver {
+                            Some(save) => match save(graph) {
+                                Ok(what) => what,
+                                Err(e) => format!("Could not save: {e}"),
+                            },
+                            None => String::from("Nowhere to save to"),
+                        };
+                    }
+
                     // Letter hotkeys work from any focus
                     KeyCode::Char('o') | KeyCode::Char('O') => save_requested = true,
 
@@ -1134,6 +1396,23 @@ impl App {
                         self.status_msg = String::from("Jumped to bottom");
                     }
 
+                    // Most of a build set is leaf libraries with nothing to
+                    // decide; Shift + H takes them out of the way and puts
+                    // them back.
+                    KeyCode::Char('H') if !has_ctrl => {
+                        let anchor = graph.anchor_at(selected_index);
+                        graph.hide_optionless = !graph.hide_optionless;
+                        graph.rebuild_visible_rows();
+                        self.restore_anchor(graph, anchor);
+
+                        let hidden = graph.optionless_count();
+                        self.status_msg = if graph.hide_optionless {
+                            format!("Hiding {hidden} port(s) with no options")
+                        } else {
+                            format!("Showing all {} ports", graph.live_count())
+                        };
+                    }
+
                     // Navigation: Single Up / Down, five at a time with Ctrl
                     KeyCode::Up => {
                         self.move_selection(
@@ -1212,8 +1491,9 @@ impl App {
                                         // the list, so it renumbers rows just as
                                         // an expand does
                                         let anchor = graph.anchor_at(selected);
-                                        graph.toggle_option(selected);
+                                        let touched = graph.toggle_option(selected);
                                         self.restore_anchor(graph, anchor);
+                                        self.ask_about(graph, &touched);
                                         self.status_msg = format!("Toggled option '{}'", opt_name);
                                     }
                                     _ => {
@@ -1234,14 +1514,18 @@ impl App {
             return KeyOutcome::Finish(TuiAction::SaveAndQuit);
         }
 
+        // Always asked, not only when something has changed. Esc and Ctrl+C are
+        // reached for by reflex and by habit from other programs, and neither
+        // should be able to end a session of picking through options on the
+        // first press. Pressing the same key again answers it.
         if quit_requested {
-            if graph.is_dirty() {
-                self.input_mode = InputMode::ConfirmQuit;
-                self.confirm_choice = ConfirmChoice::Yes;
-                self.status_msg = String::from("Unsaved changes");
+            self.input_mode = InputMode::ConfirmQuit;
+            self.confirm_choice = ConfirmChoice::Save;
+            self.status_msg = if graph.is_dirty() {
+                String::from("Unsaved changes")
             } else {
-                return KeyOutcome::Finish(TuiAction::QuitWithoutSaving);
-            }
+                String::from("Leaving")
+            };
         }
 
         if redraw {
@@ -1281,22 +1565,42 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
     // the footer free for keybindings alone
     // A locked filter leaves the list narrowed with the search bar gone, so the
     // header has to say so; otherwise the missing ports look like a fault.
-    let target = if graph.search_query.is_empty() {
+    let target = if graph.search_query.is_empty() && !graph.hide_optionless {
         format!(
             " Target: {}  ({} ports)",
             graph.root_origin,
             graph.live_count()
         )
+    } else if graph.search_query.is_empty() {
+        // Hiding narrows the list the same way a filter does, and leaving it
+        // unsaid makes the missing ports look like a fault.
+        format!(
+            " Target: {}  ({} of {} ports, no-option ports hidden)",
+            graph.root_origin,
+            graph.listed_port_count(),
+            graph.live_count()
+        )
     } else {
         format!(
-            " Target: {}  ({} of {} ports matching \"{}\")",
+            " Target: {}  ({} of {} ports matching \"{}\"{})",
             graph.root_origin,
             graph.listed_port_count(),
             graph.live_count(),
-            graph.search_query
+            graph.search_query,
+            if graph.hide_optionless {
+                ", no-option ports hidden"
+            } else {
+                ""
+            }
         )
     };
-    let status = format!("{} ", app.status_msg);
+    // Said while make runs, because a toggle can take the better part of a
+    // second on a large port and silence reads as nothing having happened.
+    let status = if app.outstanding > 0 {
+        format!("resolving {} port(s)... ", app.outstanding)
+    } else {
+        format!("{} ", app.status_msg)
+    };
     let gap = (chunks[0].width.saturating_sub(2) as usize)
         .saturating_sub(target.chars().count() + status.chars().count())
         .max(1);
@@ -1351,6 +1655,24 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
                     Span::raw(format!("{}{}", indent, prefix)),
                     Span::styled(origin.clone(), name_style),
                 ];
+
+                // Membership has to be visible on the row, because it changes
+                // what a keystroke does: Space here also moves every other
+                // member. Its own colour, since provenance already owns the
+                // name's.
+                let joined: Vec<&str> = graph
+                    .groups
+                    .iter()
+                    .filter(|(_, members)| members.iter().any(|m| m == origin))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !joined.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  [{}]", joined.join(", ")),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+
                 // Said on the port row as well as inside it, because a port
                 // whose options are unknown looks exactly like one with none
                 // until it is opened — and the row is what you scroll past.
@@ -1539,7 +1861,7 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
     f.render_widget(buttons, chunks[3]);
 
     match app.input_mode {
-        InputMode::ConfirmQuit => render_confirm_quit(f, app.confirm_choice),
+        InputMode::ConfirmQuit => render_confirm_quit(f, app.confirm_choice, graph.is_dirty()),
         InputMode::GroupAssign => render_group_assign(
             f,
             app.group_target.as_deref().unwrap_or(""),
@@ -1573,7 +1895,79 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
     }
 }
 
-pub fn run_tui(graph: &mut DependencyGraph, config_path: Option<PathBuf>) -> Result<TuiAction> {
+/// Folds one batch of answers into the graph, and reports what it learned.
+///
+/// A port the answer mentions that the graph has never seen is added and asked
+/// about in turn, so a dependency that appears three levels down from a toggle
+/// still arrives. That cascade is what makes the list match what poudriere will
+/// compute, rather than what the port looked like at its maintainer's defaults.
+fn merge(
+    graph: &mut DependencyGraph,
+    app: &mut App,
+    sys_opts: &SystemOptions,
+    answers: Answers,
+) -> Vec<String> {
+    let mut arrived = Vec::new();
+
+    for ((origin, _), reply) in answers {
+        let facts = match reply {
+            Ok(facts) => facts,
+            Err(e) => {
+                app.status_msg = format!("Could not resolve {origin}: {e}");
+                continue;
+            }
+        };
+
+        if graph.port_index(&origin).is_none() {
+            graph.add_port(&facts, sys_opts);
+            arrived.push(origin.clone());
+        }
+
+        for unknown in graph.apply_resolution(&origin, &facts) {
+            // Asked as the port ships, because nothing is known about its
+            // options yet — what they default to is part of the answer.
+            let question = (unknown, Options::AsShipped);
+            if !app.pending.contains(&question) {
+                app.pending.push(question);
+            }
+        }
+    }
+
+    graph.settle_batch();
+    graph.rebuild_visible_rows();
+    arrived
+}
+
+pub fn run_tui(
+    graph: &mut DependencyGraph,
+    config_path: Option<PathBuf>,
+    saver: Saver,
+) -> Result<TuiAction> {
+    run_tui_with(
+        graph,
+        config_path,
+        saver,
+        None,
+        None,
+        &SystemOptions::default(),
+    )
+}
+
+/// As [`run_tui`], with an oracle to answer questions raised while it runs.
+///
+/// Without one the interface still works and still writes; it simply cannot
+/// discover a dependency that only exists once an option is turned on. That is
+/// the shape a session with no readable ports tree takes.
+pub fn run_tui_with(
+    graph: &mut DependencyGraph,
+    config_path: Option<PathBuf>,
+    saver: Saver,
+    settle: Option<Settle>,
+    oracle: Option<Oracle>,
+    sys_opts: &SystemOptions,
+) -> Result<TuiAction> {
+    let resolver = oracle.map(Resolver::spawn);
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1587,11 +1981,43 @@ pub fn run_tui(graph: &mut DependencyGraph, config_path: Option<PathBuf>) -> Res
     // full repaint, which is why starting up used to need a manual Ctrl + L.
     terminal.clear()?;
 
-    let mut app = App::new(config_path);
+    let mut app = App::with_saver(config_path, saver);
+    app.settle = settle;
     let action;
 
     loop {
         terminal.draw(|f| render(f, graph, &mut app))?;
+
+        // Post whatever the last keystroke raised. Batched rather than sent one
+        // at a time so a round runs in parallel across cores.
+        if let Some(resolver) = &resolver {
+            if !app.pending.is_empty() {
+                let batch = std::mem::take(&mut app.pending);
+                app.outstanding += batch.len();
+                let _ = resolver.tx.send(batch);
+            }
+
+            // Answers are collected here rather than waited for, so the poll
+            // above keeps the interface responsive while make runs.
+            while let Ok(answers) = resolver.rx.try_recv() {
+                app.outstanding = app.outstanding.saturating_sub(answers.len());
+                let anchor = app
+                    .list_state
+                    .selected()
+                    .and_then(|row| graph.anchor_at(row));
+                let arrived = merge(graph, &mut app, sys_opts, answers);
+                app.restore_anchor(graph, anchor);
+
+                if !arrived.is_empty() {
+                    app.status_msg = match arrived.len() {
+                        1 => format!("{} pulled in", arrived[0]),
+                        n => format!("{} and {} more pulled in", arrived[0], n - 1),
+                    };
+                }
+            }
+        } else {
+            app.pending.clear();
+        }
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -1611,13 +2037,24 @@ pub fn run_tui(graph: &mut DependencyGraph, config_path: Option<PathBuf>) -> Res
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    // Leaving the alternate screen drops the cursor back where the shell left
-    // it, which is part-way along a line if the last thing printed there did
-    // not end in one. Whatever comes next — this program's own output, or the
-    // prompt — then starts mid-line and reads as though the terminal is still
-    // waiting for input. One newline, flushed before anything else is written,
-    // is what makes exiting land cleanly.
+    // Leaving the alternate screen puts back whatever the shell had on screen
+    // before bgone started, with the cursor dropped wherever that left it —
+    // part-way along a line if the last thing printed there did not end in one.
+    // What comes next, this program's own output or the prompt, then starts
+    // mid-line against a screenful of unrelated scrollback.
+    //
+    // So the screen is wiped to the terminal's own background and the cursor
+    // put at the top of it, colours reset first so a style left over from the
+    // interface cannot tint what is painted. The newline after that is what
+    // separates the summary from the top edge.
     let mut out = std::io::stdout();
+    execute!(
+        out,
+        ResetColor,
+        ClearScreen(ClearType::All),
+        ClearScreen(ClearType::Purge),
+        MoveTo(0, 0)
+    )?;
     writeln!(out)?;
     out.flush()?;
 
@@ -1631,7 +2068,6 @@ mod tests {
 
     use crate::graph::NodeId;
     use crossterm::event::{KeyEventKind, KeyEventState};
-    use rusqlite::Connection;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -1651,78 +2087,71 @@ mod tests {
         }
     }
 
-    /// Writes a port with one option, in the shape `bgone index` would.
+    /// A port as make would have described it.
     ///
-    /// The cache is normally filled by evaluating ports with make; these tests
-    /// care about key handling, not resolution, so they write the rows directly.
+    /// These tests are about key handling rather than resolution, so they build
+    /// facts directly instead of standing up a ports tree and a `make` to read
+    /// it with. Resolution itself is covered against a stub tree in
+    /// `tests/integration_tests.rs`.
+    fn fixture_port(origin: &str) -> PortFacts {
+        let name = origin.split('/').nth(1).unwrap_or(origin);
+        PortFacts {
+            origin: origin.to_string(),
+            pkgname: format!("{name}-1.0"),
+            pkgbase: name.to_string(),
+            flavours: Vec::new(),
+            options: Vec::new(),
+            deps: Vec::new(),
+            unresolved: Vec::new(),
+            source_mtime: 0,
+        }
+    }
+
     fn fixture_option(
-        conn: &Connection,
-        origin: &str,
+        facts: &mut PortFacts,
         name: &str,
         default_on: bool,
         group_type: &str,
         group_name: &str,
-    ) -> i64 {
-        let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
-        conn.execute(
-            "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved) VALUES (?1, ?2, ?3, 1)",
-            rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
-        )
-        .unwrap();
-        let port_id: i64 = conn
-            .query_row(
-                "SELECT id FROM ports WHERE origin = ?1",
-                rusqlite::params![origin],
-                |r| r.get(0),
-            )
-            .unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO options (port_id, name, description, group_type, group_name, default_on)
-             VALUES (?1, ?2, '', ?3, ?4, ?5)",
-            rusqlite::params![port_id, name, group_type, group_name, default_on as i32],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
+    ) {
+        facts.options.push(crate::resolve::OptionFacts {
+            name: name.to_string(),
+            description: String::new(),
+            group_type: group_type.to_string(),
+            group_name: group_name.to_string(),
+            default_on,
+            implies: Vec::new(),
+            prevents: Vec::new(),
+        });
     }
 
-    fn fixture_edge(conn: &Connection, from: &str, to: &str, via: Option<i64>) {
-        for origin in [from, to] {
-            let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
-            conn.execute(
-                "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved) VALUES (?1, ?2, ?3, 1)",
-                rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
-            )
-            .unwrap();
-        }
-        conn.execute(
-            "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id, polarity)
-             SELECT f.id, t.id, 'RUN', ?3, 'ON' FROM ports f, ports t
-             WHERE f.origin = ?1 AND t.origin = ?2",
-            rusqlite::params![from, to, via],
-        )
-        .unwrap();
+    fn fixture_edge(facts: &mut PortFacts, to: &str, via: Option<&str>) {
+        facts.deps.push(crate::resolve::DepEntry {
+            origin: to.to_string(),
+            flavour: None,
+            class: "RUN".to_string(),
+            via_option: via.map(str::to_string),
+            polarity: crate::resolve::Polarity::On,
+        });
+    }
+
+    fn built(facts: Vec<PortFacts>, requested: &[&str]) -> DependencyGraph {
+        let mut graph = DependencyGraph::from_facts(&facts, requested, &SystemOptions::default());
+        graph.expand_all();
+        graph
     }
 
     /// Two ports sharing an option, so the list has something to put a cursor on.
     fn test_graph() -> DependencyGraph {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn, true).unwrap();
-        for origin in ["lang/php83-extensions", "lang/php84-extensions"] {
-            fixture_option(&conn, origin, "SOAP", false, "DEFINE", "");
-        }
-        let targets = vec![
-            "lang/php83-extensions".to_string(),
-            "lang/php84-extensions".to_string(),
-        ];
-        let mut graph = DependencyGraph::load_from_db(
-            &conn,
-            &targets,
-            &crate::reader::SystemOptions::default(),
-            false,
-        )
-        .unwrap();
-        graph.expand_all();
-        graph
+        let ports: Vec<PortFacts> = ["lang/php83-extensions", "lang/php84-extensions"]
+            .iter()
+            .map(|origin| {
+                let mut p = fixture_port(origin);
+                fixture_option(&mut p, "SOAP", false, "DEFINE", "");
+                p
+            })
+            .collect();
+        built(ports, &["lang/php83-extensions", "lang/php84-extensions"])
     }
 
     /// Documented in --help, the README and the footer: Ctrl+G once to add,
@@ -1916,23 +2345,17 @@ mod tests {
     /// A graph with two ports, so collapsing the first renumbers everything
     /// under the second.
     fn spot_graph() -> DependencyGraph {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn, true).unwrap();
-        for origin in ["www/aaa", "www/zzz"] {
-            for opt in ["ALPHA", "BETA", "GAMMA"] {
-                fixture_option(&conn, origin, opt, false, "DEFINE", "");
-            }
-        }
-        let targets = vec!["www/aaa".to_string(), "www/zzz".to_string()];
-        let mut graph = DependencyGraph::load_from_db(
-            &conn,
-            &targets,
-            &crate::reader::SystemOptions::default(),
-            false,
-        )
-        .unwrap();
-        graph.expand_all();
-        graph
+        let ports: Vec<PortFacts> = ["www/aaa", "www/zzz"]
+            .iter()
+            .map(|origin| {
+                let mut p = fixture_port(origin);
+                for opt in ["ALPHA", "BETA", "GAMMA"] {
+                    fixture_option(&mut p, opt, false, "DEFINE", "");
+                }
+                p
+            })
+            .collect();
+        built(ports, &["www/aaa", "www/zzz"])
     }
 
     /// What the cursor is sitting on, for asserting it did not wander.
@@ -2046,22 +2469,15 @@ mod tests {
     /// it renumbers rows exactly as an expand does.
     #[test]
     fn toggling_leaves_the_cursor_on_the_option_it_toggled() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn, true).unwrap();
         // EXTRA is on by default and pulls in aaa/pulled, which sorts *above*
         // www/app — so turning it off shifts every row under www/app upwards.
-        let extra = fixture_option(&conn, "www/app", "EXTRA", true, "DEFINE", "");
-        fixture_option(&conn, "aaa/pulled", "DOCS", true, "DEFINE", "");
-        fixture_edge(&conn, "www/app", "aaa/pulled", Some(extra));
+        let mut app_port = fixture_port("www/app");
+        fixture_option(&mut app_port, "EXTRA", true, "DEFINE", "");
+        fixture_edge(&mut app_port, "aaa/pulled", Some("EXTRA"));
+        let mut pulled = fixture_port("aaa/pulled");
+        fixture_option(&mut pulled, "DOCS", true, "DEFINE", "");
 
-        let mut graph = DependencyGraph::load_from_db(
-            &conn,
-            &["www/app".to_string()],
-            &crate::reader::SystemOptions::default(),
-            false,
-        )
-        .unwrap();
-        graph.expand_all();
+        let mut graph = built(vec![app_port, pulled], &["www/app"]);
         let mut app = App::new(None);
 
         let before = row_of_option(&graph, "www/app", "EXTRA");
@@ -2720,28 +3136,309 @@ mod tests {
         assert!(graph.is_dirty(), "Space should have toggled an option");
     }
 
+    /// Quitting always asks, whether or not anything has changed — Esc and
+    /// Ctrl+C are pressed by reflex, and one press must not end the session.
     #[test]
-    fn quitting_clean_finishes_but_quitting_dirty_asks_first() {
+    fn quitting_always_asks_first() {
         let mut graph = test_graph();
         let mut app = App::new(None);
 
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('q')), &mut graph),
-            KeyOutcome::Finish(TuiAction::QuitWithoutSaving)
-        );
-
-        app.list_state.select(Some(first_option_row(&graph)));
-        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(!graph.is_dirty());
         assert_eq!(
             app.on_key(key(KeyCode::Char('q')), &mut graph),
             KeyOutcome::Continue
         );
         assert_eq!(app.input_mode, InputMode::ConfirmQuit);
 
-        // ...and confirming goes through
+        // Cancel, change something, and ask again
+        app.on_key(key(KeyCode::Char('c')), &mut graph);
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        app.list_state.select(Some(first_option_row(&graph)));
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(graph.is_dirty());
         assert_eq!(
-            app.on_key(key(KeyCode::Char('y')), &mut graph),
+            app.on_key(key(KeyCode::Char('q')), &mut graph),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('d')), &mut graph),
             KeyOutcome::Finish(TuiAction::QuitWithoutSaving)
+        );
+    }
+
+    /// The three ways out, each reachable both by its letter and by walking the
+    /// buttons to it.
+    #[test]
+    fn the_leaving_box_offers_save_discard_and_cancel() {
+        let mut graph = test_graph();
+
+        let mut ask = |k: KeyEvent| {
+            let mut app = App::new(None);
+            app.on_key(key(KeyCode::Esc), &mut graph);
+            assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+            let outcome = app.on_key(k, &mut graph);
+            (app.input_mode, outcome)
+        };
+
+        assert_eq!(
+            ask(key(KeyCode::Char('s'))).1,
+            KeyOutcome::Finish(TuiAction::SaveAndQuit)
+        );
+        assert_eq!(
+            ask(key(KeyCode::Char('d'))).1,
+            KeyOutcome::Finish(TuiAction::QuitWithoutSaving)
+        );
+        assert_eq!(ask(key(KeyCode::Char('c'))).0, InputMode::Normal);
+
+        // The box opens on "Save and exit", so Enter saves...
+        assert_eq!(
+            ask(key(KeyCode::Enter)).1,
+            KeyOutcome::Finish(TuiAction::SaveAndQuit)
+        );
+
+        // ...and one step right of it discards
+        let mut app = App::new(None);
+        app.on_key(key(KeyCode::Esc), &mut graph);
+        app.on_key(key(KeyCode::Right), &mut graph);
+        assert_eq!(app.confirm_choice, ConfirmChoice::Discard);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter), &mut graph),
+            KeyOutcome::Finish(TuiAction::QuitWithoutSaving)
+        );
+    }
+
+    /// Asked twice and answered the same way: the second Esc — or Ctrl+C — is
+    /// taken as the answer rather than waiting to be pointed at a button.
+    #[test]
+    fn a_second_escape_discards() {
+        for quit in [key(KeyCode::Esc), ctrl('c')] {
+            let mut graph = test_graph();
+            let mut app = App::new(None);
+            app.list_state.select(Some(first_option_row(&graph)));
+            app.on_key(key(KeyCode::Char(' ')), &mut graph);
+
+            assert_eq!(app.on_key(quit, &mut graph), KeyOutcome::Continue);
+            assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+            assert_eq!(
+                app.on_key(quit, &mut graph),
+                KeyOutcome::Finish(TuiAction::QuitWithoutSaving),
+                "a second {quit:?} must not need a button pressed"
+            );
+        }
+    }
+
+    /// Ctrl+S writes without leaving, so a long session is not all riding on
+    /// getting out cleanly at the end.
+    #[test]
+    fn ctrl_s_saves_in_place_and_stays() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut graph = test_graph();
+        let calls = Rc::new(RefCell::new(0));
+        let counted = Rc::clone(&calls);
+
+        let mut app = App::with_saver(
+            None,
+            Box::new(move |_| {
+                *counted.borrow_mut() += 1;
+                Ok(String::from("Saved 3 options across 2 files"))
+            }),
+        );
+
+        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::Continue);
+        assert_eq!(*calls.borrow(), 1, "Ctrl+S must write the options out");
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.status_msg, "Saved 3 options across 2 files");
+
+        // Plain `s` is still the OK button: write and leave
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('s')), &mut graph),
+            KeyOutcome::Finish(TuiAction::SaveAndQuit)
+        );
+        assert_eq!(*calls.borrow(), 1, "leaving must not save twice");
+    }
+
+    /// A failing write is reported rather than swallowed or fatal.
+    #[test]
+    fn a_failed_save_says_so_and_carries_on() {
+        let mut graph = test_graph();
+        let mut app = App::with_saver(
+            None,
+            Box::new(|_| Err(anyhow::anyhow!("read-only file system"))),
+        );
+
+        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::Continue);
+        assert!(
+            app.status_msg.contains("read-only file system"),
+            "status said {:?}",
+            app.status_msg
+        );
+    }
+
+    /// Being in a group changes what a keystroke does — Space here also moves
+    /// every other member — so it has to be visible on the row itself.
+    #[test]
+    fn a_grouped_port_is_labelled_on_its_row() {
+        let mut graph = test_graph();
+        graph.groups = groups_of(&[("php", &["lang/php83-extensions"])]);
+
+        let mut app = App::new(None);
+        let screen = draw(|f| render(f, &graph, &mut app));
+
+        assert!(
+            screen.contains("lang/php83-extensions  [php]"),
+            "a member must say which group it is in:\n{screen}"
+        );
+        assert!(
+            !screen.contains("lang/php84-extensions  [php]"),
+            "a port that is not in the group must not be labelled:\n{screen}"
+        );
+    }
+
+    /// Shift + H takes the ports with nothing to decide out of the way, and
+    /// leaves the cursor on what it was reading.
+    #[test]
+    fn shift_h_hides_the_ports_with_no_options() {
+        let mut app_port = fixture_port("www/app");
+        fixture_option(&mut app_port, "SSL", false, "DEFINE", "");
+        fixture_edge(&mut app_port, "devel/leaf", None);
+
+        let mut graph = built(vec![app_port, fixture_port("devel/leaf")], &["www/app"]);
+
+        let mut app = App::new(None);
+        app.list_state.select(Some(row_of_port(&graph, "www/app")));
+
+        let shift_h = KeyEvent {
+            code: KeyCode::Char('H'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        app.on_key(shift_h, &mut graph);
+        assert!(graph.hide_optionless);
+        assert!(
+            port_row_index(&graph, "devel/leaf").is_none(),
+            "the leaf has nothing to decide and should be out of the way"
+        );
+        assert!(port_row_index(&graph, "www/app").is_some());
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "port www/app",
+            "hiding must not lose the row being read"
+        );
+
+        app.on_key(shift_h, &mut graph);
+        assert!(!graph.hide_optionless);
+        assert!(port_row_index(&graph, "devel/leaf").is_some());
+    }
+
+    /// A dialog listing more groups than fit on the screen scrolled nowhere:
+    /// the cursor could be moved onto a row that was never drawn.
+    #[test]
+    fn the_window_follows_the_cursor_off_the_bottom() {
+        // Everything fits: no scrolling, ever
+        assert_eq!(scroll_window(3, 0, 10), 0);
+        assert_eq!(scroll_window(3, 2, 10), 0);
+
+        // It only moves once the cursor would leave the window...
+        assert_eq!(scroll_window(20, 0, 5), 0);
+        assert_eq!(scroll_window(20, 4, 5), 0);
+        assert_eq!(scroll_window(20, 5, 5), 1);
+
+        // ...and stops at the end rather than scrolling past it
+        assert_eq!(scroll_window(20, 19, 5), 15);
+        assert_eq!(scroll_window(20, 100, 5), 15);
+    }
+
+    /// The window is exactly as tall as the room it was given: a marker drawn
+    /// over an edge row would hide the entry just moved onto.
+    #[test]
+    fn a_scrolled_dialog_says_where_in_the_list_it_is() {
+        let lines: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+
+        let (shown, note) = windowed_lines(lines.clone(), 12, 5);
+        assert_eq!(shown.len(), 5);
+        assert_eq!(note.as_deref(), Some("  showing 9-13 of 20"));
+
+        let (shown, note) = windowed_lines(lines[..3].to_vec(), 0, 5);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(note, None, "nothing to say when it all fits");
+    }
+
+    /// A dialog with more groups than rows still draws the one under the
+    /// cursor, wherever in the list it is.
+    #[test]
+    fn the_group_dialog_draws_the_row_the_cursor_is_on() {
+        let names: Vec<String> = (0..40).map(|i| format!("group{i:02}")).collect();
+        let groups: BTreeMap<String, Vec<String>> = names
+            .iter()
+            .map(|n| (n.clone(), vec!["www/app".to_string()]))
+            .collect();
+
+        let screen = draw(|f| render_group_assign(f, "www/app", &groups, 39));
+        assert!(
+            screen.contains("group39"),
+            "the row under the cursor was never drawn:\n{screen}"
+        );
+        assert!(screen.contains("showing "), "and it must say where it is");
+    }
+
+    /// Keeping the row still is only half of it. A change *above* the cursor
+    /// renumbers it, and the list widget then scrolls by exactly enough to
+    /// bring the new number into view — parking the row against the bottom
+    /// edge, several screens from where the eye already was.
+    #[test]
+    fn the_row_stays_where_it_is_on_the_screen() {
+        // Every one of these sorts before www/zzz, so opening them renumbers it
+        let mut ports = Vec::new();
+        let origins: Vec<String> = (0..6).map(|i| format!("www/a{i}")).collect();
+        for origin in &origins {
+            let mut p = fixture_port(origin);
+            for opt in ["ONE", "TWO", "THREE"] {
+                fixture_option(&mut p, opt, false, "DEFINE", "");
+            }
+            ports.push(p);
+        }
+        let mut zzz = fixture_port("www/zzz");
+        fixture_option(&mut zzz, "ZED", false, "DEFINE", "");
+        ports.push(zzz);
+
+        let mut targets: Vec<&str> = origins.iter().map(|s| s.as_str()).collect();
+        targets.push("www/zzz");
+        let mut graph = built(ports, &targets);
+        graph.collapse_all();
+
+        let mut app = App::new(None);
+        app.viewport_height = 10;
+        // Reading www/zzz, five rows down the screen
+        let zzz = row_of_port(&graph, "www/zzz");
+        app.list_state.select(Some(zzz));
+        *app.list_state.offset_mut() = zzz.saturating_sub(5);
+        assert_eq!(
+            app.list_state.selected().unwrap() - app.list_state.offset(),
+            5
+        );
+
+        // Open everything: www/aaa gains six option rows above the cursor
+        app.on_key(key(KeyCode::Char('+')), &mut graph);
+        app.on_key(key(KeyCode::Char('+')), &mut graph);
+
+        assert_eq!(
+            under_cursor(&graph, &app),
+            "port www/zzz",
+            "the cursor must still be on the port it was reading"
+        );
+        let moved = row_of_port(&graph, "www/zzz");
+        assert!(moved > zzz, "the row number must have moved");
+        assert_eq!(
+            app.list_state.selected().unwrap() - app.list_state.offset(),
+            5,
+            "and it must still be five rows down the screen"
         );
     }
 
@@ -2757,21 +3454,12 @@ mod tests {
     /// A graph with a real dependency edge, so there is a relationship row to
     /// follow.
     fn linked_graph() -> DependencyGraph {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn, true).unwrap();
-        for origin in ["www/app", "devel/lib"] {
-            fixture_option(&conn, origin, "DOCS", true, "DEFINE", "");
-        }
-        fixture_edge(&conn, "www/app", "devel/lib", None);
-        let mut graph = DependencyGraph::load_from_db(
-            &conn,
-            &["www/app".to_string()],
-            &crate::reader::SystemOptions::default(),
-            false,
-        )
-        .unwrap();
-        graph.expand_all();
-        graph
+        let mut app_port = fixture_port("www/app");
+        fixture_option(&mut app_port, "DOCS", true, "DEFINE", "");
+        fixture_edge(&mut app_port, "devel/lib", None);
+        let mut lib = fixture_port("devel/lib");
+        fixture_option(&mut lib, "DOCS", true, "DEFINE", "");
+        built(vec![app_port, lib], &["www/app"])
     }
 
     #[test]

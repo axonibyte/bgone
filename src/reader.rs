@@ -14,7 +14,7 @@ fn assignment_values(rest: &str) -> Option<&str> {
     Some(trimmed.trim_start_matches(['=', '+', ':', '?', ' ', '\t']))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SystemOptions {
     /// Port origin (e.g. "www/apache24") -> (option_name -> enabled)
     pub port_overrides: HashMap<String, HashMap<String, bool>>,

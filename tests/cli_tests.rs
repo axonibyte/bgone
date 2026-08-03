@@ -72,12 +72,12 @@ fn test_defaults_match_documentation() {
 fn test_index_subcommand_defaults() {
     let cli = parse(&["index"]);
 
+    // The tree is named at the top level now, because configuring needs it too
+    assert_eq!(cli.ports_dir, PathBuf::from("/usr/ports"));
     match cli.command {
-        Some(Commands::Index {
-            ports_dir, force, ..
-        }) => {
-            assert_eq!(ports_dir, PathBuf::from("/usr/ports"));
+        Some(Commands::Index { force, all, .. }) => {
             assert!(!force);
+            assert!(!all);
         }
         _ => panic!("expected the index subcommand"),
     }
@@ -176,11 +176,14 @@ fn test_index_subcommand_switches_parse() {
         vec!["index", "--ports-dir", "/mnt/ports", "--force"],
     ] {
         let cli = parse(&args);
+        assert_eq!(
+            cli.ports_dir,
+            PathBuf::from("/mnt/ports"),
+            "args: {:?}",
+            args
+        );
         match cli.command {
-            Some(Commands::Index {
-                ports_dir, force, ..
-            }) => {
-                assert_eq!(ports_dir, PathBuf::from("/mnt/ports"), "args: {:?}", args);
+            Some(Commands::Index { force, .. }) => {
                 assert!(force, "args: {:?}", args);
             }
             _ => panic!("expected the index subcommand for {:?}", args),
@@ -302,6 +305,7 @@ fn test_every_key_on_the_footer_is_explained_in_help() {
             "^L" => "Ctrl + L",
             "^R" => "Ctrl + R",
             "^G" => "Ctrl + G",
+            "Shift+H" => "Shift + H",
             "Bksp" => "Backspace",
             other => other,
         };
@@ -422,6 +426,7 @@ fn test_index_writes_to_the_requested_db_path() {
 
     let out = run(&[
         "index",
+        "--all",
         "--ports-dir",
         ports_root.to_str().unwrap(),
         "--db-path",
@@ -433,56 +438,57 @@ fn test_index_writes_to_the_requested_db_path() {
         "index failed: {}",
         stderr_of(&out) + &stdout_of(&out)
     );
-    assert!(stdout_of(&out).contains("Indexed 1 ports"));
+    assert!(stdout_of(&out).contains("Preheating 1 port"));
     assert!(db.exists(), "--db-path was ignored by the index subcommand");
-    assert_eq!(port_count(&db), 1);
 }
 
+/// `--force` empties the memo. Nothing is lost by that: a miss costs one
+/// evaluation, and the memo refills itself.
 #[test]
-fn test_index_force_rebuilds_the_cache() {
+fn test_index_force_empties_the_memo() {
     let temp = TempDir::new("cli_index_force");
     let ports_root = write_mock_ports_tree(&temp);
     let db = temp.join("cache.db");
     let db_arg = db.to_str().unwrap();
     let ports_arg = ports_root.to_str().unwrap();
 
-    assert!(run(&["index", "-p", ports_arg, "-d", db_arg])
+    // A remembered reply, put there by hand so this does not depend on a
+    // FreeBSD `make` being present to produce a real one
+    assert!(run(&["index", "--all", "-p", ports_arg, "-d", db_arg])
         .status
         .success());
+    remember(&db, "www/nginx");
+    assert_eq!(reply_count(&db), 1);
 
-    // Stale row that a forced rebuild must drop
-    {
-        let conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "INSERT INTO ports (origin, pkgbase, pkgname) VALUES ('stale/port', 's', 's-1')",
-            [],
-        )
-        .unwrap();
-    }
-    assert_eq!(port_count(&db), 2);
-
-    let out = run(&["index", "-p", ports_arg, "-d", db_arg, "--force"]);
+    let out = run(&["index", "--all", "-p", ports_arg, "-d", db_arg, "--force"]);
     assert!(out.status.success());
-    assert_eq!(port_count(&db), 1, "--force did not rebuild the schema");
+    assert_eq!(reply_count(&db), 0, "--force did not empty the memo");
 }
 
 #[test]
-fn test_force_reset_switch_rebuilds_the_cache() {
+fn test_force_reset_switch_empties_the_memo() {
     let temp = TempDir::new("cli_force_reset");
-    let ports_root = write_mock_ports_tree(&temp);
     let db = temp.join("cache.db");
     let db_arg = db.to_str().unwrap();
 
-    assert!(
-        run(&["index", "-p", ports_root.to_str().unwrap(), "-d", db_arg])
-            .status
-            .success()
-    );
-    assert_eq!(port_count(&db), 1);
+    run(&["-d", db_arg]);
+    remember(&db, "www/nginx");
+    assert_eq!(reply_count(&db), 1);
 
-    // No origins, so this exits after printing help - but -r still wipes the cache
+    // No origins, so this exits after printing help - but -r still wipes it
     assert!(run(&["-d", db_arg, "--force-reset"]).status.success());
-    assert_eq!(port_count(&db), 0, "--force-reset did not drop the tables");
+    assert_eq!(reply_count(&db), 0, "--force-reset did not empty the memo");
+}
+
+/// Puts one reply in the memo, so emptying it is observable.
+fn remember(db: &Path, origin: &str) {
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO reply (origin, target, mtime, options_key, reply)
+         VALUES (?1, 'host', 1, '', 'x')",
+        rusqlite::params![origin],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -491,9 +497,16 @@ fn test_unresolvable_origin_exits_with_an_error() {
     let db = temp.join("cache.db");
 
     let out = run(&["-d", db.to_str().unwrap(), "nonexistent/port"]);
+    let err = stderr_of(&out);
 
     assert_eq!(out.status.code(), Some(1));
-    assert!(stderr_of(&out).contains("No matching ports found"));
+    // Whichever way it failed — no such port, or no tree to look in — the
+    // message has to name what was asked for and say why it could not answer.
+    assert!(err.contains("nonexistent/port"), "said: {err}");
+    assert!(
+        err.contains("No matching ports found") || err.contains("Could not evaluate"),
+        "said: {err}"
+    );
 }
 
 #[test]
@@ -521,13 +534,17 @@ fn test_ignore_missing_still_fails_when_nothing_resolves() {
         "nonexistent/two",
     ]);
 
+    let err = stderr_of(&out);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stderr_of(&out).contains("No matching ports found"));
+    assert!(
+        err.contains("No matching ports found") || err.contains("Could not evaluate"),
+        "said: {err}"
+    );
 }
 
-fn port_count(db: &Path) -> i64 {
+fn reply_count(db: &Path) -> i64 {
     let conn = Connection::open(db).unwrap();
-    conn.query_row("SELECT COUNT(*) FROM ports", [], |r| r.get(0))
+    conn.query_row("SELECT COUNT(*) FROM reply", [], |r| r.get(0))
         .unwrap()
 }
 
@@ -599,27 +616,27 @@ fn test_config_origins_and_command_line_file_both_apply() {
     assert_eq!(cli.origins, vec!["www/apache24"]);
 }
 
-/// `ports_dir` belongs to the subcommand, so its precedence has to be resolved
-/// against the subcommand's own matches.
+/// `ports_dir` is global, so it resolves the same whichever side of the
+/// subcommand it was typed on — and it resolves for a plain configure run,
+/// which now needs the tree just as much.
 #[test]
-fn test_config_reaches_the_index_subcommands_ports_dir() {
+fn test_config_reaches_the_ports_dir_on_either_side_of_the_subcommand() {
     let from_config = resolve(&["index"], r#"ports_dir = "/from/config""#);
-    match from_config.command {
-        Some(Commands::Index { ports_dir, .. }) => {
-            assert_eq!(ports_dir, PathBuf::from("/from/config"))
-        }
-        _ => panic!("expected the index subcommand"),
-    }
+    assert_eq!(from_config.ports_dir, PathBuf::from("/from/config"));
 
-    let explicit = resolve(
-        &["index", "--ports-dir", "/from/cli"],
-        r#"ports_dir = "/from/config""#,
-    );
-    match explicit.command {
-        Some(Commands::Index { ports_dir, .. }) => {
-            assert_eq!(ports_dir, PathBuf::from("/from/cli"))
-        }
-        _ => panic!("expected the index subcommand"),
+    let configuring = resolve(&["www/nginx"], r#"ports_dir = "/from/config""#);
+    assert_eq!(configuring.ports_dir, PathBuf::from("/from/config"));
+
+    for args in [
+        vec!["index", "--ports-dir", "/from/cli"],
+        vec!["--ports-dir", "/from/cli", "index"],
+    ] {
+        let explicit = resolve(&args, r#"ports_dir = "/from/config""#);
+        assert_eq!(
+            explicit.ports_dir,
+            PathBuf::from("/from/cli"),
+            "args: {args:?}"
+        );
     }
 }
 

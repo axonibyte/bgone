@@ -22,7 +22,7 @@
 //! simply work: none of them is our problem any more.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -328,8 +328,58 @@ fn queries() -> Vec<String> {
     q
 }
 
-/// Newest mtime across a port's `Makefile*`, used to tell when cached facts have
-/// gone stale.
+/// Directories under the ports root that are not categories.
+const NON_CATEGORIES: [&str; 6] = [
+    "Mk",
+    "Templates",
+    "Tools",
+    "Keywords",
+    "distfiles",
+    "packages",
+];
+
+/// Every `category/port` directory holding a Makefile.
+///
+/// A directory walk rather than something make reports, because this answers
+/// "which ports exist" — what a glob pattern matches against, and what tells a
+/// dependency on a port that cannot be evaluated from one on a port that is not
+/// there at all. Reading 34,954 directory entries takes well under a second, so
+/// there is nothing here worth caching.
+pub fn enumerate_ports(ports_dir: &Path) -> Result<Vec<String>> {
+    let mut origins = Vec::new();
+
+    let categories = fs::read_dir(ports_dir)
+        .with_context(|| format!("cannot read ports tree at {ports_dir:?}"))?;
+
+    for category in categories.flatten() {
+        let cat_name = category.file_name().to_string_lossy().to_string();
+        if cat_name.starts_with('.') || NON_CATEGORIES.contains(&cat_name.as_str()) {
+            continue;
+        }
+        if !category.path().is_dir() {
+            continue;
+        }
+
+        let Ok(ports) = fs::read_dir(category.path()) else {
+            continue;
+        };
+        for port in ports.flatten() {
+            let port_name = port.file_name().to_string_lossy().to_string();
+            if port_name.starts_with('.') {
+                continue;
+            }
+            if port.path().join("Makefile").is_file() {
+                origins.push(format!("{cat_name}/{port_name}"));
+            }
+        }
+    }
+
+    origins.sort();
+    Ok(origins)
+}
+
+/// Newest mtime across a port's `Makefile*`, which is what tells a memoised
+/// reply from one the tree has moved on from.
 ///
 /// Only the port's own directory is stat'd. A change in a master port or an
 /// included fragment does not bump it — but a ports tree is updated as a whole
@@ -456,6 +506,42 @@ pub fn parse_reply(origin: &str, text: &str, source_mtime: i64) -> Result<PortFa
     let mut deps = Vec::new();
     let mut unresolved = Vec::new();
 
+    // What `bsd.options.mk` already folded into the port's own dependency lists.
+    //
+    // For every option that is set, it appends `${opt}_${class}_DEPENDS` to
+    // `${class}_DEPENDS` (and the `_OFF` list for every option that is not), so
+    // `${class}_DEPENDS_ALL` — evaluated with the maintainer defaults in force —
+    // carries option-conditional entries as though they were unconditional.
+    //
+    // Recording both spellings listed such a dependency twice, once plainly and
+    // once against its option; worse, the unconditional copy kept the port in
+    // the build after the option that asked for it had been turned off.
+    //
+    // Which entries make folded in is known exactly: each option's own list, at
+    // the polarity that option was evaluated at. Those are subtracted here, so
+    // the dependency is recorded once, against the option that carries it.
+    //
+    // A port that genuinely declares the same entry both ways is indistinguishable
+    // from this and is treated as conditional. That costs a dependency shown one
+    // level in rather than at the top, against a duplicate on almost every port
+    // with a default-on option.
+    let folded_in: HashSet<(&str, String)> = {
+        let mut set = HashSet::new();
+        for class in DEP_CLASSES {
+            for (suffix_tag, on) in [("ON", true), ("OFF", false)] {
+                for (opt, value) in records(get(&format!("OPTDEP_{class}_{suffix_tag}"))) {
+                    if defaults.contains(&opt) != on {
+                        continue;
+                    }
+                    for entry in words(&value) {
+                        set.insert((class, entry));
+                    }
+                }
+            }
+        }
+        set
+    };
+
     let mut take =
         |entry: &str, class: &str, via: Option<&str>, polarity: Polarity| match parse_dep_entry(
             entry,
@@ -475,6 +561,9 @@ pub fn parse_reply(origin: &str, text: &str, source_mtime: i64) -> Result<PortFa
 
     for class in DEP_CLASSES {
         for entry in words(get(&format!("DEP_{class}"))) {
+            if folded_in.contains(&(class, entry.clone())) {
+                continue;
+            }
             take(&entry, class, None, Polarity::On);
         }
     }
@@ -501,8 +590,16 @@ pub fn parse_reply(origin: &str, text: &str, source_mtime: i64) -> Result<PortFa
     })
 }
 
-/// Evaluates one port.
-pub fn resolve_one(env: &MakeEnv, origin: &str) -> Result<PortFacts> {
+/// Evaluates one port and returns make's reply verbatim, with the mtime of the
+/// Makefiles it was read from.
+///
+/// Separate from [`resolve_one`] so the reply can be memoised as make said it,
+/// rather than as this program understood it. [`parse_reply`] is pure, so a
+/// stored reply can be re-read by a later version that understands more of it.
+///
+/// `options` is the option set to evaluate as. `None` asks what the port defines
+/// and defaults to; `Some(set)` pins `PORT_OPTIONS` to exactly `set`.
+pub fn evaluate(env: &MakeEnv, origin: &str, options: Option<&[String]>) -> Result<(String, i64)> {
     let port_dir = env.ports_dir.join(origin);
     let source_mtime = newest_makefile_mtime(&port_dir)
         .with_context(|| format!("{origin}: no Makefile under {port_dir:?}"))?;
@@ -539,7 +636,24 @@ pub fn resolve_one(env: &MakeEnv, origin: &str) -> Result<PortFacts> {
         cmd.arg(format!("{key}={value}"));
     }
 
-    // A port that wants to prompt would hang the whole index.
+    // Pinning the option set is what makes a port's *procedural* dependencies
+    // visible. `MYSQL_USES=mysql` and `.if ${PORT_OPTIONS:MFOO}` blocks produce
+    // nothing unless the option is set while make is reading the Makefile, so no
+    // single evaluation can describe a port under every set of options — which
+    // is why this takes the set as an argument rather than resolving once.
+    //
+    // `bsd.options.mk:301` special-cases OPTIONS_OVERRIDE: it *replaces*
+    // PORT_OPTIONS outright, ahead of the maintainer's defaults, make.conf, the
+    // per-port variables and any saved options file. `FOO_IMPLIES` is applied
+    // after it, so make still resolves implications itself.
+    //
+    // Given on the command line rather than in the environment, because a
+    // command-line assignment cannot be overwritten by the Makefile.
+    if let Some(set) = options {
+        cmd.arg(format!("OPTIONS_OVERRIDE={}", set.join(" ")));
+    }
+
+    // A port that wants to prompt would hang the whole walk.
     cmd.env("BATCH", "yes");
 
     let output = cmd
@@ -557,11 +671,16 @@ pub fn resolve_one(env: &MakeEnv, origin: &str) -> Result<PortFacts> {
         );
     }
 
-    parse_reply(
-        origin,
-        &String::from_utf8_lossy(&output.stdout),
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
         source_mtime,
-    )
+    ))
+}
+
+/// Evaluates one port and parses what it said.
+pub fn resolve_one(env: &MakeEnv, origin: &str) -> Result<PortFacts> {
+    let (reply, source_mtime) = evaluate(env, origin, None)?;
+    parse_reply(origin, &reply, source_mtime)
 }
 
 #[cfg(test)]
@@ -743,6 +862,82 @@ mod tests {
         // The `_OFF` form, invisible to the parser this replaces
         assert_eq!(find("security/gnutls").polarity, Polarity::Off);
         assert_eq!(find("security/gnutls").class, "RUN");
+    }
+
+    /// `bsd.options.mk` folds a set option's dependencies into the port's own
+    /// lists, so a default-on option's dependency comes back in both answers.
+    ///
+    /// Recording both listed it twice — once plainly and once against its
+    /// option, in the colour that means "only while this is on" — and left the
+    /// plain copy holding the port in the build after the option was turned off.
+    #[test]
+    fn a_set_options_dependency_is_not_also_recorded_as_unconditional() {
+        let text = reply(&[
+            ("PKGNAME", "app-1.0"),
+            ("OPTIONS", "SSL GNUTLS"),
+            // SSL is on, so make has already folded its LIB_DEPENDS into
+            // LIB_DEPENDS_ALL; GNUTLS is off, so its _OFF list is in there too.
+            ("DEFAULTS", "SSL"),
+            (
+                "DEP_LIB",
+                "libpcre2-8.so:devel/pcre2 libssl.so:security/openssl \
+                 libgnutls.so:security/gnutls",
+            ),
+            (
+                "OPTDEP_LIB_ON",
+                &record(&[("SSL", "libssl.so:security/openssl")]),
+            ),
+            (
+                "OPTDEP_LIB_OFF",
+                &record(&[("GNUTLS", "libgnutls.so:security/gnutls")]),
+            ),
+        ]);
+
+        let facts = parse_reply("www/app", &text, 0).unwrap();
+        let of = |origin: &str| -> Vec<&DepEntry> {
+            facts.deps.iter().filter(|d| d.origin == origin).collect()
+        };
+
+        // The one the port really does depend on whatever its options say
+        assert_eq!(of("devel/pcre2").len(), 1);
+        assert!(of("devel/pcre2")[0].via_option.is_none());
+
+        // Recorded once, against the option that carries it
+        let ssl = of("security/openssl");
+        assert_eq!(ssl.len(), 1, "openssl was recorded {} times", ssl.len());
+        assert_eq!(ssl[0].via_option.as_deref(), Some("SSL"));
+        assert_eq!(ssl[0].polarity, Polarity::On);
+
+        // Same for the off-polarity form
+        let gnutls = of("security/gnutls");
+        assert_eq!(gnutls.len(), 1);
+        assert_eq!(gnutls[0].via_option.as_deref(), Some("GNUTLS"));
+        assert_eq!(gnutls[0].polarity, Polarity::Off);
+    }
+
+    /// The subtraction is keyed on the polarity the option was *evaluated* at.
+    /// An off option's `_ON` list was never folded in, so nothing of the port's
+    /// own list may be taken away on account of it.
+    #[test]
+    fn an_unset_options_dependency_takes_nothing_away() {
+        let text = reply(&[
+            ("PKGNAME", "app-1.0"),
+            ("OPTIONS", "SSL"),
+            ("DEFAULTS", ""),
+            ("DEP_LIB", "libssl.so:security/openssl"),
+            (
+                "OPTDEP_LIB_ON",
+                &record(&[("SSL", "libssl.so:security/openssl")]),
+            ),
+        ]);
+
+        let facts = parse_reply("www/app", &text, 0).unwrap();
+        // The port names it in both places and SSL is off, so the plain listing
+        // is the port's own and stands on its own feet.
+        assert!(facts
+            .deps
+            .iter()
+            .any(|d| d.origin == "security/openssl" && d.via_option.is_none()));
     }
 
     #[test]

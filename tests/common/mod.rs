@@ -55,162 +55,398 @@ pub fn write_mock_ports_tree(temp: &TempDir) -> PathBuf {
     ports_root
 }
 
-// ---------------------------------------------------------------- cache fixtures
+// -------------------------------------------------------------- tree fixtures
 //
-// The cache is written by `bgone index`, which evaluates every port with make.
-// Tests that only care about the graph should not have to run make, so these
-// write the same rows directly. They are the only place that knows the schema's
-// shape, so a schema change lands here rather than in forty call sites.
+// Every fact bgone has comes from evaluating a port with make, so a fixture is
+// a ports tree and a `make` to read it with. These build both: a directory per
+// port holding a `.port` description, and a stub `make` that turns one into the
+// tagged reply the real thing would print.
+//
+// The stub honours `OPTIONS_OVERRIDE`, which is the whole point. A port can
+// declare a dependency that exists *only* when an option is set — the shape
+// `MYSQL_USES=mysql` takes — and no evaluation at the maintainer's defaults will
+// ever mention it. Without a stub that models that, nothing here would exercise
+// the reason the resolver asks make a second time.
 
-use rusqlite::Connection;
+use bgone::graph::DependencyGraph;
+use bgone::oracle::Oracle;
+use bgone::reader::SystemOptions;
+use bgone::resolve::MakeEnv;
+use std::collections::BTreeMap;
 
-/// Inserts a port and returns its id.
-pub fn add_port(conn: &Connection, origin: &str) -> i64 {
-    let pkgname = format!("{}-1.0", origin.split('/').nth(1).unwrap_or(origin));
-    conn.execute(
-        "INSERT OR IGNORE INTO ports (origin, pkgbase, pkgname, resolved)
-         VALUES (?1, ?2, ?3, 1)",
-        rusqlite::params![origin, origin.split('/').nth(1).unwrap_or(origin), pkgname],
-    )
-    .unwrap();
-    port_id(conn, origin)
+/// One line of a port's description, in the order the stub reads them.
+#[derive(Default)]
+struct Port {
+    pkgname: Option<String>,
+    /// name, default_on, group_type, group_name, description
+    options: Vec<(String, bool, String, String, String)>,
+    implies: Vec<(String, String)>,
+    prevents: Vec<(String, String)>,
+    /// class, dependency entry
+    deps: Vec<(String, String)>,
+    /// class, option, polarity, dependency entry
+    optdeps: Vec<(String, String, String, String)>,
+    /// class, option, dependency entry — contributed procedurally, so it shows
+    /// up as an ordinary dependency but only while that option is set
+    hidden: Vec<(String, String, String)>,
+    /// A port whose directory exists but which make cannot evaluate.
+    unreadable: bool,
 }
 
-pub fn port_id(conn: &Connection, origin: &str) -> i64 {
-    conn.query_row(
-        "SELECT id FROM ports WHERE origin = ?1",
-        rusqlite::params![origin],
-        |r| r.get(0),
-    )
-    .unwrap_or_else(|_| panic!("no port row for {origin}"))
+/// A mock ports tree, plus the cache and stub make that go with it.
+pub struct Tree {
+    temp: TempDir,
+    ports: BTreeMap<String, Port>,
+    written: bool,
 }
 
-/// Inserts an option on a port, creating the port if needed. Returns its id.
-#[allow(clippy::too_many_arguments)]
-pub fn add_option(
-    conn: &Connection,
-    origin: &str,
-    name: &str,
-    default_on: bool,
-    description: &str,
-    group_type: &str,
-    group_name: &str,
-) -> i64 {
-    let pid = add_port(conn, origin);
-    conn.execute(
-        "INSERT OR REPLACE INTO options
-         (port_id, name, description, group_type, group_name, default_on)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            pid,
-            name,
-            description,
-            group_type,
-            group_name,
-            default_on as i32
-        ],
-    )
-    .unwrap();
-    conn.last_insert_rowid()
+impl Tree {
+    pub fn new(tag: &str) -> Self {
+        Self {
+            temp: TempDir::new(tag),
+            ports: BTreeMap::new(),
+            written: false,
+        }
+    }
+
+    pub fn root(&self) -> PathBuf {
+        self.temp.join("ports")
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.temp.join("cache.db")
+    }
+
+    fn port(&mut self, origin: &str) -> &mut Port {
+        self.written = false;
+        self.ports.entry(origin.to_string()).or_default()
+    }
+
+    pub fn add_port(&mut self, origin: &str) {
+        self.port(origin);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_option(
+        &mut self,
+        origin: &str,
+        name: &str,
+        default_on: bool,
+        description: &str,
+        group_type: &str,
+        group_name: &str,
+    ) {
+        let port = self.port(origin);
+        port.options.retain(|(n, ..)| n != name);
+        port.options.push((
+            name.to_string(),
+            default_on,
+            group_type.to_string(),
+            group_name.to_string(),
+            description.to_string(),
+        ));
+    }
+
+    /// An edge that applies only when `opt` on `from` is set.
+    pub fn add_option_dep(&mut self, from: &str, opt: &str, to: &str) {
+        self.add_option_dep_with(from, opt, to, "RUN", "ON");
+    }
+
+    pub fn add_option_dep_with(
+        &mut self,
+        from: &str,
+        opt: &str,
+        to: &str,
+        class: &str,
+        polarity: &str,
+    ) {
+        if !self
+            .ports
+            .get(from)
+            .map(|p| p.options.iter().any(|(n, ..)| n == opt))
+            .unwrap_or(false)
+        {
+            self.add_option(from, opt, true, "", "DEFINE", "");
+        }
+        self.add_port(to);
+        self.port(from).optdeps.push((
+            class.to_string(),
+            opt.to_string(),
+            polarity.to_string(),
+            entry_for(to),
+        ));
+    }
+
+    /// An edge that applies whatever the options say.
+    pub fn add_port_dep(&mut self, from: &str, to: &str) {
+        self.add_port_dep_with(from, to, "LIB");
+    }
+
+    pub fn add_port_dep_with(&mut self, from: &str, to: &str, class: &str) {
+        self.add_port(to);
+        self.port(from)
+            .deps
+            .push((class.to_string(), entry_for(to)));
+    }
+
+    /// A dependency the port never names in a `${opt}_*_DEPENDS` variable, and
+    /// which only exists while `opt` is set — what `${opt}_USES=` and
+    /// `.if ${PORT_OPTIONS:M${opt}}` blocks produce.
+    ///
+    /// Invisible to any single evaluation at the maintainer's defaults, which is
+    /// exactly the gap that made poudriere prompt for ports bgone never wrote.
+    pub fn add_hidden_dep(&mut self, from: &str, opt: &str, to: &str) {
+        self.add_port(to);
+        self.port(from)
+            .hidden
+            .push(("LIB".to_string(), opt.to_string(), entry_for(to)));
+    }
+
+    pub fn add_implies(&mut self, origin: &str, opt: &str, implies: &str) {
+        self.port(origin)
+            .implies
+            .push((opt.to_string(), implies.to_string()));
+    }
+
+    pub fn add_prevents(&mut self, origin: &str, opt: &str, prevents: &str) {
+        self.port(origin)
+            .prevents
+            .push((opt.to_string(), prevents.to_string()));
+    }
+
+    /// Sets the package name make would report.
+    pub fn set_pkgname(&mut self, origin: &str, pkgname: &str) {
+        self.port(origin).pkgname = Some(pkgname.to_string());
+    }
+
+    /// Marks a port as one make cannot evaluate: the directory and Makefile are
+    /// there, but nothing can be got out of it.
+    pub fn make_unreadable(&mut self, origin: &str) {
+        self.port(origin).unreadable = true;
+    }
+
+    fn write(&mut self) {
+        let root = self.root();
+        for (origin, port) in &self.ports {
+            let dir = root.join(origin);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("Makefile"), "# read by the stub make\n").unwrap();
+
+            if port.unreadable {
+                let _ = fs::remove_file(dir.join(".port"));
+                continue;
+            }
+
+            let name = origin.split('/').nth(1).unwrap_or(origin);
+            let mut out = format!(
+                "pkgname\t{}\n",
+                port.pkgname.clone().unwrap_or(format!("{name}-1.0"))
+            );
+            for (n, on, gt, gn, desc) in &port.options {
+                out.push_str(&format!(
+                    "opt\t{n}\t{}\t{gt}\t{gn}\t{desc}\n",
+                    if *on { 1 } else { 0 }
+                ));
+            }
+            for (a, b) in &port.implies {
+                out.push_str(&format!("implies\t{a}\t{b}\n"));
+            }
+            for (a, b) in &port.prevents {
+                out.push_str(&format!("prevents\t{a}\t{b}\n"));
+            }
+            for (class, entry) in &port.deps {
+                out.push_str(&format!("dep\t{class}\t{entry}\n"));
+            }
+            for (class, opt, pol, entry) in &port.optdeps {
+                out.push_str(&format!("optdep\t{class}\t{opt}\t{pol}\t{entry}\n"));
+            }
+            for (class, opt, entry) in &port.hidden {
+                out.push_str(&format!("hidden\t{class}\t{opt}\t{entry}\n"));
+            }
+            fs::write(dir.join(".port"), out).unwrap();
+        }
+        // `Mk/bsd.port.mk` is what the oracle looks for to decide the tree is
+        // readable, so the fixture has to have one.
+        fs::create_dir_all(root.join("Mk")).unwrap();
+        fs::write(root.join("Mk").join("bsd.port.mk"), "# stub\n").unwrap();
+        self.written = true;
+    }
+
+    pub fn oracle(&mut self) -> Oracle {
+        if !self.written {
+            self.write();
+        }
+        let conn = rusqlite::Connection::open(self.db_path()).unwrap();
+        bgone::db::init_db(&conn, false).unwrap();
+        drop(conn);
+
+        let mut env = MakeEnv::new(self.root());
+        env.make = stub_make(&self.temp.path);
+        Oracle::new(env, self.db_path())
+    }
+
+    /// A port that exists in the tree but which make cannot evaluate.
+    pub fn add_unevaluated_port(&mut self, origin: &str) {
+        self.make_unreadable(origin);
+    }
+
+    /// The graph these ports make, from the targets named.
+    pub fn graph(&mut self, targets: &[&str]) -> DependencyGraph {
+        let owned: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
+        self.build(&owned, &SystemOptions::default(), false)
+            .unwrap()
+    }
+
+    /// Resolves a graph the way `main` does, so a test sees exactly what a run
+    /// would. Fallible, because a pattern matching nothing is an error.
+    pub fn build(
+        &mut self,
+        patterns: &[String],
+        sys_opts: &SystemOptions,
+        ignore_missing: bool,
+    ) -> anyhow::Result<DependencyGraph> {
+        let oracle = self.oracle();
+        DependencyGraph::resolve(&oracle, patterns, sys_opts, ignore_missing)
+    }
+
+    /// Asks the tree about ports whose options have just changed, exactly as
+    /// the interface does off its event loop. Returns the ports that arrived.
+    pub fn resettle(&mut self, graph: &mut DependencyGraph, touched: &[String]) -> Vec<String> {
+        let oracle = self.oracle();
+        graph.resettle(&oracle, &SystemOptions::default(), touched)
+    }
 }
 
-pub fn option_id(conn: &Connection, origin: &str, name: &str) -> i64 {
-    conn.query_row(
-        "SELECT o.id FROM options o JOIN ports p ON p.id = o.port_id
-         WHERE p.origin = ?1 AND o.name = ?2",
-        rusqlite::params![origin, name],
-        |r| r.get(0),
-    )
-    .unwrap_or_else(|_| panic!("no option {name} on {origin}"))
+/// The depends entry a port origin is named by, in `bsd.port.mk`'s own shape.
+fn entry_for(origin: &str) -> String {
+    let name = origin.split('/').nth(1).unwrap_or(origin);
+    format!("lib{name}.so:{origin}")
 }
 
-/// An edge that applies only when `opt` on `from` is set.
-pub fn add_option_dep(conn: &Connection, from: &str, opt: &str, to: &str) {
-    add_option_dep_with(conn, from, opt, to, "RUN", "ON");
-}
-
-pub fn add_option_dep_with(
-    conn: &Connection,
-    from: &str,
-    opt: &str,
-    to: &str,
-    class: &str,
-    polarity: &str,
-) {
-    let from_id = add_port(conn, from);
-    let to_id = add_port(conn, to);
-    let opt_id = conn
-        .query_row(
-            "SELECT o.id FROM options o WHERE o.port_id = ?1 AND o.name = ?2",
-            rusqlite::params![from_id, opt],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or_else(|_| add_option(conn, from, opt, true, "", "DEFINE", ""));
-
-    conn.execute(
-        "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id, polarity)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![from_id, to_id, class, opt_id, polarity],
-    )
-    .unwrap();
-}
-
-/// An edge that applies whatever the options say.
-pub fn add_port_dep(conn: &Connection, from: &str, to: &str) {
-    add_port_dep_with(conn, from, to, "LIB");
-}
-
-pub fn add_port_dep_with(conn: &Connection, from: &str, to: &str, class: &str) {
-    let from_id = add_port(conn, from);
-    let to_id = add_port(conn, to);
-    conn.execute(
-        "INSERT INTO dep_edge (from_port_id, to_port_id, class, via_option_id)
-         VALUES (?1, ?2, ?3, NULL)",
-        rusqlite::params![from_id, to_id, class],
-    )
-    .unwrap();
-}
-
-pub fn add_implies(conn: &Connection, origin: &str, opt: &str, implies: &str) {
-    let id = option_id(conn, origin, opt);
-    conn.execute(
-        "INSERT OR REPLACE INTO option_implies (option_id, implies_name) VALUES (?1, ?2)",
-        rusqlite::params![id, implies],
-    )
-    .unwrap();
-}
-
-pub fn add_prevents(conn: &Connection, origin: &str, opt: &str, prevents: &str) {
-    let id = option_id(conn, origin, opt);
-    conn.execute(
-        "INSERT OR REPLACE INTO option_prevents (option_id, prevents_name) VALUES (?1, ?2)",
-        rusqlite::params![id, prevents],
-    )
-    .unwrap();
-}
-
-/// Sets the package name make would have reported.
-pub fn set_pkgname(conn: &Connection, origin: &str, pkgname: &str) {
-    add_port(conn, origin);
-    conn.execute(
-        "UPDATE ports SET pkgname = ?2 WHERE origin = ?1",
-        rusqlite::params![origin, pkgname],
-    )
-    .unwrap();
-}
-
-/// A port that exists in the tree but that `make` could not evaluate.
+/// A `make` that answers from a port's `.port` description.
 ///
-/// The indexer inserts a row for every directory so that edges have something
-/// to point at, and marks it resolved only once make has answered for it.
-pub fn add_unevaluated_port(conn: &Connection, origin: &str) {
-    conn.execute(
-        "INSERT OR REPLACE INTO ports (origin, pkgbase, pkgname, resolved)
-         VALUES (?1, '', '', 0)",
-        rusqlite::params![origin],
+/// Written out rather than mocked in-process because the resolver's contract is
+/// with a *program*: it builds a command line, runs it, and parses stdout. A
+/// fake that skipped the process would leave the argument construction — which
+/// is where `OPTIONS_OVERRIDE` lives — untested.
+pub fn stub_make(dir: &Path) -> PathBuf {
+    let awk = dir.join("stub-make.awk");
+    fs::write(&awk, STUB_AWK).unwrap();
+
+    let path = dir.join("stub-make");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             portdir=''; override=''; has_override=0\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in\n\
+             \x20   -C) shift; portdir=\"$1\" ;;\n\
+             \x20   OPTIONS_OVERRIDE=*) override=\"${{1#OPTIONS_OVERRIDE=}}\"; has_override=1 ;;\n\
+             \x20 esac\n\
+             \x20 shift\n\
+             done\n\
+             [ -f \"$portdir/.port\" ] || exit 1\n\
+             exec awk -v override=\"$override\" -v has_override=\"$has_override\" \
+             -f {awk} \"$portdir/.port\"\n",
+            awk = awk.display()
+        ),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
 }
+
+/// Turns a `.port` description into the reply `make -V` would print.
+///
+/// Mirrors the two things about `bsd.options.mk` that matter here: an option set
+/// with `OPTIONS_OVERRIDE` replaces the maintainer's defaults outright, and a
+/// set option's own `${opt}_${class}_DEPENDS` is folded into the port's
+/// `${class}_DEPENDS_ALL` as though it had been unconditional all along.
+const STUB_AWK: &str = r#"
+BEGIN { FS = "\t"; US = sprintf("%c", 31); RS_ = sprintf("%c", 30) }
+
+$1 == "pkgname"  { pkgname = $2 }
+$1 == "opt"      { n = ++nopt; oname[n] = $2; odef[n] = $3; otype[n] = $4; ogrp[n] = $5; odesc[n] = $6 }
+$1 == "implies"  { impl[$2] = impl[$2] " " $3 }
+$1 == "prevents" { prev[$2] = prev[$2] " " $3 }
+$1 == "dep"      { d = ++ndep; dclass[d] = $2; dentry[d] = $3 }
+$1 == "optdep"   { o = ++nod; odclass[o] = $2; odopt[o] = $3; odpol[o] = $4; odentry[o] = $5 }
+$1 == "hidden"   { h = ++nhid; hclass[h] = $2; hopt[h] = $3; hentry[h] = $4 }
+
+END {
+    # Which options are set: the override if one was given, else the defaults.
+    if (has_override == "1") {
+        split(override, want, " ")
+        for (i in want) if (want[i] != "") on[want[i]] = 1
+    } else {
+        for (i = 1; i <= nopt; i++) if (odef[i] == "1") on[oname[i]] = 1
+    }
+
+    names = ""; defaults = ""; desc = ""; implies = ""; prevents = ""
+    for (i = 1; i <= nopt; i++) {
+        names = names " " oname[i]
+        if (oname[i] in on) defaults = defaults " " oname[i]
+        desc = desc oname[i] US odesc[i] RS_
+        if (oname[i] in impl) implies = implies oname[i] US substr(impl[oname[i]], 2) RS_
+        if (oname[i] in prev) prevents = prevents oname[i] US substr(prev[oname[i]], 2) RS_
+        if (otype[i] != "DEFINE" && ogrp[i] != "") grp[otype[i] US ogrp[i]] = grp[otype[i] US ogrp[i]] " " oname[i]
+    }
+
+    print "PKGNAME" US pkgname
+    print "OPTIONS" US names
+    print "DEFAULTS" US defaults
+    print "DESC" US desc
+    print "IMPLIES" US implies
+    print "PREVENTS" US prevents
+
+    split("SINGLE MULTI RADIO GROUP", kinds, " ")
+    for (k in kinds) {
+        line = ""
+        for (key in grp) {
+            split(key, parts, US)
+            if (parts[1] == kinds[k]) line = line parts[2] US substr(grp[key], 2) RS_
+        }
+        print "GRP_" kinds[k] US line
+    }
+
+    split("PKG EXTRACT PATCH FETCH BUILD LIB RUN TEST", classes, " ")
+    for (c in classes) {
+        cl = classes[c]
+
+        # The port's own list, plus what bsd.options.mk folded into it: a set
+        # option's declared dependencies, and anything it contributes
+        # procedurally.
+        all = ""
+        for (i = 1; i <= ndep; i++) if (dclass[i] == cl) all = all " " dentry[i]
+        for (i = 1; i <= nod; i++) {
+            set = (odopt[i] in on)
+            if (odclass[i] == cl && ((odpol[i] == "ON" && set) || (odpol[i] == "OFF" && !set)))
+                all = all " " odentry[i]
+        }
+        for (i = 1; i <= nhid; i++)
+            if (hclass[i] == cl && (hopt[i] in on)) all = all " " hentry[i]
+        print "DEP_" cl US all
+
+        for (p = 1; p <= 2; p++) {
+            pol = (p == 1) ? "ON" : "OFF"
+            byopt = ""
+            for (i = 1; i <= nopt; i++) {
+                entries = ""
+                for (j = 1; j <= nod; j++)
+                    if (odclass[j] == cl && odopt[j] == oname[i] && odpol[j] == pol)
+                        entries = entries " " odentry[j]
+                if (entries != "") byopt = byopt oname[i] US substr(entries, 2) RS_
+            }
+            print "OPTDEP_" cl "_" pol US byopt
+        }
+    }
+}
+"#;
 
 // ------------------------------------------------------------ poudriere fixture
 //

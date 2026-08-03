@@ -1,6 +1,7 @@
+use crate::oracle::{Options, Oracle, Question};
 use crate::reader::SystemOptions;
+use crate::resolve::{OptionFacts, Polarity, PortFacts};
 use anyhow::{bail, Result};
-use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Row a `Shift + Down` should land on: the next sibling of `from`, or — when
@@ -167,10 +168,6 @@ pub struct SectionState {
     pub last_single_seq: u64,
 }
 
-/// One option as read from the cache: id, name, default state, description,
-/// group type and group name.
-type OptionRow = (i64, String, bool, String, String, String);
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OptionNode {
@@ -257,6 +254,13 @@ pub struct DependencyGraph {
     ///
     /// Indexed by position in `ports`; use [`DependencyGraph::is_live`].
     live: Vec<bool>,
+    /// Indices into `ports`, alphabetised by origin.
+    ///
+    /// The list reads as an index, but a port discovered mid-session — because
+    /// an option was turned on and make reported something new — has to be
+    /// appended, since every existing index would otherwise shift. So order is
+    /// kept here rather than in `ports` itself.
+    order: Vec<usize>,
     pub visible_rows: Vec<VisibleRow>,
     /// Port origin -> `PKGNAME`-ish label ("nginx-1.24.0"), for the header the
     /// ports framework writes into an options file. Only ever informational.
@@ -265,6 +269,13 @@ pub struct DependencyGraph {
     /// config file and is written back to it; members not in the current list
     /// are carried along untouched.
     pub groups: BTreeMap<String, Vec<String>>,
+    /// Leave out ports that define no options at all.
+    ///
+    /// A build set is mostly leaf libraries with nothing to decide; hiding them
+    /// leaves the list showing only what there is a choice about. Ports `make`
+    /// could not read are kept either way — they have no options *known*, which
+    /// is the one thing that must not be hidden.
+    pub hide_optionless: bool,
 
     pub global_mode: Mode,
     pub last_global_seq: u64,
@@ -272,20 +283,148 @@ pub struct DependencyGraph {
     pub search_query: String,
 }
 
-/// Everything read out of the database for one port before entries are built.
+/// Everything learned about one port before entries are built.
 struct Collected {
     resolved: bool,
-    options: Vec<OptionRow>,
+    /// Option metadata, from the evaluation *as the port ships* — the only one
+    /// whose `default_on` means what it says.
+    options: Vec<OptionFacts>,
     /// (option name, dependency origin, applies when the option is *off*)
     option_deps: Vec<(String, String, bool)>,
+    /// Pulled in whatever the options say, under the set actually in force.
     requires: Vec<String>,
-    implies: HashMap<String, Vec<String>>,
-    prevents: HashMap<String, Vec<String>>,
+    /// The state each option is in, which decides which `option_deps` apply.
+    states: HashMap<String, bool>,
+}
+
+impl Collected {
+    /// A port `make` could not read. It still exists and is still depended on,
+    /// so it is kept and marked rather than dropped — a silently optionless port
+    /// is indistinguishable from one that genuinely has none, which is the gap
+    /// this whole resolver exists to close.
+    fn unevaluated() -> Self {
+        Self {
+            resolved: false,
+            options: Vec::new(),
+            option_deps: Vec::new(),
+            requires: Vec::new(),
+            states: HashMap::new(),
+        }
+    }
+
+    /// The ports this one pulls in *as currently configured*.
+    ///
+    /// Only these are walked. A dependency behind an option that is off is not
+    /// part of the build, and evaluating it would cost a `make` run for a port
+    /// nothing is going to write — turning the option on re-resolves and finds
+    /// it then. Its name is still recorded, which is all a "not pulled in" row
+    /// needs.
+    fn dependencies(&self) -> Vec<String> {
+        let mut out = self.requires.clone();
+        for (opt, dep, applies_when_off) in &self.option_deps {
+            let on = self.states.get(opt).copied().unwrap_or(false);
+            if on != *applies_when_off {
+                out.push(dep.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+#[cfg(test)]
+impl DependencyGraph {
+    /// Builds a graph straight from a set of facts, without a ports tree.
+    ///
+    /// For tests whose subject is the interface rather than resolution: they
+    /// need a list with ports and options in it, not a `make` to produce one.
+    /// Resolution itself is covered against a real stub tree in
+    /// `tests/integration_tests.rs`.
+    pub(crate) fn from_facts(
+        facts: &[PortFacts],
+        requested: &[&str],
+        sys_opts: &SystemOptions,
+    ) -> Self {
+        let mut graph = Self {
+            root_origin: requested.join(", "),
+            ports: Vec::new(),
+            option_nodes: Vec::new(),
+            by_origin: HashMap::new(),
+            live: Vec::new(),
+            order: Vec::new(),
+            visible_rows: Vec::new(),
+            pkg_names: HashMap::new(),
+            groups: BTreeMap::new(),
+            hide_optionless: false,
+            global_mode: Mode::None,
+            last_global_seq: 0,
+            current_seq: 0,
+            search_query: String::new(),
+        };
+
+        for f in facts {
+            graph.add_port(f, sys_opts);
+        }
+        for f in facts {
+            graph.apply_resolution(&f.origin, f);
+        }
+        for origin in requested {
+            if let Some(id) = graph.port_index(origin) {
+                graph.ports[id].provenance = Provenance::Requested;
+                graph.ports[id].is_expanded = true;
+            }
+        }
+
+        graph.settle_batch();
+        graph.rebuild_visible_rows();
+        graph
+    }
+}
+
+/// Matches a glob pattern against a port origin.
+///
+/// `*` spans anything including `/`, so `www/py-*` and `*postgres*` both work,
+/// and `?` is one character. Applied to the tree listing rather than handed to
+/// SQLite, now that there is no table of ports to run `GLOB` against.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    // Iterative rather than recursive: `star` remembers where the last `*` was,
+    // so a mismatch backtracks to just after what that `*` had consumed instead
+    // of unwinding a call stack.
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut resume) = (None, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            resume = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 impl DependencyGraph {
-    pub fn load_from_db(
-        conn: &Connection,
+    /// Builds the list by asking the tree, starting from whatever `patterns`
+    /// name.
+    ///
+    /// A pattern without a metacharacter is taken at its word rather than
+    /// matched against the tree listing, so naming one port does not cost a walk
+    /// of 34,954 directories.
+    pub fn resolve(
+        oracle: &Oracle,
         patterns: &[String],
         sys_opts: &SystemOptions,
         ignore_missing: bool,
@@ -294,32 +433,34 @@ impl DependencyGraph {
         let mut seen = HashSet::new();
         let mut unmatched_patterns = Vec::new();
 
-        // 1. Resolve origins/patterns using SQLite GLOB with LIKE fallback
+        let needs_listing = patterns
+            .iter()
+            .any(|p| p.contains('*') || p.contains('?') || p.contains('['));
+        let listing = if needs_listing {
+            oracle.enumerate().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         for pat in patterns {
             let mut matched = false;
 
-            let mut stmt =
-                conn.prepare("SELECT origin FROM ports WHERE origin GLOB ?1 ORDER BY origin")?;
-            let rows = stmt.query_map(params![pat], |row| row.get::<_, String>(0))?;
-
-            for origin in rows.flatten() {
-                matched = true;
-                if seen.insert(origin.clone()) {
-                    resolved_origins.push(origin);
-                }
-            }
-
-            if !matched {
-                let like_pat = pat.replace('*', "%").replace('?', "_");
-                let mut stmt_like =
-                    conn.prepare("SELECT origin FROM ports WHERE origin LIKE ?1 ORDER BY origin")?;
-                let rows_like =
-                    stmt_like.query_map(params![like_pat], |row| row.get::<_, String>(0))?;
-                for origin in rows_like.flatten() {
+            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                for origin in listing.iter().filter(|o| glob_matches(pat, o)) {
                     matched = true;
                     if seen.insert(origin.clone()) {
-                        resolved_origins.push(origin);
+                        resolved_origins.push(origin.clone());
                     }
+                }
+            } else if oracle.ports_dir().join(pat).join("Makefile").is_file()
+                || !oracle.tree_readable()
+            {
+                // Without a tree there is nothing to check the name against, so
+                // it is taken as given and fails later if the memo has never
+                // heard of it — with a message that says so.
+                matched = true;
+                if seen.insert(pat.clone()) {
+                    resolved_origins.push(pat.clone());
                 }
             }
 
@@ -328,15 +469,14 @@ impl DependencyGraph {
             }
         }
 
-        // Always fail if 0 total ports were matched, regardless of ignore_missing
         if resolved_origins.is_empty() {
             bail!(
-            "No matching ports found for pattern(s): '{}'. Run 'bgone index' to index your ports tree.",
-            patterns.join("', '")
-        );
+                "No matching ports found for pattern(s): '{}' under {}",
+                patterns.join("', '"),
+                oracle.ports_dir().display()
+            );
         }
 
-        // Handle unmatched patterns when at least 1 total port resolved
         if !unmatched_patterns.is_empty() {
             if ignore_missing {
                 eprintln!(
@@ -345,11 +485,14 @@ impl DependencyGraph {
                 );
             } else {
                 bail!(
-                "No matching ports found for pattern(s): '{}'. Run 'bgone index' to index your ports tree.",
-                unmatched_patterns.join("', '")
-            );
+                    "No matching ports found for pattern(s): '{}' under {}",
+                    unmatched_patterns.join("', '"),
+                    oracle.ports_dir().display()
+                );
             }
         }
+
+        resolved_origins.sort();
 
         let header_title = if resolved_origins.len() == 1 {
             resolved_origins[0].clone()
@@ -367,16 +510,45 @@ impl DependencyGraph {
             option_nodes: Vec::new(),
             by_origin: HashMap::new(),
             live: Vec::new(),
+            order: Vec::new(),
             visible_rows: Vec::new(),
             pkg_names: HashMap::new(),
             groups: BTreeMap::new(),
+            hide_optionless: false,
             global_mode: Mode::None,
             last_global_seq: 0,
             current_seq: 0,
             search_query: String::new(),
         };
 
-        graph.load_ports(conn, &resolved_origins, sys_opts)?;
+        let failures = graph.load_ports(oracle, &resolved_origins, sys_opts)?;
+
+        // One port among many that make could not read is a real port with
+        // unknown options, and the list says so about it. *Every* named port
+        // failing is a different thing — the tree is wrong, or unreachable, or
+        // the names are — and continuing would show an empty list with no
+        // explanation. So the first reason is reported instead of swallowed.
+        let all_unread = resolved_origins.iter().all(|o| {
+            graph
+                .port_index(o)
+                .map(|id| !graph.ports[id].resolved)
+                .unwrap_or(true)
+        });
+        if all_unread {
+            match failures.first() {
+                Some((_, why)) => bail!(
+                    "Could not evaluate any of '{}' under {}: {}",
+                    patterns.join("', '"),
+                    oracle.ports_dir().display(),
+                    why
+                ),
+                None => bail!(
+                    "No matching ports found for pattern(s): '{}' under {}",
+                    patterns.join("', '"),
+                    oracle.ports_dir().display()
+                ),
+            }
+        }
 
         graph.recompute_live_set();
         graph.rebuild_visible_rows();
@@ -393,142 +565,64 @@ impl DependencyGraph {
     /// call stack.
     fn load_ports(
         &mut self,
-        conn: &Connection,
+        oracle: &Oracle,
         roots: &[String],
         sys_opts: &SystemOptions,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
+        let mut failures: Vec<(String, String)> = Vec::new();
         let requested: HashSet<&str> = roots.iter().map(|s| s.as_str()).collect();
 
         let mut collected: HashMap<String, Collected> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut level: Vec<String> = Vec::new();
 
         for origin in roots {
             if seen.insert(origin.clone()) {
-                queue.push_back(origin.clone());
+                level.push(origin.clone());
             }
         }
 
-        while let Some(origin) = queue.pop_front() {
-            let resolved: bool = conn
-                .query_row(
-                    "SELECT resolved FROM ports WHERE origin = ?1",
-                    params![origin],
-                    |row| row.get::<_, i32>(0),
-                )
-                .map(|v| v == 1)
-                .unwrap_or(false);
+        // Level by level rather than one port at a time: a port's dependencies
+        // are not known until it has been evaluated, so the walk cannot run
+        // ahead of itself — but everything at the same distance from the roots
+        // is independent, and evaluating a level takes as long as its slowest
+        // port rather than the sum of them.
+        while !level.is_empty() {
+            let answers = oracle.facts_many(
+                &level
+                    .iter()
+                    .map(|o| (o.clone(), Options::AsShipped))
+                    .collect::<Vec<_>>(),
+            );
 
-            let mut stmt = conn.prepare(
-                "SELECT o.id, o.name, o.default_on, o.description, o.group_type, o.group_name
-                 FROM options o JOIN ports p ON p.id = o.port_id
-                 WHERE p.origin = ?1 ORDER BY o.name",
-            )?;
-            let options: Vec<OptionRow> = stmt
-                .query_map(params![origin], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i32>(2)? == 1,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+            let mut next: Vec<String> = Vec::new();
+            for (origin, answer) in answers {
+                let facts = match answer {
+                    Ok(facts) => facts,
+                    Err(e) => {
+                        // A port make could not read still exists and is still
+                        // depended on. It is recorded as unevaluated so the list
+                        // can say so, rather than quietly showing a port with no
+                        // options — but the reason is kept, because "no options"
+                        // and "could not ask" are different problems.
+                        failures.push((origin.clone(), e.to_string()));
+                        collected.insert(origin, Collected::unevaluated());
+                        continue;
+                    }
+                };
 
-            // Option-conditional edges, both polarities in one pass. An `_OFF`
-            // edge is followed when its option is *unset*, so both have to be
-            // walked here even though only one applies at a time — which of
-            // them applies is decided later, by `recompute_live_set`.
-            let mut option_deps = Vec::new();
-            {
-                let mut dep_stmt = conn.prepare(
-                    "SELECT DISTINCT t.origin, e.polarity FROM dep_edge e
-                     JOIN ports t ON t.id = e.to_port_id
-                     WHERE e.via_option_id = ?1 ORDER BY t.origin",
-                )?;
-                for (option_id, opt_name, ..) in &options {
-                    let rows: Vec<(String, String)> = dep_stmt
-                        .query_map(params![option_id], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    for (dep, polarity) in rows {
-                        if seen.insert(dep.clone()) {
-                            queue.push_back(dep.clone());
-                        }
-                        option_deps.push((opt_name.clone(), dep, polarity == "OFF"));
+                let entry = self.collect_port(oracle, &facts, sys_opts)?;
+                for dep in entry.dependencies() {
+                    if seen.insert(dep.clone()) {
+                        next.push(dep);
                     }
                 }
-            }
-
-            let mut implies: HashMap<String, Vec<String>> = HashMap::new();
-            let mut prevents: HashMap<String, Vec<String>> = HashMap::new();
-            {
-                let mut imp = conn.prepare(
-                    "SELECT o.name, i.implies_name FROM option_implies i
-                     JOIN options o ON o.id = i.option_id
-                     JOIN ports p ON p.id = o.port_id WHERE p.origin = ?1",
-                )?;
-                for row in imp
-                    .query_map(params![origin], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .flatten()
-                {
-                    implies.entry(row.0).or_default().push(row.1);
+                if !facts.pkgname.trim().is_empty() {
+                    self.pkg_names.insert(origin.clone(), facts.pkgname.clone());
                 }
-                let mut prv = conn.prepare(
-                    "SELECT o.name, x.prevents_name FROM option_prevents x
-                     JOIN options o ON o.id = x.option_id
-                     JOIN ports p ON p.id = o.port_id WHERE p.origin = ?1",
-                )?;
-                for row in prv
-                    .query_map(params![origin], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .flatten()
-                {
-                    prevents.entry(row.0).or_default().push(row.1);
-                }
+                collected.insert(origin, entry);
             }
-
-            let requires: Vec<String> = {
-                let mut req_stmt = conn.prepare(
-                    "SELECT DISTINCT t.origin FROM dep_edge e
-                     JOIN ports f ON f.id = e.from_port_id
-                     JOIN ports t ON t.id = e.to_port_id
-                     WHERE f.origin = ?1 AND e.via_option_id IS NULL
-                     ORDER BY t.origin",
-                )?;
-                let rows: Vec<String> = req_stmt
-                    .query_map(params![origin], |row| row.get::<_, String>(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                rows
-            };
-            for dep in &requires {
-                if seen.insert(dep.clone()) {
-                    queue.push_back(dep.clone());
-                }
-            }
-
-            self.record_pkg_name(conn, &origin)?;
-
-            collected.insert(
-                origin,
-                Collected {
-                    resolved,
-                    options,
-                    option_deps,
-                    requires,
-                    implies,
-                    prevents,
-                },
-            );
+            level = next;
         }
 
         // Alphabetised, so the list reads as an index rather than a walk order
@@ -540,26 +634,49 @@ impl DependencyGraph {
         }
 
         for origin in &origins {
-            let entry = collected.remove(origin).expect("origin was just listed");
+            let mut entry = collected.remove(origin).expect("origin was just listed");
             let port_id = self.ports.len();
 
+            // Options come out of the cache in name order, which scatters a
+            // category's members through the list — an OPTIONS_SINGLE whose two
+            // choices sit ten rows apart reads as two unrelated switches rather
+            // than as a choice between them. Ungrouped options first, then each
+            // category whole, so the `<group>` badge marks a run rather than an
+            // isolated row.
+            entry.options.sort_by(|a, b| {
+                let key = |o: &OptionFacts| {
+                    (
+                        !o.group_name.is_empty(),
+                        o.group_name.clone(),
+                        o.group_type.clone(),
+                        o.name.clone(),
+                    )
+                };
+                key(a).cmp(&key(b))
+            });
+
             let mut option_ids = Vec::new();
-            for (_, opt_name, default_state, description, group_type, group_name) in entry.options {
-                let initial_enabled = sys_opts.get_state(origin, &opt_name, default_state);
+            for opt in entry.options {
+                let initial_enabled = entry
+                    .states
+                    .get(&opt.name)
+                    .copied()
+                    .unwrap_or(opt.default_on);
 
                 let by_polarity = |off: bool| -> Vec<String> {
                     entry
                         .option_deps
                         .iter()
-                        .filter(|(name, _, is_off)| name == &opt_name && *is_off == off)
+                        .filter(|(name, _, is_off)| name == &opt.name && *is_off == off)
                         .map(|(_, dep, _)| dep.clone())
                         .collect()
                 };
                 let dep_origins = by_polarity(false);
                 let dep_origins_off = by_polarity(true);
 
-                // Every dependency was queued during the walk, so it is in
-                // by_origin, which was fully populated before this loop.
+                // A dependency behind an option that is off was never walked, so
+                // it has no index — which is exactly right: it is not in the
+                // build, and turning the option on re-resolves and finds it.
                 let resolve_idx = |origins: &[String]| -> Vec<usize> {
                     origins
                         .iter()
@@ -573,12 +690,12 @@ impl DependencyGraph {
                 self.option_nodes.push(OptionNode {
                     id: opt_id,
                     port_origin: origin.clone(),
-                    name: opt_name.clone(),
-                    description,
+                    name: opt.name.clone(),
+                    description: opt.description,
                     enabled: initial_enabled,
                     initial_enabled,
-                    group_type,
-                    group_name,
+                    group_type: opt.group_type,
+                    group_name: opt.group_name,
                     is_expanded: false,
                     last_single_seq: 0,
                     subtree_seq: 0,
@@ -588,8 +705,8 @@ impl DependencyGraph {
                     dep_origins_off,
                     dep_idx,
                     dep_idx_off,
-                    implies: entry.implies.get(&opt_name).cloned().unwrap_or_default(),
-                    prevents: entry.prevents.get(&opt_name).cloned().unwrap_or_default(),
+                    implies: opt.implies,
+                    prevents: opt.prevents,
                 });
                 option_ids.push(opt_id);
             }
@@ -626,8 +743,344 @@ impl DependencyGraph {
             });
         }
 
+        self.reindex();
+        Ok(failures)
+    }
+
+    /// Recomputes everything derived from the set of ports: the alphabetical
+    /// order, the origin-to-index resolutions, and the inverted edges.
+    ///
+    /// Called whenever the shape of the graph changes — which now happens
+    /// mid-session, because turning an option on can make make report a
+    /// dependency nothing had heard of.
+    fn reindex(&mut self) {
+        self.order = (0..self.ports.len()).collect();
+        self.order
+            .sort_by(|&a, &b| self.ports[a].origin.cmp(&self.ports[b].origin));
+
+        let of = |origins: &[String], by: &HashMap<String, usize>| -> Vec<usize> {
+            origins.iter().filter_map(|d| by.get(d).copied()).collect()
+        };
+
+        for i in 0..self.ports.len() {
+            let requires = self.ports[i].requires.clone();
+            self.ports[i].requires_idx = of(&requires, &self.by_origin);
+        }
+        for i in 0..self.option_nodes.len() {
+            let on = self.option_nodes[i].dep_origins.clone();
+            let off = self.option_nodes[i].dep_origins_off.clone();
+            self.option_nodes[i].dep_idx = of(&on, &self.by_origin);
+            self.option_nodes[i].dep_idx_off = of(&off, &self.by_origin);
+        }
+
         self.build_required_by();
-        Ok(())
+    }
+
+    /// The options currently set on a port, which is the question to ask make
+    /// about it.
+    pub fn option_set(&self, port_id: usize) -> Vec<String> {
+        self.ports[port_id]
+            .options
+            .iter()
+            .filter(|&&id| self.option_nodes[id].enabled)
+            .map(|&id| self.option_nodes[id].name.clone())
+            .collect()
+    }
+
+    /// Records what make said a port depends on under the options now set, and
+    /// reports the origins that answer mentions which the graph has never seen.
+    ///
+    /// Does *not* reindex or recompute reachability: both are O(the whole
+    /// graph), and a settle applies hundreds of these in a row. The caller does
+    /// it once per batch instead — [`settle_batch`](Self::settle_batch).
+    ///
+    /// This is what closes the gap a single evaluation leaves. A dependency
+    /// added by `${opt}_USES` or an `.if ${PORT_OPTIONS:MFOO}` block does not
+    /// exist until the option is set, so it cannot have been walked in advance —
+    /// it arrives here, when the option is turned on and the port is asked
+    /// again.
+    pub fn apply_resolution(&mut self, origin: &str, facts: &PortFacts) -> Vec<String> {
+        let Some(port_id) = self.port_index(origin) else {
+            return Vec::new();
+        };
+
+        let mut requires: Vec<String> = facts
+            .deps
+            .iter()
+            .filter(|d| d.via_option.is_none())
+            .map(|d| d.origin.clone())
+            .collect();
+        requires.sort();
+        requires.dedup();
+        self.ports[port_id].requires = requires;
+        self.ports[port_id].resolved = true;
+
+        for &opt_id in &self.ports[port_id].options.clone() {
+            let name = self.option_nodes[opt_id].name.clone();
+            let by_polarity = |off: bool| -> Vec<String> {
+                let mut out: Vec<String> = facts
+                    .deps
+                    .iter()
+                    .filter(|d| {
+                        d.via_option.as_deref() == Some(name.as_str())
+                            && (d.polarity == Polarity::Off) == off
+                    })
+                    .map(|d| d.origin.clone())
+                    .collect();
+                out.sort();
+                out.dedup();
+                out
+            };
+            self.option_nodes[opt_id].dep_origins = by_polarity(false);
+            self.option_nodes[opt_id].dep_origins_off = by_polarity(true);
+        }
+
+        // Only what is actually pulled in is worth chasing. A dependency behind
+        // an option that is off is not in the build, and asking make about it
+        // would cost an evaluation for a port nothing is going to write.
+        let mut wanted: Vec<String> = self.ports[port_id].requires.clone();
+        for &opt_id in &self.ports[port_id].options {
+            let opt = &self.option_nodes[opt_id];
+            let deps = if opt.enabled {
+                &opt.dep_origins
+            } else {
+                &opt.dep_origins_off
+            };
+            wanted.extend(deps.iter().cloned());
+        }
+
+        let mut unknown: Vec<String> = wanted
+            .into_iter()
+            .filter(|o| !self.by_origin.contains_key(o))
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        unknown
+    }
+
+    /// Asks the tree about every port in `origins` under the options now set,
+    /// folds the answers in, and keeps going until nothing new turns up.
+    ///
+    /// Returns the ports that arrived, which are the ones that were not in the
+    /// build until this ran.
+    ///
+    /// The interface does the same thing a batch at a time off the event loop,
+    /// so a keystroke is never waiting on `make`; this is the blocking form, for
+    /// the places that need the graph settled before they can act on it — saving,
+    /// above all, since what gets written is exactly what is in the build.
+    pub fn resettle(
+        &mut self,
+        oracle: &Oracle,
+        sys_opts: &SystemOptions,
+        origins: &[String],
+    ) -> Vec<String> {
+        let mut arrived = Vec::new();
+        let mut asking: Vec<Question> = origins
+            .iter()
+            .filter_map(|o| {
+                self.port_index(o)
+                    .map(|id| (o.clone(), Options::Exactly(self.option_set(id))))
+            })
+            .collect();
+        let mut asked: HashSet<String> = HashSet::new();
+
+        while !asking.is_empty() {
+            for (origin, _) in &asking {
+                asked.insert(origin.clone());
+            }
+            let answers = oracle.facts_many(&asking);
+            let mut next: Vec<Question> = Vec::new();
+
+            for (origin, answer) in answers {
+                let Ok(facts) = answer else { continue };
+                if self.port_index(&origin).is_none() {
+                    self.add_port(&facts, sys_opts);
+                    arrived.push(origin.clone());
+                }
+                for unknown in self.apply_resolution(&origin, &facts) {
+                    if asked.insert(unknown.clone()) {
+                        // Asked as the port ships: nothing is known about its
+                        // options yet, and what they default to is part of the
+                        // answer.
+                        next.push((unknown, Options::AsShipped));
+                    }
+                }
+            }
+            self.settle_batch();
+            asking = next;
+        }
+
+        self.rebuild_visible_rows();
+        arrived
+    }
+
+    /// Adds a port the walk had not reached, with its options set the way the
+    /// user's saved configuration says.
+    ///
+    /// Appended rather than inserted in place: every `requires_idx`, `dep_idx`
+    /// and `parent_port` is an index into `ports`, so inserting would silently
+    /// renumber all of them. `order` carries the alphabetical reading instead.
+    pub fn add_port(&mut self, facts: &PortFacts, sys_opts: &SystemOptions) -> usize {
+        if let Some(existing) = self.port_index(&facts.origin) {
+            return existing;
+        }
+
+        let port_id = self.ports.len();
+        let mut options = facts.options.clone();
+        options.sort_by(|a, b| {
+            let key = |o: &OptionFacts| {
+                (
+                    !o.group_name.is_empty(),
+                    o.group_name.clone(),
+                    o.group_type.clone(),
+                    o.name.clone(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+
+        let mut option_ids = Vec::new();
+        for opt in options {
+            let enabled = sys_opts.get_state(&facts.origin, &opt.name, opt.default_on);
+            let opt_id = self.option_nodes.len();
+            self.option_nodes.push(OptionNode {
+                id: opt_id,
+                port_origin: facts.origin.clone(),
+                name: opt.name,
+                description: opt.description,
+                enabled,
+                initial_enabled: enabled,
+                group_type: opt.group_type,
+                group_name: opt.group_name,
+                is_expanded: false,
+                last_single_seq: 0,
+                subtree_seq: 0,
+                subtree_mode: Mode::None,
+                parent_port: port_id,
+                dep_origins: Vec::new(),
+                dep_origins_off: Vec::new(),
+                dep_idx: Vec::new(),
+                dep_idx_off: Vec::new(),
+                implies: opt.implies,
+                prevents: opt.prevents,
+            });
+            option_ids.push(opt_id);
+        }
+
+        self.ports.push(PortEntry {
+            id: port_id,
+            origin: facts.origin.clone(),
+            provenance: Provenance::Dependency,
+            resolved: true,
+            options: option_ids,
+            requires: Vec::new(),
+            requires_idx: Vec::new(),
+            required_by: Vec::new(),
+            is_expanded: false,
+            last_single_seq: 0,
+            subtree_seq: 0,
+            subtree_mode: Mode::None,
+            requires_section: SectionState::default(),
+            required_by_section: SectionState::default(),
+        });
+        self.by_origin.insert(facts.origin.clone(), port_id);
+        if !facts.pkgname.trim().is_empty() {
+            self.pkg_names
+                .insert(facts.origin.clone(), facts.pkgname.clone());
+        }
+        self.live.push(false);
+        port_id
+    }
+
+    /// Puts the graph back in order after a run of `add_port`/`apply_resolution`.
+    ///
+    /// Kept separate from those two because it walks every port and every
+    /// option: doing it per answer made settling 940 ports take four seconds of
+    /// pure bookkeeping, against a few hundred milliseconds of actual lookups.
+    pub fn settle_batch(&mut self) {
+        self.reindex();
+        self.recompute_live_set();
+    }
+
+    /// Turns one port's evaluation into an entry, re-evaluating it under the
+    /// options actually in force when those differ from the maintainer's.
+    ///
+    /// This second evaluation is the whole point of asking the tree at all.
+    /// `bsd.options.mk` lets a port express a dependency two ways: declaratively,
+    /// as `MPI_LIB_DEPENDS`, which any single evaluation reports; and
+    /// procedurally, as `MYSQL_USES=mysql` or an `.if ${PORT_OPTIONS:MFOO}`
+    /// block, which produces nothing at all unless the option is set *while make
+    /// is reading the Makefile*. `mail/sqlgrey` pulls in a MySQL client only the
+    /// second way. No one evaluation can describe a port under every set of
+    /// options, so the set in force is asked about directly.
+    fn collect_port(
+        &self,
+        oracle: &Oracle,
+        shipped: &PortFacts,
+        sys_opts: &SystemOptions,
+    ) -> Result<Collected> {
+        // What the options are actually set to: the maintainer's defaults, with
+        // the user's saved choices laid over them.
+        let states: HashMap<String, bool> = shipped
+            .options
+            .iter()
+            .map(|opt| {
+                let state = sys_opts.get_state(&shipped.origin, &opt.name, opt.default_on);
+                (opt.name.clone(), state)
+            })
+            .collect();
+
+        let in_force: Vec<String> = shipped
+            .options
+            .iter()
+            .filter(|opt| states.get(&opt.name).copied().unwrap_or(false))
+            .map(|opt| opt.name.clone())
+            .collect();
+        let as_shipped: Vec<String> = shipped
+            .options
+            .iter()
+            .filter(|opt| opt.default_on)
+            .map(|opt| opt.name.clone())
+            .collect();
+
+        // Nothing has been changed away from the defaults, so the evaluation
+        // already in hand is the one that applies.
+        let effective = if in_force == as_shipped {
+            None
+        } else {
+            Some(oracle.facts(&shipped.origin, &Options::Exactly(in_force))?)
+        };
+        let deps = &effective.as_ref().unwrap_or(shipped).deps;
+
+        let mut requires: Vec<String> = deps
+            .iter()
+            .filter(|d| d.via_option.is_none())
+            .map(|d| d.origin.clone())
+            .collect();
+        requires.sort();
+        requires.dedup();
+
+        let mut option_deps: Vec<(String, String, bool)> = deps
+            .iter()
+            .filter_map(|d| {
+                d.via_option
+                    .as_ref()
+                    .map(|opt| (opt.clone(), d.origin.clone(), d.polarity == Polarity::Off))
+            })
+            .collect();
+        option_deps.sort();
+        option_deps.dedup();
+
+        Ok(Collected {
+            resolved: true,
+            // Metadata from the as-shipped evaluation: under an override,
+            // `PORT_OPTIONS` is whatever was forced, so `default_on` would
+            // report the choice back to us as though it were the default.
+            options: shipped.options.clone(),
+            option_deps,
+            requires,
+            states,
+        })
     }
 
     /// Inverts every forward edge so each port can show what pulls it in.
@@ -660,36 +1113,26 @@ impl DependencyGraph {
                         .then_with(|| a.via_option.cmp(&b.via_option))
                 });
                 entries.dedup();
+
+                // A parent that needs this port whatever its options say needs
+                // it, full stop; saying so again for each option it also names
+                // listed the same parent twice, once plainly and once in the
+                // colour that means "only while this option is on" — which is
+                // not true of it. `None` sorts before `Some`, so the
+                // unconditional entry is the one already in hand.
+                let mut unconditional = String::new();
+                entries.retain(|e| {
+                    if e.via_option.is_none() {
+                        unconditional.clear();
+                        unconditional.push_str(&e.origin);
+                        return true;
+                    }
+                    e.origin != unconditional
+                });
+
                 port.required_by = entries;
             }
         }
-    }
-
-    /// Records the package name the options-file header carries.
-    ///
-    /// `PKGNAME` now comes straight from the cache, where make put it, so there
-    /// is nothing left to reconstruct. The old version stitched one together
-    /// from PORTNAME and PORTVERSION when the tree had not been read, which was
-    /// wrong for 88% of ports — no PORTREVISION, no PORTEPOCH, and no
-    /// USES-synthesised prefix like `py312-`.
-    fn record_pkg_name(&mut self, conn: &Connection, origin: &str) -> Result<()> {
-        if self.pkg_names.contains_key(origin) {
-            return Ok(());
-        }
-
-        let pkg_name: Option<String> = conn
-            .query_row(
-                "SELECT pkgname FROM ports WHERE origin = ?1",
-                params![origin],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .filter(|n| !n.trim().is_empty());
-
-        if let Some(pkg_name) = pkg_name {
-            self.pkg_names.insert(origin.to_string(), pkg_name);
-        }
-        Ok(())
     }
 
     /// Ports named on the command line, in list order. These are the roots of
@@ -718,6 +1161,20 @@ impl DependencyGraph {
         self.port_index(origin)
             .map(|i| self.live[i])
             .unwrap_or(false)
+    }
+
+    /// A port with nothing to decide about it: it defines no options, and `make`
+    /// read it successfully, so that is the whole truth rather than a gap.
+    fn is_optionless(&self, port_id: usize) -> bool {
+        let port = &self.ports[port_id];
+        port.options.is_empty() && port.resolved
+    }
+
+    /// Live ports that [`hide_optionless`](Self::hide_optionless) would leave out.
+    pub fn optionless_count(&self) -> usize {
+        (0..self.ports.len())
+            .filter(|&id| self.live[id] && self.is_optionless(id))
+            .count()
     }
 
     /// How many ports the list is actually showing, which a search narrows.
@@ -849,6 +1306,21 @@ impl DependencyGraph {
 
     /// True when any option differs from the state it was loaded with. Toggling
     /// an option back to where it started clears this again.
+    /// Ports whose options have been changed this session.
+    ///
+    /// These are the ones whose dependencies may no longer be what the graph
+    /// says, so they are where a settle has to start.
+    pub fn changed_ports(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .real_options()
+            .filter(|opt| opt.enabled != opt.initial_enabled)
+            .map(|opt| opt.port_origin.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// True when any option on a port that will actually be written differs from
     /// the state it was loaded with. Edits to a port nothing pulls in any more
     /// are not saved, so they must not raise the unsaved-changes prompt either.
@@ -987,7 +1459,14 @@ impl DependencyGraph {
         self.set_node_expanded(row_index, false);
     }
 
-    pub fn toggle_option(&mut self, row_index: usize) {
+    /// Turns the option under the cursor on or off, reporting every port whose
+    /// options that changed — the one under the cursor, and any grouped with it.
+    ///
+    /// The callers need that list because a changed option set is a different
+    /// question to ask make: what a port depends on is not derivable from what
+    /// is already known about it.
+    pub fn toggle_option(&mut self, row_index: usize) -> Vec<String> {
+        let mut touched = Vec::new();
         if let Some(row) = self.visible_rows.get(row_index) {
             if let NodeId::Option(id) = row.node_id {
                 let (origin, name, group_type, current_enabled) = {
@@ -1000,17 +1479,19 @@ impl DependencyGraph {
                     )
                 };
 
-                // Radios only ever turn on; the rest of the group turns off in
-                // response. Pressing one that is already on does nothing.
-                let is_radio = group_type == "SINGLE" || group_type == "RADIO";
-                if !(is_radio && current_enabled) {
-                    self.apply_choice(&origin, &name, !current_enabled || is_radio);
+                // `OPTIONS_SINGLE` must have exactly one member set, so pressing
+                // the one already on does nothing — there is nothing to fall
+                // back to. `OPTIONS_RADIO` is the optional form, zero or one,
+                // and `bsddialog` lets you clear it; so does this.
+                if !(group_type == "SINGLE" && current_enabled) {
+                    touched = self.apply_choice(&origin, &name, !current_enabled);
                 }
             }
         }
         // An option change can add or strand whole subtrees
         self.recompute_live_set();
         self.rebuild_visible_rows();
+        touched
     }
 
     /// Records a choice the user made, on the port they made it on and on every
@@ -1020,7 +1501,10 @@ impl DependencyGraph {
     /// be configured alike and drift apart when maintained by hand, so a choice
     /// made on one member is a choice made on all of them. A member that has no
     /// option by that name is left alone rather than guessed at.
-    pub fn apply_choice(&mut self, origin: &str, name: &str, enabled: bool) {
+    ///
+    /// Returns the ports in the current list whose options this actually
+    /// changed, which is what has to be asked about again.
+    pub fn apply_choice(&mut self, origin: &str, name: &str, enabled: bool) -> Vec<String> {
         let mut targets = vec![origin.to_string()];
         for members in self.groups.values() {
             if members.iter().any(|m| m == origin) {
@@ -1032,13 +1516,73 @@ impl DependencyGraph {
             }
         }
 
+        let mut touched = Vec::new();
         for target in targets {
             // Members outside the current list keep whatever they had; the group
             // still names them, and they will follow along when next loaded.
             if let Some(port_id) = self.port_index(&target) {
                 self.set_choice_on(port_id, name, enabled);
+                touched.push(target);
             }
         }
+        touched
+    }
+
+    /// Brings a port that has just joined `group` into line with the members
+    /// already in it, reporting how many options it took on.
+    ///
+    /// Joining a group is a statement that this port should be configured like
+    /// its siblings, so it adopts their choices rather than waiting for the next
+    /// toggle to reach it — which would otherwise leave the group claiming to be
+    /// in step while its newest member disagreed with all of it.
+    ///
+    /// The first member of a group has nobody to copy, so this does nothing. A
+    /// name the joining port does not define is skipped, and one it defines that
+    /// nobody else does is left as it was: a group is a set of ports that
+    /// *overlap*, not one that matches.
+    pub fn adopt_group_options(&mut self, group: &str, origin: &str) -> usize {
+        let Some(target_id) = self.port_index(origin) else {
+            return 0;
+        };
+        // Whichever member is listed first and is actually in front of us. The
+        // members are meant to agree, so any of them answers the question.
+        let Some(source_id) = self
+            .groups
+            .get(group)
+            .into_iter()
+            .flatten()
+            .filter(|m| m.as_str() != origin)
+            .find_map(|m| self.port_index(m))
+        else {
+            return 0;
+        };
+
+        let source: Vec<(String, bool)> = self.ports[source_id]
+            .options
+            .iter()
+            .map(|&id| {
+                let opt = &self.option_nodes[id];
+                (opt.name.clone(), opt.enabled)
+            })
+            .collect();
+
+        // Assigned rather than pushed through `set_choice_on`, because the
+        // source port is already internally consistent: replaying its choices
+        // one at a time would let each radio pick undo the one before it.
+        let mut adopted = 0;
+        for &opt_id in &self.ports[target_id].options.clone() {
+            let name = self.option_nodes[opt_id].name.clone();
+            if let Some((_, enabled)) = source.iter().find(|(n, _)| *n == name) {
+                if self.option_nodes[opt_id].enabled != *enabled {
+                    adopted += 1;
+                }
+                self.option_nodes[opt_id].enabled = *enabled;
+            }
+        }
+
+        self.recompute_live_set();
+        self.rebuild_visible_rows();
+        adopted
     }
 
     /// Applies a choice to one port, resolved against *that* port's own option
@@ -1060,6 +1604,11 @@ impl DependencyGraph {
 
         if group_type == "SINGLE" || group_type == "RADIO" {
             if !enabled {
+                // A SINGLE has to keep one member set, so there is nothing to
+                // do; a RADIO may have none, and clears.
+                if group_type == "RADIO" {
+                    self.option_nodes[opt_id].enabled = false;
+                }
                 return;
             }
             let siblings: Vec<usize> = self.ports[port_id]
@@ -1162,7 +1711,7 @@ impl DependencyGraph {
         let mut rows = Vec::with_capacity(self.visible_rows.len());
         let query = self.search_query.to_lowercase();
 
-        for port_id in 0..self.ports.len() {
+        for &port_id in &self.order {
             // Searching narrows which *ports* are listed, on their origin alone,
             // and a port that matches is shown whole.
             //
@@ -1172,6 +1721,9 @@ impl DependencyGraph {
             // happened to be above — and left section headers standing with
             // their entries gone.
             if !query.is_empty() && !self.ports[port_id].origin.to_lowercase().contains(&query) {
+                continue;
+            }
+            if self.hide_optionless && self.is_optionless(port_id) {
                 continue;
             }
             self.flatten_port(port_id, &mut rows);

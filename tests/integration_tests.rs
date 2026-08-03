@@ -2,20 +2,15 @@ mod common;
 
 use common::TempDir;
 
-use rusqlite::Connection;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use bgone::cli::parse_ports_file;
-use bgone::db;
 use bgone::exporter;
 use bgone::graph::{
     next_sibling_index, prev_sibling_index, DependencyGraph, NodeId, Provenance, RowKind,
     SectionKind,
 };
-use bgone::indexer;
 use bgone::reader::SystemOptions;
-use bgone::resolve;
 use bgone::ui::{
     next_focus, prev_focus, recenter_offset, tree_op, Focus, RecenterPosition, TreeOp,
 };
@@ -114,33 +109,16 @@ fn test_exporter_writes_valid_options_files() {
     let make_conf_path = temp.path.join("make.conf");
 
     // Set up database and graph
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_option(
-        &conn,
-        "www/apache24",
-        "HTTP2",
-        true,
-        "Enable HTTP2",
-        "DEFINE",
-        "",
-    );
-    common::add_option(
-        &conn,
-        "www/apache24",
-        "DOCS",
-        false,
-        "Build Docs",
-        "DEFINE",
-        "",
-    );
-    common::set_pkgname(&conn, "www/apache24", "apache-2.4.58");
+    tree.add_option("www/apache24", "HTTP2", true, "Enable HTTP2", "DEFINE", "");
+    tree.add_option("www/apache24", "DOCS", false, "Build Docs", "DEFINE", "");
+    tree.set_pkgname("www/apache24", "apache-2.4.58");
 
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &sys_opts, false)
-            .unwrap();
+    let graph = tree
+        .build(&["www/apache24".to_string()], &sys_opts, false)
+        .unwrap();
 
     // Export options
     let stats =
@@ -180,8 +158,7 @@ fn test_exporter_writes_the_package_name_make_reported() {
     let temp = TempDir::new("exporter_versions");
     let options_dir = temp.path.join("ports");
 
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     for (origin, opt, pkgname) in [
         // The forms a reconstruction could not produce: a revision, an epoch,
@@ -190,8 +167,8 @@ fn test_exporter_writes_the_package_name_make_reported() {
         ("devel/py-black", "STATIC", "py312-black-26.5.1"),
         ("www/known", "DOCS", "known-1.2.3"),
     ] {
-        common::add_option(&conn, origin, opt, false, "", "DEFINE", "");
-        common::set_pkgname(&conn, origin, pkgname);
+        tree.add_option(origin, opt, false, "", "DEFINE", "");
+        tree.set_pkgname(origin, pkgname);
     }
 
     let sys_opts = SystemOptions::default();
@@ -200,7 +177,7 @@ fn test_exporter_writes_the_package_name_make_reported() {
         "devel/py-black".to_string(),
         "www/known".to_string(),
     ];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
     exporter::export_options(&graph, &options_dir, false, None).unwrap();
 
     let read = |port: &str| fs::read_to_string(options_dir.join(port).join("options")).unwrap();
@@ -223,20 +200,20 @@ fn test_the_global_snippet_omits_options_the_ports_disagree_about() {
     let options_dir = temp.path.join("ports");
     let make_conf = temp.path.join("make.conf");
 
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     // DOCS disagrees; SSL is on everywhere; NLS is off everywhere.
-    common::add_option(&conn, "www/one", "DOCS", true, "", "DEFINE", "");
-    common::add_option(&conn, "www/one", "SSL", true, "", "DEFINE", "");
-    common::add_option(&conn, "www/one", "NLS", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/two", "DOCS", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/two", "SSL", true, "", "DEFINE", "");
-    common::add_option(&conn, "www/two", "NLS", false, "", "DEFINE", "");
+    tree.add_option("www/one", "DOCS", true, "", "DEFINE", "");
+    tree.add_option("www/one", "SSL", true, "", "DEFINE", "");
+    tree.add_option("www/one", "NLS", false, "", "DEFINE", "");
+    tree.add_option("www/two", "DOCS", false, "", "DEFINE", "");
+    tree.add_option("www/two", "SSL", true, "", "DEFINE", "");
+    tree.add_option("www/two", "NLS", false, "", "DEFINE", "");
 
     let patterns = vec!["www/one".to_string(), "www/two".to_string()];
-    let graph =
-        DependencyGraph::load_from_db(&conn, &patterns, &SystemOptions::default(), false).unwrap();
+    let graph = tree
+        .build(&patterns, &SystemOptions::default(), false)
+        .unwrap();
     exporter::export_options(&graph, &options_dir, false, Some(&make_conf)).unwrap();
 
     let content = fs::read_to_string(&make_conf).unwrap();
@@ -260,33 +237,16 @@ fn test_exported_options_round_trip_through_the_reader() {
     let temp = TempDir::new("exporter_roundtrip");
     let options_dir = temp.path.join("ports");
 
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/apache24");
-    common::add_option(
-        &conn,
-        "www/apache24",
-        "HTTP2",
-        true,
-        "Enable HTTP2",
-        "DEFINE",
-        "",
-    );
-    common::add_option(
-        &conn,
-        "www/apache24",
-        "DOCS",
-        false,
-        "Build Docs",
-        "DEFINE",
-        "",
-    );
+    tree.add_port("www/apache24");
+    tree.add_option("www/apache24", "HTTP2", true, "Enable HTTP2", "DEFINE", "");
+    tree.add_option("www/apache24", "DOCS", false, "Build Docs", "DEFINE", "");
 
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &sys_opts, false)
-            .unwrap();
+    let graph = tree
+        .build(&["www/apache24".to_string()], &sys_opts, false)
+        .unwrap();
     exporter::export_options(&graph, &options_dir, false, None).unwrap();
 
     // Defaults inverted, so anything not genuinely read back flips state
@@ -294,9 +254,9 @@ fn test_exported_options_round_trip_through_the_reader() {
     assert!(reloaded.get_state("www/apache24", "HTTP2", false));
     assert!(!reloaded.get_state("www/apache24", "DOCS", true));
 
-    let regraph =
-        DependencyGraph::load_from_db(&conn, &["www/apache24".to_string()], &reloaded, false)
-            .unwrap();
+    let regraph = tree
+        .build(&["www/apache24".to_string()], &reloaded, false)
+        .unwrap();
     assert!(!regraph.is_dirty());
 }
 
@@ -305,12 +265,10 @@ fn test_exporter_dry_run_creates_no_files() {
     let temp = TempDir::new("exporter_dryrun");
     let options_dir = temp.path.join("ports");
 
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "sysutils/tmux");
-    common::add_option(
-        &conn,
+    tree.add_port("sysutils/tmux");
+    tree.add_option(
         "sysutils/tmux",
         "UTF8BIDI",
         true,
@@ -320,9 +278,9 @@ fn test_exporter_dry_run_creates_no_files() {
     );
 
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["sysutils/tmux".to_string()], &sys_opts, false)
-            .unwrap();
+    let graph = tree
+        .build(&["sysutils/tmux".to_string()], &sys_opts, false)
+        .unwrap();
 
     // Run export in dry-run mode
     let stats =
@@ -336,290 +294,135 @@ fn test_exporter_dry_run_creates_no_files() {
 }
 
 // ============================================================================
-// 3. INDEXER & DB TESTS (Parallel Processing & Parser)
+// 3. THE ORACLE (evaluating ports, and remembering what they said)
 // ============================================================================
 
-/// A stand-in for make that replays a canned reply per port.
-///
-/// The real thing evaluates 38,000 lines of ports framework; a test that only
-/// cares about how a reply becomes rows should not need it, or a ports tree, or
-/// FreeBSD. The stub answers from a file beside the port's Makefile, so a
-/// fixture reads as "this is what make says about this port".
-fn stub_make(dir: &Path) -> PathBuf {
-    let path = dir.join("stub-make");
-    fs::write(
-        &path,
-        "#!/bin/sh\n\
-         while [ $# -gt 0 ]; do\n\
-           if [ \"$1\" = \"-C\" ]; then shift; cat \"$1/.reply\"; exit 0; fi\n\
-           shift\n\
-         done\n\
-         exit 1\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    path
-}
-
-/// Writes a port directory whose canned reply says exactly `fields`.
-fn mock_port(root: &Path, origin: &str, fields: &[(&str, String)]) {
-    let dir = root.join(origin);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("Makefile"), "# evaluated by the stub\n").unwrap();
-
-    let reply: String = fields
-        .iter()
-        .map(|(k, v)| format!("{k}{}{v}\n", resolve::US))
-        .collect();
-    fs::write(dir.join(".reply"), reply).unwrap();
-}
-
-/// A list-valued reply field: records separated, two fields each.
-fn rec(items: &[(&str, &str)]) -> String {
-    items
-        .iter()
-        .map(|(a, b)| format!("{a}{}{b}{}", resolve::US, resolve::RS))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn indexed_env(root: &Path, stub: &Path) -> resolve::MakeEnv {
-    let mut env = resolve::MakeEnv::new(root);
-    env.make = stub.to_path_buf();
-    env
-}
-
+/// The memo is keyed on the whole question, so a hit is never a guess.
 #[test]
-fn test_indexer_stores_what_make_reports() {
-    let temp = TempDir::new("indexer");
-    let root = temp.path.join("ports");
-    fs::create_dir_all(&root).unwrap();
-    let stub = stub_make(&temp.path);
+fn a_remembered_reply_is_not_asked_for_again() {
+    let mut tree = common::Tree::new("oracle_memo");
+    tree.add_option("www/nginx", "HTTP2", true, "Enable HTTP2", "DEFINE", "");
+    tree.add_port_dep("www/nginx", "devel/pcre2");
 
-    mock_port(
-        &root,
-        "www/nginx",
-        &[
-            ("PKGNAME", "nginx-1.24.0_1".into()),
-            ("PKGBASE", "nginx".into()),
-            ("FLAVORS", String::new()),
-            ("OPTIONS", "HTTP2 SSL DEBUG GZIP_DEF GZIP_ALT".into()),
-            ("DEFAULTS", "HTTP2 GZIP_DEF".into()),
-            (
-                "DESC",
-                rec(&[("HTTP2", "Enable HTTP2"), ("SSL", "Enable SSL")]),
-            ),
-            ("GRP_SINGLE", rec(&[("GZIP", "GZIP_DEF GZIP_ALT")])),
-            ("DEP_LIB", "libpcre2-8.so:devel/pcre2".into()),
-            ("DEP_BUILD", "pkgconf:devel/pkgconf".into()),
-            // The path form the old regex used to mistake for an origin
-            (
-                "DEP_RUN",
-                "${LOCALBASE}/bin/nowhere:devel/nonexistent".into(),
-            ),
-            ("OPTDEP_RUN_ON", rec(&[("HTTP2", "nghttp2>=1:www/nghttp2")])),
-        ],
-    );
-    for origin in ["www/nghttp2", "devel/pcre2", "devel/pkgconf"] {
-        mock_port(
-            &root,
-            origin,
-            &[
-                (
-                    "PKGNAME",
-                    format!("{}-1.0", origin.split('/').nth(1).unwrap()),
-                ),
-                ("OPTIONS", String::new()),
-            ],
-        );
-    }
-
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    let stats = indexer::index_ports_dir(&mut conn, &indexed_env(&root, &stub)).unwrap();
-
-    assert_eq!(stats.ports_indexed, 4);
-    assert_eq!(stats.options_indexed, 5);
-    assert_eq!(stats.failed, 0);
-
-    // Identity comes from make, so PKGNAME carries the revision the old
-    // reconstruction could never produce.
-    let pkgname: String = conn
-        .query_row(
-            "SELECT pkgname FROM ports WHERE origin = 'www/nginx'",
-            [],
-            |r| r.get(0),
-        )
+    let oracle = tree.oracle();
+    let first = oracle
+        .facts("www/nginx", &bgone::oracle::Options::AsShipped)
         .unwrap();
-    assert_eq!(pkgname, "nginx-1.24.0_1");
+    assert_eq!(first.options.len(), 1);
 
-    // Grouping and descriptions survive
-    let (gt, gn): (String, String) = conn
-        .query_row(
-            "SELECT o.group_type, o.group_name FROM options o
-             JOIN ports p ON p.id = o.port_id
-             WHERE p.origin = 'www/nginx' AND o.name = 'GZIP_ALT'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    // Take the tree away. The answer is remembered, so it still comes back.
+    fs::remove_file(tree.root().join("www/nginx/.port")).unwrap();
+    let second = oracle
+        .facts("www/nginx", &bgone::oracle::Options::AsShipped)
         .unwrap();
-    assert_eq!((gt.as_str(), gn.as_str()), ("SINGLE", "GZIP"));
+    assert_eq!(second, first, "the reply must come from the memo");
+}
 
-    // Edges point at ports, with their real class.
-    let edges: Vec<(String, String, Option<String>)> = conn
-        .prepare(
-            "SELECT t.origin, e.class, o.name FROM dep_edge e
-             JOIN ports f ON f.id = e.from_port_id
-             JOIN ports t ON t.id = e.to_port_id
-             LEFT JOIN options o ON o.id = e.via_option_id
-             WHERE f.origin = 'www/nginx' ORDER BY t.origin",
-        )
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+/// The Makefile's age is part of the key, so a tree update simply misses.
+#[test]
+fn a_changed_makefile_is_evaluated_again() {
+    let mut tree = common::Tree::new("oracle_mtime");
+    tree.add_option("www/app", "ALPHA", true, "", "DEFINE", "");
+
+    let oracle = tree.oracle();
+    let before = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    assert_eq!(before.options.len(), 1);
+
+    // A new option, and a Makefile that says the port has moved on
+    tree.add_option("www/app", "BETA", false, "", "DEFINE", "");
+    let oracle = tree.oracle();
+    let makefile = tree.root().join("www/app/Makefile");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    let handle = fs::File::options().write(true).open(&makefile).unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_modified(later))
+        .unwrap();
+
+    let after = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
     assert_eq!(
-        edges,
-        vec![
-            ("devel/pcre2".to_string(), "LIB".to_string(), None),
-            ("devel/pkgconf".to_string(), "BUILD".to_string(), None),
-            (
-                "www/nghttp2".to_string(),
-                "RUN".to_string(),
-                Some("HTTP2".to_string())
-            ),
-        ],
-        "the class is recorded, not invented, and option edges name their option"
-    );
-
-    // `devel/nonexistent` is not in the tree. It is recorded rather than
-    // silently dropped, which is what makes 'nothing failed to resolve'
-    // checkable.
-    let unresolved: Vec<(String, String)> = conn
-        .prepare("SELECT raw_entry, reason FROM unresolved_dep WHERE port_origin = 'www/nginx'")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert_eq!(
-        unresolved,
-        vec![("devel/nonexistent".to_string(), "NO_SUCH_PORT".to_string())]
+        after.options.len(),
+        2,
+        "an older answer must not survive the Makefile changing"
     );
 }
 
-/// A port that failed to evaluate is retried on the next index, not remembered
-/// as failed.
+/// A port make cannot read is an error rather than a port with no options.
+#[test]
+fn a_port_make_cannot_read_is_an_error() {
+    let mut tree = common::Tree::new("oracle_unreadable");
+    tree.add_option("www/app", "ALPHA", true, "", "DEFINE", "");
+    tree.make_unreadable("www/app");
+
+    let oracle = tree.oracle();
+    assert!(oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .is_err());
+}
+
+/// The whole reason for asking make a second time.
 ///
-/// Only a successful evaluation writes a `port_mtime` row, so a failure leaves
-/// nothing to compare against and the port is always stale. That matters
-/// because most failures are environmental — no ports tree, a make that cannot
-/// read it — and caching them would make a transient problem permanent.
+/// A dependency contributed by `${opt}_USES` or an `.if ${PORT_OPTIONS:MFOO}`
+/// block appears in no `${opt}_*_DEPENDS` variable and does not exist at all
+/// until the option is set. Evaluating once, at the maintainer's defaults, can
+/// never see it — which is why poudriere kept prompting for ports bgone had
+/// never written.
 #[test]
-fn test_a_failed_port_is_retried_rather_than_remembered_as_failed() {
-    let temp = TempDir::new("retry");
-    let root = temp.path.join("ports");
-    fs::create_dir_all(&root).unwrap();
-    let stub = stub_make(&temp.path);
+fn a_dependency_that_only_exists_with_an_option_on_is_found_by_asking_again() {
+    let mut tree = common::Tree::new("oracle_hidden");
+    tree.add_option("mail/sqlgrey", "MYSQL", false, "", "DEFINE", "");
+    tree.add_hidden_dep("mail/sqlgrey", "MYSQL", "databases/mysql84-client");
 
-    // No `.reply`, so the stub exits non-zero: make cannot answer for it.
-    let dir = root.join("www/app");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("Makefile"), "# unreadable\n").unwrap();
+    let oracle = tree.oracle();
 
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    let env = indexed_env(&root, &stub);
-
-    let first = indexer::index_ports_dir(&mut conn, &env).unwrap();
-    assert_eq!(first.failed, 1);
-    assert_eq!(first.options_indexed, 0);
-
-    let resolved: i32 = conn
-        .query_row(
-            "SELECT resolved FROM ports WHERE origin = 'www/app'",
-            [],
-            |r| r.get(0),
-        )
+    let off = oracle
+        .facts("mail/sqlgrey", &bgone::oracle::Options::AsShipped)
         .unwrap();
-    assert_eq!(resolved, 0, "the port exists but is marked unevaluated");
-    let logged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM unresolved_dep WHERE port_origin = 'www/app' AND reason = 'EVAL_FAILED'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(logged, 1);
-
-    // Make it answerable. The Makefile itself is untouched, so nothing about
-    // mtime says to retry — the absence of a recorded success is what does.
-    mock_port(
-        &root,
-        "www/app",
-        &[
-            ("PKGNAME", "app-1.0".into()),
-            ("OPTIONS", "ALPHA".into()),
-            ("DEFAULTS", "ALPHA".into()),
-        ],
+    assert!(
+        !off.deps.iter().any(|d| d.origin.contains("mysql")),
+        "with MYSQL off there is no client dependency: {:?}",
+        off.deps
     );
 
-    let second = indexer::index_ports_dir(&mut conn, &env).unwrap();
-    assert_eq!(second.cached, 0, "a failure is never treated as up to date");
-    assert_eq!(second.failed, 0);
-    assert_eq!(second.options_indexed, 1);
-
-    let resolved: i32 = conn
-        .query_row(
-            "SELECT resolved FROM ports WHERE origin = 'www/app'",
-            [],
-            |r| r.get(0),
+    let on = oracle
+        .facts(
+            "mail/sqlgrey",
+            &bgone::oracle::Options::Exactly(vec!["MYSQL".to_string()]),
         )
         .unwrap();
-    assert_eq!(resolved, 1);
-    let logged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM unresolved_dep WHERE port_origin = 'www/app'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(logged, 0, "the stale failure is cleared, not left behind");
+    assert!(
+        on.deps
+            .iter()
+            .any(|d| d.origin == "databases/mysql84-client"),
+        "with MYSQL on it must appear: {:?}",
+        on.deps
+    );
 }
 
-/// Re-indexing skips ports whose Makefiles have not changed.
+/// A set option's own dependency list is folded into the port's by
+/// `bsd.options.mk`, so make reports it twice. Recording both listed it twice
+/// and, worse, kept the port in the build after the option was turned off.
 #[test]
-fn test_unchanged_ports_are_not_re_evaluated() {
-    let temp = TempDir::new("incremental");
-    let root = temp.path.join("ports");
-    fs::create_dir_all(&root).unwrap();
-    let stub = stub_make(&temp.path);
-    mock_port(
-        &root,
-        "www/app",
-        &[
-            ("PKGNAME", "app-1.0".into()),
-            ("OPTIONS", "ALPHA".into()),
-            ("DEFAULTS", "ALPHA".into()),
-        ],
-    );
+fn a_set_options_dependency_is_recorded_against_the_option_only() {
+    let mut tree = common::Tree::new("oracle_fold");
+    tree.add_option("www/app", "SSL", true, "", "DEFINE", "");
+    tree.add_option_dep_with("www/app", "SSL", "security/openssl", "LIB", "ON");
 
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    let env = indexed_env(&root, &stub);
+    let oracle = tree.oracle();
+    let facts = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
 
-    let first = indexer::index_ports_dir(&mut conn, &env).unwrap();
-    assert_eq!(first.cached, 0);
-    assert_eq!(first.options_indexed, 1);
-
-    let second = indexer::index_ports_dir(&mut conn, &env).unwrap();
-    assert_eq!(second.cached, 1, "nothing changed, so nothing is re-run");
-    assert_eq!(second.options_indexed, 0);
+    let openssl: Vec<_> = facts
+        .deps
+        .iter()
+        .filter(|d| d.origin == "security/openssl")
+        .collect();
+    assert_eq!(openssl.len(), 1, "recorded as {openssl:?}");
+    assert_eq!(openssl[0].via_option.as_deref(), Some("SSL"));
 }
 
 // ============================================================================
@@ -628,14 +431,12 @@ fn test_unchanged_ports_are_not_re_evaluated() {
 
 #[test]
 fn test_graph_radio_group_mutual_exclusion() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "databases/db");
+    tree.add_port("databases/db");
 
     // Insert two options in the same SINGLE group
-    common::add_option(
-        &conn,
+    tree.add_option(
         "databases/db",
         "ENGINE_A",
         true,
@@ -643,8 +444,7 @@ fn test_graph_radio_group_mutual_exclusion() {
         "SINGLE",
         "ENGINE",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "databases/db",
         "ENGINE_B",
         false,
@@ -654,9 +454,9 @@ fn test_graph_radio_group_mutual_exclusion() {
     );
 
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["databases/db".to_string()], &sys_opts, false)
-            .unwrap();
+    let mut graph = tree
+        .build(&["databases/db".to_string()], &sys_opts, false)
+        .unwrap();
 
     // Verify initial states
     assert!(graph.option_nodes[0].enabled); // ENGINE_A
@@ -677,13 +477,11 @@ fn test_graph_radio_group_mutual_exclusion() {
 /// row, which is what left options stranded without their ports.
 #[test]
 fn test_graph_search_filtering() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "net/curl");
+    tree.add_port("net/curl");
 
-    common::add_option(
-        &conn,
+    tree.add_option(
         "net/curl",
         "HTTP2",
         true,
@@ -691,8 +489,7 @@ fn test_graph_search_filtering() {
         "DEFINE",
         "",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "net/curl",
         "OPENSSL",
         true,
@@ -700,8 +497,7 @@ fn test_graph_search_filtering() {
         "DEFINE",
         "",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "net/curl",
         "COOKIES",
         false,
@@ -711,8 +507,9 @@ fn test_graph_search_filtering() {
     );
 
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["net/curl".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["net/curl".to_string()], &sys_opts, false)
+        .unwrap();
 
     // Expand all nodes
     graph.expand_all();
@@ -744,12 +541,10 @@ fn test_graph_search_filtering() {
 
 #[test]
 fn test_unknown_port_returns_error() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     let sys_opts = SystemOptions::default();
-    let result =
-        DependencyGraph::load_from_db(&conn, &["nonexistent/port".to_string()], &sys_opts, false);
+    let result = tree.build(&["nonexistent/port".to_string()], &sys_opts, false);
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -758,15 +553,14 @@ fn test_unknown_port_returns_error() {
 
 #[test]
 fn test_graph_glob_pattern_resolution() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/py-django");
-    common::add_port(&conn, "www/py-requests");
+    tree.add_port("www/py-django");
+    tree.add_port("www/py-requests");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/py-*".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     assert_eq!(graph.requested_ports().count(), 2);
     assert!(graph.root_origin.contains("2 ports matched"));
@@ -774,13 +568,12 @@ fn test_graph_glob_pattern_resolution() {
 
 #[test]
 fn test_pattern_matching_zero_ports_returns_error() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["nonexistent/*".to_string()];
 
-    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false);
+    let result = tree.build(&patterns, &sys_opts, false);
 
     // Bails when zero ports match across all provided patterns
     assert!(result.is_err());
@@ -803,19 +596,18 @@ www/py-*, net/curl
 "#;
     fs::write(&ports_file, file_content).unwrap();
 
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/apache24");
-    common::add_port(&conn, "databases/postgresql16-server");
-    common::add_port(&conn, "lang/python311");
-    common::add_port(&conn, "www/py-django");
-    common::add_port(&conn, "net/curl");
+    tree.add_port("www/apache24");
+    tree.add_port("databases/postgresql16-server");
+    tree.add_port("lang/python311");
+    tree.add_port("www/py-django");
+    tree.add_port("net/curl");
 
     let targets = parse_ports_file(&ports_file).unwrap();
 
     let sys_opts = SystemOptions::default();
-    let graph = DependencyGraph::load_from_db(&conn, &targets, &sys_opts, false).unwrap();
+    let graph = tree.build(&targets, &sys_opts, false).unwrap();
 
     // Should resolve all 5 matching ports cleanly
     assert_eq!(graph.requested_ports().count(), 5);
@@ -823,15 +615,14 @@ www/py-*, net/curl
 
 #[test]
 fn test_multiple_ports_with_one_unknown_returns_error() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/apache24");
+    tree.add_port("www/apache24");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
 
-    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false);
+    let result = tree.build(&patterns, &sys_opts, false);
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -840,16 +631,15 @@ fn test_multiple_ports_with_one_unknown_returns_error() {
 
 #[test]
 fn test_ignore_missing_flag_warns_and_continues() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/apache24");
+    tree.add_port("www/apache24");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/apache24".to_string(), "invalid/unknown".to_string()];
 
     // With ignore_missing = true, valid port loads cleanly and doesn't bail out
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, true).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, true).unwrap();
     assert_eq!(graph.requested_ports().count(), 1);
 }
 
@@ -858,16 +648,14 @@ fn test_ignore_missing_flag_warns_and_continues() {
 // ============================================================================
 
 /// Two roots that both depend on `devel/shared`, which itself carries options.
-fn shared_dependency_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+fn shared_dependency_db() -> common::Tree {
+    let mut tree = common::Tree::new("t");
 
-    common::add_port(&conn, "www/root1");
-    common::add_port(&conn, "www/root2");
-    common::add_port(&conn, "devel/shared");
+    tree.add_port("www/root1");
+    tree.add_port("www/root2");
+    tree.add_port("devel/shared");
 
-    common::add_option(
-        &conn,
+    tree.add_option(
         "www/root1",
         "USE_SHARED",
         true,
@@ -875,8 +663,7 @@ fn shared_dependency_db() -> Connection {
         "DEFINE",
         "",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "www/root2",
         "ALSO_SHARED",
         true,
@@ -884,8 +671,7 @@ fn shared_dependency_db() -> Connection {
         "DEFINE",
         "",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "devel/shared",
         "THREADS",
         false,
@@ -893,8 +679,7 @@ fn shared_dependency_db() -> Connection {
         "DEFINE",
         "",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "devel/shared",
         "ENGINE_A",
         true,
@@ -902,8 +687,7 @@ fn shared_dependency_db() -> Connection {
         "SINGLE",
         "ENGINE",
     );
-    common::add_option(
-        &conn,
+    tree.add_option(
         "devel/shared",
         "ENGINE_B",
         false,
@@ -912,10 +696,10 @@ fn shared_dependency_db() -> Connection {
         "ENGINE",
     );
 
-    common::add_option_dep(&conn, "www/root1", "USE_SHARED", "devel/shared");
-    common::add_option_dep(&conn, "www/root2", "ALSO_SHARED", "devel/shared");
+    tree.add_option_dep("www/root1", "USE_SHARED", "devel/shared");
+    tree.add_option_dep("www/root2", "ALSO_SHARED", "devel/shared");
 
-    conn
+    tree
 }
 
 // ============================================================================
@@ -925,9 +709,8 @@ fn shared_dependency_db() -> Connection {
 /// Builds a database from `(origin, option, dep)` option-conditional edges and
 /// `(origin, dep)` unconditional ones. Every named port gets one option so the
 /// tree has something to show.
-fn dep_graph_db(option_edges: &[(&str, &str, &str)], port_edges: &[(&str, &str)]) -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+fn dep_graph_db(option_edges: &[(&str, &str, &str)], port_edges: &[(&str, &str)]) -> common::Tree {
+    let mut tree = common::Tree::new("t");
 
     let mut origins: Vec<&str> = Vec::new();
     for (from, _, to) in option_edges {
@@ -942,17 +725,17 @@ fn dep_graph_db(option_edges: &[(&str, &str, &str)], port_edges: &[(&str, &str)]
     origins.dedup();
 
     for origin in &origins {
-        common::add_option(&conn, origin, "DOCS", true, "", "DEFINE", "");
+        tree.add_option(origin, "DOCS", true, "", "DEFINE", "");
     }
     for (from, opt, to) in option_edges {
-        common::add_option(&conn, from, opt, true, "", "DEFINE", "");
-        common::add_option_dep(&conn, from, opt, to);
+        tree.add_option(from, opt, true, "", "DEFINE", "");
+        tree.add_option_dep(from, opt, to);
     }
     for (from, to) in port_edges {
-        common::add_port_dep(&conn, from, to);
+        tree.add_port_dep(from, to);
     }
 
-    conn
+    tree
 }
 
 fn origins_in_list(graph: &DependencyGraph) -> Vec<String> {
@@ -962,7 +745,7 @@ fn origins_in_list(graph: &DependencyGraph) -> Vec<String> {
 /// The list is an index, so it reads alphabetically and holds each port once.
 #[test]
 fn test_port_list_is_alphabetised_and_holds_each_port_once() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/nginx", "SSL", "security/openssl")],
         &[
             ("www/nginx", "devel/pcre2"),
@@ -970,8 +753,9 @@ fn test_port_list_is_alphabetised_and_holds_each_port_once() {
         ],
     );
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/nginx".to_string()], &sys_opts, false).unwrap();
+    let graph = tree
+        .build(&["www/nginx".to_string()], &sys_opts, false)
+        .unwrap();
 
     assert_eq!(
         origins_in_list(&graph),
@@ -993,7 +777,7 @@ fn test_port_list_is_alphabetised_and_holds_each_port_once() {
 /// hitting a depth limit — and produces no duplicate entry.
 #[test]
 fn test_dependency_cycle_terminates_without_duplicating_a_port() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[
             ("www/a", "NEEDS_B", "www/b"),
             ("www/b", "NEEDS_C", "www/c"),
@@ -1002,8 +786,9 @@ fn test_dependency_cycle_terminates_without_duplicating_a_port() {
         &[],
     );
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/a".to_string()], &sys_opts, false).unwrap();
+    let graph = tree
+        .build(&["www/a".to_string()], &sys_opts, false)
+        .unwrap();
 
     assert_eq!(origins_in_list(&graph), vec!["www/a", "www/b", "www/c"]);
     assert_eq!(
@@ -1023,13 +808,13 @@ fn test_dependency_cycle_terminates_without_duplicating_a_port() {
 /// unconditional, and records which option made it conditional.
 #[test]
 fn test_required_by_inverts_both_kinds_of_edge() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/app", "SSL", "security/openssl")],
         &[("www/app", "devel/pcre2"), ("www/other", "devel/pcre2")],
     );
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/app".to_string(), "www/other".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     let openssl = &graph.ports[graph.port_index("security/openssl").unwrap()];
     assert_eq!(openssl.required_by.len(), 1);
@@ -1053,10 +838,11 @@ fn test_required_by_inverts_both_kinds_of_edge() {
 /// Ports named on the command line are white; everything pulled in is yellow.
 #[test]
 fn test_provenance_marks_requested_ports_separately() {
-    let conn = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
+    let mut tree = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
 
     let app = &graph.ports[graph.port_index("www/app").unwrap()];
     let pcre2 = &graph.ports[graph.port_index("devel/pcre2").unwrap()];
@@ -1073,10 +859,10 @@ fn test_provenance_marks_requested_ports_separately() {
 /// Asking for a port by name outranks having it dragged in as a dependency.
 #[test]
 fn test_requested_outranks_being_a_dependency() {
-    let conn = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
+    let mut tree = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/app".to_string(), "devel/pcre2".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     let pcre2 = &graph.ports[graph.port_index("devel/pcre2").unwrap()];
     assert_eq!(pcre2.provenance, Provenance::Requested);
@@ -1102,10 +888,11 @@ fn test_dependency_chain_is_walked_past_the_old_depth_cap() {
         .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
         .collect();
 
-    let conn = dep_graph_db(&edges, &[]);
+    let mut tree = dep_graph_db(&edges, &[]);
     let sys_opts = SystemOptions::default();
-    let graph =
-        DependencyGraph::load_from_db(&conn, &["www/p0".to_string()], &sys_opts, false).unwrap();
+    let graph = tree
+        .build(&["www/p0".to_string()], &sys_opts, false)
+        .unwrap();
 
     assert_eq!(origins_in_list(&graph).len(), 13, "p0 through p12");
     assert!(graph.ports.iter().any(|p| p.origin == "www/p12"));
@@ -1118,13 +905,14 @@ fn test_unconditional_dependencies_are_walked_but_never_exported() {
     let temp = TempDir::new("requires_export");
     let options_dir = temp.path.join("ports");
 
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/app", "SSL", "security/openssl")],
         &[("www/app", "devel/pcre2"), ("devel/pcre2", "devel/pkgconf")],
     );
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
 
     // Reached transitively through two unconditional edges
     assert!(graph.ports.iter().any(|p| p.origin == "devel/pkgconf"));
@@ -1168,10 +956,11 @@ fn test_unconditional_dependencies_are_walked_but_never_exported() {
 /// anything or mark the graph dirty.
 #[test]
 fn test_section_header_is_not_toggleable() {
-    let conn = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
+    let mut tree = dep_graph_db(&[], &[("www/app", "devel/pcre2")]);
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
     graph.expand_all();
 
     for row in 0..graph.visible_rows.len() {
@@ -1186,13 +975,14 @@ fn test_section_header_is_not_toggleable() {
 /// Relationship rows are jump targets, and every target resolves to an entry.
 #[test]
 fn test_relationship_rows_carry_resolvable_jump_targets() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/app", "SSL", "security/openssl")],
         &[("www/app", "devel/pcre2")],
     );
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
     graph.expand_all();
 
     let mut targets: Vec<&str> = graph
@@ -1236,7 +1026,7 @@ fn is_on(graph: &DependencyGraph, origin: &str, name: &str) -> bool {
     graph.option_nodes[find_option(graph, origin, name)].enabled
 }
 
-fn toggle(graph: &mut DependencyGraph, origin: &str, name: &str) {
+fn toggle(graph: &mut DependencyGraph, origin: &str, name: &str) -> Vec<String> {
     let row = graph
         .visible_rows
         .iter()
@@ -1247,7 +1037,7 @@ fn toggle(graph: &mut DependencyGraph, origin: &str, name: &str) {
             _ => false,
         })
         .unwrap_or_else(|| panic!("no visible row for {origin}/{name}"));
-    graph.toggle_option(row);
+    graph.toggle_option(row)
 }
 
 /// `NJS_IMPLIES=STREAM` means the two cannot be built apart, so turning NJS on
@@ -1255,23 +1045,18 @@ fn toggle(graph: &mut DependencyGraph, origin: &str, name: &str) {
 /// options file the framework then quietly overrides.
 #[test]
 fn test_turning_an_option_on_turns_on_what_it_implies() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_option(&conn, "www/nginx", "NJS", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/nginx", "STREAM", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/nginx", "HTTP", false, "", "DEFINE", "");
-    common::add_implies(&conn, "www/nginx", "NJS", "STREAM");
+    tree.add_option("www/nginx", "NJS", false, "", "DEFINE", "");
+    tree.add_option("www/nginx", "STREAM", false, "", "DEFINE", "");
+    tree.add_option("www/nginx", "HTTP", false, "", "DEFINE", "");
+    tree.add_implies("www/nginx", "NJS", "STREAM");
     // Transitive: STREAM itself implies HTTP
-    common::add_implies(&conn, "www/nginx", "STREAM", "HTTP");
+    tree.add_implies("www/nginx", "STREAM", "HTTP");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/nginx".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/nginx".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
 
     assert!(!is_on(&graph, "www/nginx", "STREAM"));
@@ -1288,20 +1073,15 @@ fn test_turning_an_option_on_turns_on_what_it_implies() {
 /// Two options that imply each other must not spin.
 #[test]
 fn test_mutually_implying_options_terminate() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    common::add_option(&conn, "www/app", "A", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/app", "B", false, "", "DEFINE", "");
-    common::add_implies(&conn, "www/app", "A", "B");
-    common::add_implies(&conn, "www/app", "B", "A");
+    let mut tree = common::Tree::new("t");
+    tree.add_option("www/app", "A", false, "", "DEFINE", "");
+    tree.add_option("www/app", "B", false, "", "DEFINE", "");
+    tree.add_implies("www/app", "A", "B");
+    tree.add_implies("www/app", "B", "A");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/app".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
     toggle(&mut graph, "www/app", "A");
 
@@ -1312,19 +1092,14 @@ fn test_mutually_implying_options_terminate() {
 /// `DEBUG_PREVENTS=STREAM`: turning DEBUG on turns STREAM off.
 #[test]
 fn test_turning_an_option_on_turns_off_what_it_prevents() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    common::add_option(&conn, "www/app", "DEBUG", false, "", "DEFINE", "");
-    common::add_option(&conn, "www/app", "STREAM", true, "", "DEFINE", "");
-    common::add_prevents(&conn, "www/app", "DEBUG", "STREAM");
+    let mut tree = common::Tree::new("t");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("www/app", "STREAM", true, "", "DEFINE", "");
+    tree.add_prevents("www/app", "DEBUG", "STREAM");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/app".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
 
     assert!(is_on(&graph, "www/app", "STREAM"));
@@ -1340,50 +1115,37 @@ fn test_turning_an_option_on_turns_off_what_it_prevents() {
 /// treated as an error — ports do it, and there is nothing to set.
 #[test]
 fn test_implying_an_option_the_port_does_not_have_is_harmless() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
-    common::add_option(&conn, "www/app", "A", false, "", "DEFINE", "");
-    common::add_implies(&conn, "www/app", "A", "NOT_HERE");
+    let mut tree = common::Tree::new("t");
+    tree.add_option("www/app", "A", false, "", "DEFINE", "");
+    tree.add_implies("www/app", "A", "NOT_HERE");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/app".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
     toggle(&mut graph, "www/app", "A");
     assert!(is_on(&graph, "www/app", "A"));
 }
 
-/// `FOO_LIB_DEPENDS_OFF` pulls a port in when the option is *unset*, so the
-/// reachable set follows the opposite edge. The old parser could not see these
-/// at all.
+/// `FOO_LIB_DEPENDS_OFF` pulls a port in when the option is *unset*, so turning
+/// the option off is what puts the port into the build.
+///
+/// Only what is actually pulled in is walked, so `devel/system-lib` is a name
+/// and nothing more until BUNDLED goes off — asking make about a port nothing
+/// is going to write would be an evaluation spent on nothing. Turning the
+/// option off is what makes it worth asking, and the answer is what adds it.
 #[test]
-fn test_an_off_polarity_dependency_is_pulled_in_when_the_option_is_off() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+fn test_an_off_polarity_dependency_arrives_when_the_option_goes_off() {
+    let mut tree = common::Tree::new("t");
 
-    common::add_option(&conn, "www/app", "BUNDLED", true, "", "DEFINE", "");
-    common::add_option(&conn, "devel/system-lib", "DOCS", true, "", "DEFINE", "");
+    tree.add_option("www/app", "BUNDLED", true, "", "DEFINE", "");
+    tree.add_option("devel/system-lib", "DOCS", true, "", "DEFINE", "");
     // With BUNDLED off the port needs the system library instead.
-    common::add_option_dep_with(
-        &conn,
-        "www/app",
-        "BUNDLED",
-        "devel/system-lib",
-        "LIB",
-        "OFF",
-    );
+    tree.add_option_dep_with("www/app", "BUNDLED", "devel/system-lib", "LIB", "OFF");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/app".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
 
     assert!(
@@ -1391,11 +1153,18 @@ fn test_an_off_polarity_dependency_is_pulled_in_when_the_option_is_off() {
         "BUNDLED is on, so the system library is not needed"
     );
 
-    toggle(&mut graph, "www/app", "BUNDLED");
+    let touched = toggle(&mut graph, "www/app", "BUNDLED");
+    let arrived = tree.resettle(&mut graph, &touched);
+
+    assert_eq!(arrived, vec!["devel/system-lib"]);
     assert!(
         graph.is_live("devel/system-lib"),
         "turning BUNDLED off is what pulls the system library in"
     );
+    // ...and it comes with its own options, ready to configure
+    assert!(graph
+        .real_options()
+        .any(|o| o.port_origin == "devel/system-lib" && o.name == "DOCS"));
 }
 
 // ============================================================================
@@ -1410,19 +1179,19 @@ fn test_an_off_polarity_dependency_is_pulled_in_when_the_option_is_off() {
 /// has no options — on the row, and in the message inside it.
 #[test]
 fn test_an_unevaluated_port_says_so_rather_than_looking_empty() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     // Two ports with nothing in them, for opposite reasons.
-    common::add_port(&conn, "www/genuinely-empty");
-    common::add_unevaluated_port(&conn, "www/unreadable");
+    tree.add_port("www/genuinely-empty");
+    tree.add_unevaluated_port("www/unreadable");
 
     let patterns = vec![
         "www/genuinely-empty".to_string(),
         "www/unreadable".to_string(),
     ];
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &patterns, &SystemOptions::default(), false).unwrap();
+    let mut graph = tree
+        .build(&patterns, &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
 
     let resolved_of = |graph: &DependencyGraph, origin: &str| {
@@ -1465,20 +1234,15 @@ fn test_an_unevaluated_port_says_so_rather_than_looking_empty() {
 /// being off is not reported as a gap in what gets written.
 #[test]
 fn test_only_live_unevaluated_ports_are_reported() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
-    common::add_option(&conn, "www/app", "EXTRA", true, "", "DEFINE", "");
-    common::add_unevaluated_port(&conn, "devel/broken");
-    common::add_option_dep(&conn, "www/app", "EXTRA", "devel/broken");
+    tree.add_option("www/app", "EXTRA", true, "", "DEFINE", "");
+    tree.add_unevaluated_port("devel/broken");
+    tree.add_option_dep("www/app", "EXTRA", "devel/broken");
 
-    let mut graph = DependencyGraph::load_from_db(
-        &conn,
-        &["www/app".to_string()],
-        &SystemOptions::default(),
-        false,
-    )
-    .unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
 
     assert_eq!(graph.unevaluated_ports(), vec!["devel/broken"]);
@@ -1514,13 +1278,14 @@ fn listed_origins(graph: &DependencyGraph) -> Vec<String> {
 /// port pulled in, all the way down.
 #[test]
 fn test_disabling_an_option_strands_its_whole_subtree() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/app", "LUA", "lang/lua54")],
         &[("lang/lua54", "devel/readline"), ("www/app", "devel/pcre2")],
     );
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
 
     // LUA defaults on, so the whole chain is pulled in
     assert_eq!(
@@ -1549,13 +1314,13 @@ fn test_disabling_an_option_strands_its_whole_subtree() {
 /// A port still pulled in by some other route does not vanish.
 #[test]
 fn test_a_port_reached_another_way_survives() {
-    let conn = dep_graph_db(
+    let mut tree = dep_graph_db(
         &[("www/app", "SSL", "security/openssl")],
         &[("www/other", "security/openssl")],
     );
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/app".to_string(), "www/other".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     let row = find_option_row(&graph, "www/app", "SSL");
     graph.toggle_option(row);
@@ -1570,10 +1335,11 @@ fn test_a_port_reached_another_way_survives() {
 /// not silently reset what was chosen for it.
 #[test]
 fn test_option_state_survives_a_port_leaving_and_returning() {
-    let conn = dep_graph_db(&[("www/app", "LUA", "lang/lua54")], &[]);
+    let mut tree = dep_graph_db(&[("www/app", "LUA", "lang/lua54")], &[]);
     let sys_opts = SystemOptions::default();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
 
     // DOCS defaults on for lang/lua54; turn it off
     graph.set_option_state("lang/lua54", "DOCS", false);
@@ -1600,7 +1366,7 @@ fn test_ports_nothing_pulls_in_are_neither_saved_nor_counted_as_dirty() {
     let temp = TempDir::new("live_export");
     let options_dir = temp.path.join("ports");
 
-    let conn = dep_graph_db(&[("www/app", "LUA", "lang/lua54")], &[]);
+    let mut tree = dep_graph_db(&[("www/app", "LUA", "lang/lua54")], &[]);
 
     // Start with LUA off, so lang/lua54 is out of the list from the beginning
     let mut sys_opts = SystemOptions::default();
@@ -1609,8 +1375,9 @@ fn test_ports_nothing_pulls_in_are_neither_saved_nor_counted_as_dirty() {
         [("LUA".to_string(), false)].into_iter().collect(),
     );
 
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &["www/app".to_string()], &sys_opts, false).unwrap();
+    let mut graph = tree
+        .build(&["www/app".to_string()], &sys_opts, false)
+        .unwrap();
 
     assert!(!graph.is_live("lang/lua54"));
     assert_eq!(listed_origins(&graph), vec!["www/app"]);
@@ -1660,11 +1427,11 @@ fn states_of(graph: &DependencyGraph, origin: &str, opt_name: &str) -> Vec<bool>
 /// `required by` instead.
 #[test]
 fn test_shared_dependency_is_one_entry_naming_both_parents() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
 
     let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     assert_eq!(
         graph
@@ -1693,11 +1460,11 @@ fn test_shared_dependency_is_one_entry_naming_both_parents() {
 
 #[test]
 fn test_toggling_a_shared_dependency_is_a_single_edit() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
 
     let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     assert_eq!(states_of(&graph, "devel/shared", "THREADS"), vec![false]);
@@ -1716,11 +1483,11 @@ fn test_toggling_a_shared_dependency_is_a_single_edit() {
 
 #[test]
 fn test_radio_group_on_a_shared_dependency() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
 
     let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     assert_eq!(states_of(&graph, "devel/shared", "ENGINE_A"), vec![true]);
@@ -1737,11 +1504,11 @@ fn test_radio_group_on_a_shared_dependency() {
 /// still a single entry, and counts as requested.
 #[test]
 fn test_explicit_target_that_is_also_a_dependency_stays_one_entry() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
 
     let patterns = vec!["www/root1".to_string(), "devel/shared".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     assert_eq!(graph.option_instances("devel/shared", "THREADS").len(), 1);
@@ -1773,10 +1540,10 @@ fn test_exporter_writes_duplicated_port_options_once() {
     let options_dir = temp.path.join("ports");
     let make_conf_path = temp.path.join("make.conf");
 
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     let row = find_option_row(&graph, "devel/shared", "THREADS");
@@ -1922,10 +1689,10 @@ fn test_sibling_navigation_handles_degenerate_input() {
 
 #[test]
 fn test_sibling_navigation_walks_a_real_list() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string(), "www/root2".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     let depths: Vec<usize> = graph.visible_rows.iter().map(|r| r.depth).collect();
@@ -1958,10 +1725,10 @@ fn test_sibling_navigation_walks_a_real_list() {
 
 #[test]
 fn test_graph_is_clean_when_first_loaded() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string()];
-    let graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     assert!(
         !graph.is_dirty(),
@@ -1971,10 +1738,10 @@ fn test_graph_is_clean_when_first_loaded() {
 
 #[test]
 fn test_toggling_an_option_marks_the_graph_dirty() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     let row = find_option_row(&graph, "devel/shared", "THREADS");
@@ -1989,10 +1756,10 @@ fn test_toggling_an_option_marks_the_graph_dirty() {
 
 #[test]
 fn test_radio_switch_marks_the_graph_dirty() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
     graph.expand_all();
 
     let row = find_option_row(&graph, "devel/shared", "ENGINE_B");
@@ -2007,10 +1774,10 @@ fn test_radio_switch_marks_the_graph_dirty() {
 
 #[test]
 fn test_expand_and_collapse_node_affect_only_the_target_row() {
-    let conn = shared_dependency_db();
+    let mut tree = shared_dependency_db();
     let sys_opts = SystemOptions::default();
     let patterns = vec!["www/root1".to_string()];
-    let mut graph = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, false).unwrap();
+    let mut graph = tree.build(&patterns, &sys_opts, false).unwrap();
 
     let root_row = graph
         .visible_rows
@@ -2104,14 +1871,13 @@ fn test_recenter_clamps_near_the_edges_of_the_list() {
 
 #[test]
 fn test_ignore_missing_flag_still_bails_if_zero_total_ports_match() {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+    let mut tree = common::Tree::new("t");
 
     let sys_opts = SystemOptions::default();
     let patterns = vec!["invalid/port1".to_string(), "invalid/port2".to_string()];
 
     // With ignore_missing = true, if 0 total ports match, it MUST still bail out
-    let result = DependencyGraph::load_from_db(&conn, &patterns, &sys_opts, true);
+    let result = tree.build(&patterns, &sys_opts, true);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("No matching ports found for pattern(s)"));
@@ -2123,12 +1889,11 @@ fn test_ignore_missing_flag_still_bails_if_zero_total_ports_match() {
 
 /// A database where three ports share an option name, one of them also has a
 /// radio group, and one lacks the shared option entirely.
-fn group_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+fn group_db() -> common::Tree {
+    let mut tree = common::Tree::new("t");
 
-    let add = |origin: &str, opt: &str, default: bool, gt: &str, gn: &str| {
-        common::add_option(&conn, origin, opt, default, "", gt, gn);
+    let mut add = |origin: &str, opt: &str, default: bool, gt: &str, gn: &str| {
+        tree.add_option(origin, opt, default, "", gt, gn);
     };
 
     for origin in [
@@ -2149,33 +1914,33 @@ fn group_db() -> Connection {
     add("lang/php84-extensions", "SQLITE", false, "SINGLE", "DB");
 
     add("www/unrelated", "SOAP", false, "DEFINE", "");
-    conn
+    tree
 }
 
-fn search_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::init_db(&conn, true).unwrap();
+fn search_db() -> common::Tree {
+    let mut tree = common::Tree::new("t");
 
     for (origin, opt, desc) in [
         ("databases/postgresql16-server", "SSL", "Secure sockets"),
         ("devel/git", "DOCS", "Postgres support"),
         ("www/nginx", "POSTGRES", "Database backend"),
     ] {
-        common::add_option(&conn, origin, opt, true, desc, "DEFINE", "");
+        tree.add_option(origin, opt, true, desc, "DEFINE", "");
     }
-    common::add_port_dep(&conn, "www/nginx", "databases/postgresql16-server");
-    conn
+    tree.add_port_dep("www/nginx", "databases/postgresql16-server");
+    tree
 }
 
-fn load_grouped(conn: &Connection, groups: &[(&str, &[&str])]) -> DependencyGraph {
+fn load_grouped(tree: &mut common::Tree, groups: &[(&str, &[&str])]) -> DependencyGraph {
     let targets: Vec<String> = vec![
         "lang/php83-extensions".to_string(),
         "lang/php84-extensions".to_string(),
         "lang/php85-extensions".to_string(),
         "www/unrelated".to_string(),
     ];
-    let mut graph =
-        DependencyGraph::load_from_db(conn, &targets, &SystemOptions::default(), false).unwrap();
+    let mut graph = tree
+        .build(&targets, &SystemOptions::default(), false)
+        .unwrap();
     for (name, members) in groups {
         graph.groups.insert(
             name.to_string(),
@@ -2197,9 +1962,9 @@ fn enabled_of(graph: &DependencyGraph, origin: &str, opt: &str) -> Option<bool> 
 /// The whole point: setting an option on one member sets it on the rest.
 #[test]
 fn test_toggling_a_member_sets_the_option_across_the_group() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[(
             "php-extensions",
             &[
@@ -2252,9 +2017,9 @@ fn test_toggling_a_member_sets_the_option_across_the_group() {
 /// defines must not be invented on the others.
 #[test]
 fn test_an_option_only_one_member_has_stays_there() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[(
             "php-extensions",
             &["lang/php83-extensions", "lang/php84-extensions"],
@@ -2279,9 +2044,9 @@ fn test_an_option_only_one_member_has_stays_there() {
 /// necessarily the same set as the port the choice was made on.
 #[test]
 fn test_a_radio_pick_resolves_against_each_members_own_siblings() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[(
             "php-extensions",
             &["lang/php83-extensions", "lang/php84-extensions"],
@@ -2320,9 +2085,9 @@ fn test_a_radio_pick_resolves_against_each_members_own_siblings() {
 /// exactly as outside one.
 #[test]
 fn test_reselecting_a_radio_changes_nothing() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[(
             "php-extensions",
             &["lang/php83-extensions", "lang/php84-extensions"],
@@ -2342,9 +2107,9 @@ fn test_reselecting_a_radio_changes_nothing() {
 /// A port can belong to more than one group, and a choice reaches the union.
 #[test]
 fn test_a_port_in_two_groups_reaches_both() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[
             ("a", &["lang/php83-extensions", "lang/php84-extensions"]),
             ("b", &["lang/php83-extensions", "lang/php85-extensions"]),
@@ -2367,9 +2132,9 @@ fn test_a_port_in_two_groups_reaches_both() {
 /// membership simply waits for it.
 #[test]
 fn test_a_member_outside_the_current_list_is_skipped() {
-    let conn = group_db();
+    let mut tree = group_db();
     let mut graph = load_grouped(
-        &conn,
+        &mut tree,
         &[(
             "php-extensions",
             &[
@@ -2396,8 +2161,8 @@ fn test_a_member_outside_the_current_list_is_skipped() {
 /// existed.
 #[test]
 fn test_without_groups_a_toggle_touches_only_its_own_port() {
-    let conn = group_db();
-    let mut graph = load_grouped(&conn, &[]);
+    let mut tree = group_db();
+    let mut graph = load_grouped(&mut tree, &[]);
 
     let row = find_option_row(&graph, "lang/php83-extensions", "SOAP");
     graph.toggle_option(row);
@@ -2418,13 +2183,14 @@ fn searched(graph: &mut DependencyGraph, query: &str) -> Vec<String> {
 }
 
 fn search_graph() -> DependencyGraph {
-    let conn = search_db();
+    let mut tree = search_db();
     let targets: Vec<String> = ["databases/postgresql16-server", "devel/git", "www/nginx"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let mut graph =
-        DependencyGraph::load_from_db(&conn, &targets, &SystemOptions::default(), false).unwrap();
+    let mut graph = tree
+        .build(&targets, &SystemOptions::default(), false)
+        .unwrap();
     graph.expand_all();
     graph
 }
@@ -2551,4 +2317,441 @@ fn filtering_does_not_change_what_gets_written() {
             "{port} was hidden by the filter but must still be written"
         );
     }
+}
+
+// ============================================================================
+// 9. PROVENANCE, GROUPS AND WHAT THE LIST LEAVES OUT
+// ============================================================================
+
+/// A parent that needs a port whatever its options say needs it, full stop.
+///
+/// `bsd.options.mk` folds a set option's dependencies into the port's own
+/// lists, so the cache can hold both spellings of the same edge; saying so
+/// twice listed the same parent as both unconditional and "only while this
+/// option is on", which cannot both be true of it.
+#[test]
+fn a_parent_that_needs_a_port_either_way_is_listed_once() {
+    let mut tree = common::Tree::new("t");
+
+    tree.add_option("www/app", "SSL", true, "", "DEFINE", "");
+    tree.add_option("security/openssl", "DOCS", true, "", "DEFINE", "");
+    tree.add_option_dep("www/app", "SSL", "security/openssl");
+    tree.add_port_dep("www/app", "security/openssl");
+
+    let graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+
+    let openssl = &graph.ports[graph.port_index("security/openssl").unwrap()];
+    assert_eq!(
+        openssl.required_by.len(),
+        1,
+        "listed as {:?}",
+        openssl.required_by
+    );
+    assert!(
+        openssl.required_by[0].via_option.is_none(),
+        "the unconditional edge is the true one and must be the survivor"
+    );
+}
+
+/// A port kept out of the list by a different parent's option is not one of
+/// this parent's conditional entries, so the collapse must not reach it.
+#[test]
+fn two_different_parents_are_both_still_listed() {
+    let mut tree = common::Tree::new("t");
+
+    tree.add_option("www/a", "USE", true, "", "DEFINE", "");
+    tree.add_option("www/b", "DOCS", true, "", "DEFINE", "");
+    tree.add_option("devel/shared", "DOCS", true, "", "DEFINE", "");
+    tree.add_option_dep("www/a", "USE", "devel/shared");
+    tree.add_port_dep("www/b", "devel/shared");
+
+    let graph = tree
+        .build(
+            &["www/a".to_string(), "www/b".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+
+    let shared = &graph.ports[graph.port_index("devel/shared").unwrap()];
+    let names: Vec<&str> = shared
+        .required_by
+        .iter()
+        .map(|r| r.origin.as_str())
+        .collect();
+    assert_eq!(names, vec!["www/a", "www/b"]);
+}
+
+/// `OPTIONS_SINGLE` must have exactly one member set, so the one already on
+/// cannot be cleared — there is nothing for the port to fall back to.
+/// `OPTIONS_RADIO` is the optional form, zero or one, and clears.
+#[test]
+fn a_radio_clears_but_a_single_choice_holds() {
+    let mut tree = common::Tree::new("t");
+
+    tree.add_option("www/app", "GTK3", true, "", "RADIO", "GUI");
+    tree.add_option("www/app", "QT5", false, "", "RADIO", "GUI");
+    tree.add_option("www/app", "ENGINE_A", true, "", "SINGLE", "ENGINE");
+    tree.add_option("www/app", "ENGINE_B", false, "", "SINGLE", "ENGINE");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+
+    let row_of = |graph: &DependencyGraph, want: &str| {
+        graph
+            .visible_rows
+            .iter()
+            .position(|r| matches!(&r.kind, RowKind::Option { name, .. } if name == want))
+            .expect("option row")
+    };
+    let state = |graph: &DependencyGraph, want: &str| {
+        graph
+            .option_nodes
+            .iter()
+            .find(|o| o.name == want)
+            .unwrap()
+            .enabled
+    };
+
+    // The radio that is on clears, leaving the group with nothing picked
+    let row = row_of(&graph, "GTK3");
+    graph.toggle_option(row);
+    assert!(!state(&graph, "GTK3"), "a RADIO must be de-selectable");
+    assert!(!state(&graph, "QT5"), "clearing one must not pick another");
+
+    // ...and picking it again still turns the other off
+    let row = row_of(&graph, "QT5");
+    graph.toggle_option(row);
+    assert!(state(&graph, "QT5"));
+    let row = row_of(&graph, "GTK3");
+    graph.toggle_option(row);
+    assert!(state(&graph, "GTK3"));
+    assert!(!state(&graph, "QT5"));
+
+    // The mandatory form does not clear
+    let row = row_of(&graph, "ENGINE_A");
+    graph.toggle_option(row);
+    assert!(
+        state(&graph, "ENGINE_A"),
+        "an OPTIONS_SINGLE choice has nothing to fall back to"
+    );
+}
+
+/// An OPTIONS_SINGLE / GROUP reads as a choice only if its members are next to
+/// each other; sorted by name alone they scatter through the list.
+#[test]
+fn a_categorys_options_are_listed_together() {
+    let mut tree = common::Tree::new("t");
+
+    // Names chosen so name order alone interleaves the two groups
+    tree.add_option("www/app", "ALPHA", true, "", "SINGLE", "ENGINE");
+    tree.add_option("www/app", "BRAVO", false, "", "GROUP", "PLUGINS");
+    tree.add_option("www/app", "CHARLIE", false, "", "SINGLE", "ENGINE");
+    tree.add_option("www/app", "DELTA", false, "", "GROUP", "PLUGINS");
+    tree.add_option("www/app", "ECHO", true, "", "DEFINE", "");
+
+    let graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+
+    let listed: Vec<(&str, &str)> = graph.ports[0]
+        .options
+        .iter()
+        .map(|&id| {
+            let o = &graph.option_nodes[id];
+            (o.name.as_str(), o.group_name.as_str())
+        })
+        .collect();
+
+    assert_eq!(
+        listed,
+        vec![
+            // Ungrouped first: nothing frames them, so they read as the port's
+            // own switches
+            ("ECHO", ""),
+            ("ALPHA", "ENGINE"),
+            ("CHARLIE", "ENGINE"),
+            ("BRAVO", "PLUGINS"),
+            ("DELTA", "PLUGINS"),
+        ]
+    );
+}
+
+/// Joining a group is the statement that this port should be configured like
+/// its members, so it takes on their choices rather than waiting for the next
+/// toggle to reach it.
+#[test]
+fn a_port_joining_a_group_takes_on_the_choices_already_made() {
+    let mut tree = common::Tree::new("t");
+
+    // php83 has SOAP on and DEBUG off; php84 starts the other way about, and
+    // has an option php83 has never heard of.
+    tree.add_option("lang/php83", "SOAP", true, "", "DEFINE", "");
+    tree.add_option("lang/php83", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("lang/php84", "SOAP", false, "", "DEFINE", "");
+    tree.add_option("lang/php84", "DEBUG", true, "", "DEFINE", "");
+    tree.add_option("lang/php84", "FIBERS", true, "", "DEFINE", "");
+
+    let mut graph = tree
+        .build(
+            &["lang/php83".to_string(), "lang/php84".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+
+    let state = |graph: &DependencyGraph, origin: &str, name: &str| {
+        graph
+            .option_nodes
+            .iter()
+            .find(|o| o.port_origin == origin && o.name == name)
+            .unwrap()
+            .enabled
+    };
+
+    // The first member has nobody to copy
+    graph.groups.insert("php".to_string(), Vec::new());
+    assert_eq!(graph.adopt_group_options("php", "lang/php83"), 0);
+    graph
+        .groups
+        .get_mut("php")
+        .unwrap()
+        .push("lang/php83".to_string());
+    assert!(state(&graph, "lang/php83", "SOAP"));
+
+    // The second takes on what the first has
+    assert_eq!(graph.adopt_group_options("php", "lang/php84"), 2);
+    assert!(state(&graph, "lang/php84", "SOAP"));
+    assert!(!state(&graph, "lang/php84", "DEBUG"));
+    assert!(
+        state(&graph, "lang/php84", "FIBERS"),
+        "an option nobody else has is left as it was"
+    );
+    assert!(
+        state(&graph, "lang/php83", "SOAP"),
+        "the members already there are not touched"
+    );
+}
+
+/// A group naming a port that is not in this list, or a port that is not in
+/// any group, must not derail the copy.
+#[test]
+fn adopting_survives_members_that_are_not_here() {
+    let mut tree = common::Tree::new("t");
+    tree.add_option("lang/php83", "SOAP", true, "", "DEFINE", "");
+
+    let mut graph = tree
+        .build(
+            &["lang/php83".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+
+    graph
+        .groups
+        .insert("php".to_string(), vec!["lang/php99".to_string()]);
+    assert_eq!(graph.adopt_group_options("php", "lang/php83"), 0);
+    assert_eq!(graph.adopt_group_options("nonesuch", "lang/php83"), 0);
+    assert_eq!(graph.adopt_group_options("php", "lang/nothere"), 0);
+}
+
+/// Most of a build set is leaf libraries with nothing to decide about them.
+#[test]
+fn hiding_leaves_only_the_ports_there_is_a_choice_about() {
+    let mut tree = common::Tree::new("t");
+
+    tree.add_option("www/app", "SSL", true, "", "DEFINE", "");
+    tree.add_port("devel/leaf");
+    tree.add_port_dep("www/app", "devel/leaf");
+    tree.add_port_dep("www/app", "devel/unread");
+    // Present but never evaluated: its options are unknown, not absent
+    tree.add_unevaluated_port("devel/unread");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+
+    let listed = |graph: &DependencyGraph| -> Vec<String> {
+        graph
+            .visible_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::Port { origin, .. } => Some(origin.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        listed(&graph),
+        vec!["devel/leaf", "devel/unread", "www/app"]
+    );
+    assert_eq!(graph.optionless_count(), 1);
+
+    graph.hide_optionless = true;
+    graph.rebuild_visible_rows();
+    assert_eq!(
+        listed(&graph),
+        vec!["devel/unread", "www/app"],
+        "a port make could not read has options unknown, not absent"
+    );
+
+    graph.hide_optionless = false;
+    graph.rebuild_visible_rows();
+    assert_eq!(listed(&graph).len(), 3);
+}
+
+/// Hiding is a view. What gets written is what is in the build.
+#[test]
+fn hiding_does_not_change_what_gets_written() {
+    let temp = TempDir::new("hide_export");
+    let options_dir = temp.path.join("ports");
+
+    let mut tree = common::Tree::new("t");
+    tree.add_option("www/app", "SSL", true, "", "DEFINE", "");
+    tree.add_option("devel/dep", "DOCS", true, "", "DEFINE", "");
+    tree.add_port_dep("www/app", "devel/dep");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.hide_optionless = true;
+    graph.rebuild_visible_rows();
+
+    exporter::export_options(&graph, &options_dir, false, None).unwrap();
+    for port in ["www_app", "devel_dep"] {
+        assert!(options_dir.join(port).join("options").exists());
+    }
+}
+
+/// The bug this whole design exists to fix, end to end.
+///
+/// `mail/sqlgrey` reaches its MySQL client through `MYSQL_USES=mysql`, which
+/// names it in no `MYSQL_*_DEPENDS` variable and produces nothing at all until
+/// the option is set. Evaluating once, at the maintainer's defaults, could never
+/// see it — so `bgone` wrote no options file for it and `poudriere options`
+/// prompted for it every time.
+#[test]
+fn turning_an_option_on_pulls_in_what_only_then_exists() {
+    let temp = TempDir::new("sqlgrey_end_to_end");
+    let options_dir = temp.path.join("ports");
+
+    let mut tree = common::Tree::new("sqlgrey");
+    tree.add_option(
+        "mail/sqlgrey",
+        "MYSQL",
+        false,
+        "MySQL backend",
+        "DEFINE",
+        "",
+    );
+    tree.add_option(
+        "mail/sqlgrey",
+        "PGSQL",
+        true,
+        "PostgreSQL backend",
+        "DEFINE",
+        "",
+    );
+    tree.add_hidden_dep("mail/sqlgrey", "MYSQL", "databases/mysql84-client");
+    tree.add_option(
+        "databases/mysql84-client",
+        "SASLCLIENT",
+        false,
+        "",
+        "GROUP",
+        "PLUGINS",
+    );
+
+    let mut graph = tree
+        .build(
+            &["mail/sqlgrey".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+    graph.expand_all();
+
+    assert!(
+        graph.port_index("databases/mysql84-client").is_none(),
+        "with MYSQL off there is no client in the build at all"
+    );
+
+    let touched = toggle(&mut graph, "mail/sqlgrey", "MYSQL");
+    let arrived = tree.resettle(&mut graph, &touched);
+
+    assert_eq!(
+        arrived,
+        vec!["databases/mysql84-client"],
+        "turning MYSQL on is what makes the dependency exist"
+    );
+    assert!(graph.is_live("databases/mysql84-client"));
+
+    // ...and it arrives configurable, with the options it defines
+    assert!(
+        graph
+            .real_options()
+            .any(|o| o.port_origin == "databases/mysql84-client" && o.name == "SASLCLIENT"),
+        "the port that arrived has to be configurable in the same session"
+    );
+
+    // ...and it is written, which is the part poudriere was complaining about
+    exporter::export_options(&graph, &options_dir, false, None).unwrap();
+    assert!(
+        options_dir
+            .join("databases_mysql84-client")
+            .join("options")
+            .exists(),
+        "no options file means poudriere prompts for it"
+    );
+}
+
+/// Turning it back off takes the port out of the build again, and stops it
+/// being written — the same reachability rule, in the other direction.
+#[test]
+fn turning_it_off_again_takes_the_port_back_out() {
+    let temp = TempDir::new("sqlgrey_off_again");
+    let options_dir = temp.path.join("ports");
+
+    let mut tree = common::Tree::new("sqlgrey_off");
+    tree.add_option("mail/sqlgrey", "MYSQL", false, "", "DEFINE", "");
+    tree.add_hidden_dep("mail/sqlgrey", "MYSQL", "databases/mysql84-client");
+    tree.add_option(
+        "databases/mysql84-client",
+        "SASLCLIENT",
+        false,
+        "",
+        "DEFINE",
+        "",
+    );
+
+    let mut graph = tree
+        .build(
+            &["mail/sqlgrey".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+    graph.expand_all();
+
+    let touched = toggle(&mut graph, "mail/sqlgrey", "MYSQL");
+    tree.resettle(&mut graph, &touched);
+    assert!(graph.is_live("databases/mysql84-client"));
+
+    let touched = toggle(&mut graph, "mail/sqlgrey", "MYSQL");
+    tree.resettle(&mut graph, &touched);
+    assert!(
+        !graph.is_live("databases/mysql84-client"),
+        "nothing pulls it in any more"
+    );
+
+    exporter::export_options(&graph, &options_dir, false, None).unwrap();
+    assert!(
+        !options_dir.join("databases_mysql84-client").exists(),
+        "a port outside the build must not be written"
+    );
 }
