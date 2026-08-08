@@ -1769,6 +1769,62 @@ impl DependencyGraph {
 
         if enabled {
             self.enforce_implications(port_id, opt_id);
+        } else if !self.option_nodes[opt_id].enabled {
+            // Only when the disable took: a SINGLE's set member refuses, and
+            // a refused press must not take its impliers down with it.
+            self.retire_impliers(port_id, opt_id);
+        }
+    }
+
+    /// Follows `FOO_IMPLIES` in the other direction, for an option just turned
+    /// off: every enabled option that implies it goes off too, transitively.
+    ///
+    /// Without this, enabling NJS (which implies STREAM) and then turning
+    /// STREAM off directly left NJS-on/STREAM-off in the session — a
+    /// combination `bsd.options.mk` silently overrides at build time, which is
+    /// exactly what this program promises cannot be saved. The philosophy is
+    /// the PREVENTS one: the press said what the user wants, and this is the
+    /// half of it that follows.
+    ///
+    /// An implier that cannot lawfully turn off — a SINGLE's one set member —
+    /// still implies its option, so the pressed option is put back on and the
+    /// press is refused, the same way pressing that SINGLE member itself would
+    /// have been.
+    fn retire_impliers(&mut self, port_id: usize, opt_id: usize) {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        queue.push_back(opt_id);
+        seen.insert(opt_id);
+
+        while let Some(current) = queue.pop_front() {
+            let current_name = self.option_nodes[current].name.clone();
+            let impliers: Vec<usize> = self.ports[port_id]
+                .options
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let o = &self.option_nodes[id];
+                    o.enabled && o.implies.contains(&current_name)
+                })
+                .collect();
+            for id in impliers {
+                self.apply_state_respecting_groups(port_id, id, false);
+                if seen.insert(id) {
+                    queue.push_back(id);
+                }
+            }
+        }
+
+        // A refusal upstream leaves an enabled implier standing; honouring the
+        // press anyway would recreate the very combination this exists to
+        // prevent, so the press is undone instead.
+        let name = self.option_nodes[opt_id].name.clone();
+        let still_implied = self.ports[port_id].options.iter().copied().any(|id| {
+            let o = &self.option_nodes[id];
+            o.enabled && o.implies.contains(&name)
+        });
+        if still_implied {
+            self.apply_state_respecting_groups(port_id, opt_id, true);
         }
     }
 

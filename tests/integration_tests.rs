@@ -1428,6 +1428,68 @@ fn prevents_clears_a_radio_member() {
     assert!(!is_on(&graph, "www/app", "GSSAPI"));
 }
 
+/// Turning off an option that an enabled option implies turns the implier off
+/// too, transitively — the reverse of the enable direction, with the PREVENTS
+/// philosophy: the press said what the user wants, and this is the half that
+/// follows. NJS-on/STREAM-off is a combination the framework silently
+/// overrides at build time, and it used to be reachable by exactly this press.
+#[test]
+fn disabling_an_implied_option_retires_its_impliers() {
+    let mut tree = common::Tree::new("retire_impliers");
+    tree.add_option("www/app", "CACHE", false, "", "DEFINE", "");
+    tree.add_option("www/app", "NJS", false, "", "DEFINE", "");
+    tree.add_option("www/app", "STREAM", false, "", "DEFINE", "");
+    tree.add_implies("www/app", "CACHE", "NJS");
+    tree.add_implies("www/app", "NJS", "STREAM");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "CACHE");
+    assert!(is_on(&graph, "www/app", "NJS"));
+    assert!(is_on(&graph, "www/app", "STREAM"));
+
+    toggle(&mut graph, "www/app", "STREAM");
+    assert!(!is_on(&graph, "www/app", "STREAM"));
+    assert!(
+        !is_on(&graph, "www/app", "NJS"),
+        "NJS implies STREAM, so it cannot stay on"
+    );
+    assert!(
+        !is_on(&graph, "www/app", "CACHE"),
+        "the chain retires transitively"
+    );
+}
+
+/// An implier that cannot lawfully turn off — a SINGLE's one set member —
+/// still implies its option, so the press is refused and the option put back,
+/// exactly as pressing that SINGLE member itself would have been refused.
+#[test]
+fn an_option_implied_by_a_single_member_cannot_turn_off() {
+    let mut tree = common::Tree::new("implied_by_single");
+    tree.add_option("www/app", "MYSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "PGSQL", false, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "SSL", false, "", "DEFINE", "");
+    tree.add_implies("www/app", "MYSQL", "SSL");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "SSL");
+    assert!(is_on(&graph, "www/app", "SSL"));
+
+    toggle(&mut graph, "www/app", "SSL");
+    assert!(
+        is_on(&graph, "www/app", "SSL"),
+        "MYSQL implies SSL and cannot turn off, so the press is refused"
+    );
+    assert!(is_on(&graph, "www/app", "MYSQL"));
+}
+
 /// An option naming something the port does not define is ignored rather than
 /// treated as an error — ports do it, and there is nothing to set.
 #[test]

@@ -1,6 +1,6 @@
 use crate::config::save_groups;
 use crate::graph::{
-    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, ResettleOutcome,
+    next_sibling_index, prev_sibling_index, DependencyGraph, NodeId, Provenance, ResettleOutcome,
     RowAnchor, RowKind, SectionKind,
 };
 use crate::oracle::{Options, Oracle, Question};
@@ -285,6 +285,65 @@ fn enclosing_port_origin(graph: &DependencyGraph, row: usize) -> Option<String> 
             RowKind::Port { origin, .. } => Some(origin.clone()),
             _ => None,
         })
+}
+
+/// Describes what a toggle did: the pressed option's new state, anything else
+/// the press moved on its port — implications, conflicts, a displaced group
+/// sibling — and, when nothing moved at all, which rule refused the press.
+/// A cascade or a refusal that happens silently reads as corruption.
+fn toggle_report(
+    graph: &DependencyGraph,
+    pressed_name: &str,
+    pressed_id: usize,
+    before: &[(usize, bool)],
+) -> String {
+    let state = |on: bool| if on { "on" } else { "off" };
+    let now_on = graph.option_nodes[pressed_id].enabled;
+    let was_on = before
+        .iter()
+        .find(|(id, _)| *id == pressed_id)
+        .map(|&(_, on)| on)
+        .unwrap_or(!now_on);
+
+    let also: Vec<String> = before
+        .iter()
+        .filter(|&&(id, was)| id != pressed_id && graph.option_nodes[id].enabled != was)
+        .map(|&(id, was)| format!("{} {}", graph.option_nodes[id].name, state(!was)))
+        .collect();
+
+    let lead = if now_on == was_on {
+        format!("'{pressed_name}' stays {}", state(now_on))
+    } else {
+        format!("'{pressed_name}' {}", state(now_on))
+    };
+
+    if !also.is_empty() {
+        return format!("{lead}; also: {}", also.join(", "));
+    }
+    if now_on != was_on {
+        return lead;
+    }
+
+    // Nothing moved: name the rule that held the press.
+    let opt = &graph.option_nodes[pressed_id];
+    if opt.group_type == "SINGLE" && now_on {
+        return format!("{lead}: a SINGLE keeps one member set");
+    }
+    let implier = graph.ports[opt.parent_port]
+        .options
+        .iter()
+        .copied()
+        .find(|&id| {
+            let o = &graph.option_nodes[id];
+            id != pressed_id && o.enabled && o.implies.iter().any(|n| n == pressed_name)
+        });
+    if let Some(id) = implier {
+        return format!(
+            "{lead}: {} implies it and cannot turn off",
+            graph.option_nodes[id].name
+        );
+    }
+    lead
 }
 
 /// Moves to `origin`'s entry, opening it on arrival. `None` when that port is
@@ -1599,24 +1658,39 @@ impl App {
 
                     KeyCode::Char(' ') => {
                         if let Some(selected) = self.list_state.selected() {
-                            if let Some(row) = graph.visible_rows.get(selected) {
-                                match &row.kind {
-                                    RowKind::Option { name, .. } => {
-                                        let opt_name = name.clone();
-                                        // A toggle can strand whole ports out of
-                                        // the list, so it renumbers rows just as
-                                        // an expand does
-                                        let anchor = graph.anchor_at(selected);
-                                        let touched = graph.toggle_option(selected);
-                                        self.restore_anchor(graph, anchor);
-                                        self.ask_about(graph, &touched);
-                                        self.status_msg = format!("Toggled option '{}'", opt_name);
-                                    }
-                                    _ => {
-                                        self.status_msg =
-                                            String::from("Cannot toggle non-option row");
-                                    }
+                            let pressed = graph
+                                .visible_rows
+                                .get(selected)
+                                .map(|row| (row.kind.clone(), row.node_id.clone()));
+                            match pressed {
+                                Some((RowKind::Option { name, .. }, NodeId::Option(opt_id))) => {
+                                    // Cascades — implications, conflicts, group
+                                    // sync — move options the press never named,
+                                    // and moving them silently reads as
+                                    // corruption. The port's states are
+                                    // snapshotted so the message can say what
+                                    // else moved, or why nothing did.
+                                    let port_id = graph.option_nodes[opt_id].parent_port;
+                                    let before: Vec<(usize, bool)> = graph.ports[port_id]
+                                        .options
+                                        .iter()
+                                        .map(|&id| (id, graph.option_nodes[id].enabled))
+                                        .collect();
+
+                                    // A toggle can strand whole ports out of
+                                    // the list, so it renumbers rows just as
+                                    // an expand does
+                                    let anchor = graph.anchor_at(selected);
+                                    let touched = graph.toggle_option(selected);
+                                    self.restore_anchor(graph, anchor);
+                                    self.ask_about(graph, &touched);
+
+                                    self.status_msg = toggle_report(graph, &name, opt_id, &before);
                                 }
+                                Some(_) => {
+                                    self.status_msg = String::from("Cannot toggle non-option row");
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -2530,6 +2604,70 @@ mod tests {
         assert!(
             set.contains(&"STREAM".to_string()),
             "the implied option is part of the state the question describes"
+        );
+    }
+
+    /// A cascade is said, not silent: a toggle that implications move reports
+    /// what else changed on the port, in both directions.
+    #[test]
+    fn the_status_line_reports_toggle_cascades() {
+        let mut p = fixture_port("www/app");
+        fixture_option(&mut p, "NJS", false, "DEFINE", "");
+        fixture_option(&mut p, "STREAM", false, "DEFINE", "");
+        p.options[0].implies = vec!["STREAM".to_string()];
+        let mut graph = built(vec![p], &["www/app"]);
+        let mut app = App::new(None);
+
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/app", "NJS")));
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(
+            app.status_msg.contains("'NJS' on") && app.status_msg.contains("STREAM on"),
+            "the implied option must be named: {:?}",
+            app.status_msg
+        );
+
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/app", "STREAM")));
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(
+            app.status_msg.contains("'STREAM' off") && app.status_msg.contains("NJS off"),
+            "the retired implier must be named: {:?}",
+            app.status_msg
+        );
+    }
+
+    /// A refused press says which rule held it, instead of claiming a toggle
+    /// that never happened.
+    #[test]
+    fn the_status_line_explains_a_refused_toggle() {
+        let mut p = fixture_port("www/app");
+        fixture_option(&mut p, "MYSQL", true, "SINGLE", "BACKEND");
+        fixture_option(&mut p, "PGSQL", false, "SINGLE", "BACKEND");
+        fixture_option(&mut p, "SSL", true, "DEFINE", "");
+        p.options[0].implies = vec!["SSL".to_string()];
+        let mut graph = built(vec![p], &["www/app"]);
+        let mut app = App::new(None);
+
+        // The SINGLE's set member refuses directly...
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/app", "MYSQL")));
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(
+            app.status_msg.contains("stays on")
+                && app.status_msg.contains("SINGLE keeps one member"),
+            "got: {:?}",
+            app.status_msg
+        );
+
+        // ...and so does an option that member implies.
+        app.list_state
+            .select(Some(row_of_option(&graph, "www/app", "SSL")));
+        app.on_key(key(KeyCode::Char(' ')), &mut graph);
+        assert!(
+            app.status_msg.contains("'SSL' stays on") && app.status_msg.contains("MYSQL"),
+            "got: {:?}",
+            app.status_msg
         );
     }
 
