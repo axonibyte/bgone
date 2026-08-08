@@ -531,7 +531,7 @@ pub fn check_evals(
 
 // ---------------------------------------------------------------- tape
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
     Toggle,
     DoubleToggle,
@@ -628,6 +628,145 @@ pub fn draw_tape(seed: u32, n: usize) -> Vec<Slot> {
 }
 
 // ---------------------------------------------------------------- engine
+
+// ---------------------------------------------------------------- shrinker
+
+/// One slot per line: the kind's label and its four argument words. This is
+/// what a promoted regression stores — the surviving action list itself, not
+/// a seed pin. A tape survives generator weight changes; note that the *world*
+/// still derives from the seed, so a change to `gen_world` invalidates the
+/// corpus and every promoted trace must be re-shrunk. Say so when it happens.
+pub fn serialize_tape(tape: &[Slot]) -> String {
+    let mut out = String::new();
+    for slot in tape {
+        let _ = writeln!(
+            out,
+            "{} {} {} {} {}",
+            kind_name(slot.kind),
+            slot.args[0],
+            slot.args[1],
+            slot.args[2],
+            slot.args[3]
+        );
+    }
+    out
+}
+
+pub fn parse_tape(text: &str) -> Vec<Slot> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|line| {
+            let mut parts = line.split_whitespace();
+            let label = parts.next().expect("kind label");
+            let kind = *ALL_KINDS
+                .iter()
+                .find(|&&k| kind_name(k) == label)
+                .unwrap_or_else(|| panic!("unknown action kind {label:?}"));
+            let mut arg = || {
+                parts
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .expect("four u32 arguments per slot")
+            };
+            Slot {
+                kind,
+                args: [arg(), arg(), arg(), arg()],
+            }
+        })
+        .collect()
+}
+
+/// Shrinks a failing tape: shortest failing prefix first, then whole action
+/// kinds removed one at a time, keeping each removal that still fails — which
+/// answers "is that action actually involved, or merely present". Generic
+/// over the failure predicate so the mechanism itself is testable without a
+/// failing engine. Every candidate replays in a fresh world (the runner
+/// builds one per call), so a successful shrink is strong evidence; a
+/// bisection step that stops failing is simply discarded.
+pub fn shrink_with<F: Fn(&[Slot]) -> bool>(fails: F, tape: &[Slot]) -> Vec<Slot> {
+    if !fails(tape) {
+        return tape.to_vec();
+    }
+
+    // Shortest failing prefix. Bisection assumes rough monotonicity; the
+    // fallback below keeps the result honest if it is not.
+    let (mut lo, mut hi) = (1usize, tape.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fails(&tape[..mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let mut current: Vec<Slot> = if fails(&tape[..hi]) {
+        tape[..hi].to_vec()
+    } else {
+        tape.to_vec()
+    };
+
+    // Remove whole kinds while the failure survives.
+    for &kind in &ALL_KINDS {
+        if !current.iter().any(|s| s.kind == kind) {
+            continue;
+        }
+        let candidate: Vec<Slot> = current.iter().copied().filter(|s| s.kind != kind).collect();
+        if !candidate.is_empty() && fails(&candidate) {
+            current = candidate;
+        }
+    }
+
+    // Then single slots, back to front — a kind that cannot vanish wholly
+    // (some of its steps are involved) still sheds its uninvolved occurrences.
+    let mut i = current.len();
+    while i > 0 {
+        i -= 1;
+        if current.len() <= 1 {
+            break;
+        }
+        let mut candidate = current.clone();
+        candidate.remove(i);
+        if fails(&candidate) {
+            current = candidate;
+        }
+    }
+    current
+}
+
+/// The real shrinker: replays the same seed's world against candidate tapes.
+pub fn shrink_failure(seed: u32, tape: &[Slot]) -> Vec<Slot> {
+    shrink_with(|t| run_tape(seed, t).is_err(), tape)
+}
+
+/// Runs a seed, and on failure shrinks it and formats everything a regression
+/// needs: the original failure, the shrunk tape ready to promote, and the
+/// shrunk run's own message.
+pub fn run_sim_shrinking(seed: u32, actions: usize) -> Result<Report, String> {
+    let tape = draw_tape(seed, actions);
+    match run_tape(seed, &tape) {
+        Ok(report) => Ok(report),
+        Err(failure) => {
+            let shrunk = shrink_failure(seed, &tape);
+            let confirmation = match run_tape(seed, &shrunk) {
+                Err(f) => format!("shrunk failure:\n{f}"),
+                Ok(_) => "shrunk tape no longer fails; the full tape above is the evidence".into(),
+            };
+            Err(format!(
+                "{failure}\n\
+                 shrunk from {} to {} step(s); promote by pasting this tape into a\n\
+                 regression test with replay_regression({seed}, ...):\n{}\n{confirmation}",
+                tape.len(),
+                shrunk.len(),
+                serialize_tape(&shrunk)
+            ))
+        }
+    }
+}
+
+/// Replays a promoted regression trace against its seed's world.
+pub fn replay_regression(seed: u32, tape_text: &str) -> Result<Report, Box<Failure>> {
+    run_tape(seed, &parse_tape(tape_text))
+}
 
 pub struct Step {
     pub ordinal: usize,

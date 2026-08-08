@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use sim::{
     check_evals, check_group_rules, check_live_set, check_make_conf, check_no_duplicates,
-    check_options_file, check_relations, run_sim, OptView, ALL_KINDS,
+    check_options_file, check_relations, parse_tape, replay_regression, run_sim, run_sim_shrinking,
+    serialize_tape, shrink_with, OptView, ALL_KINDS,
 };
 
 // ============================================================================
@@ -201,7 +202,7 @@ fn fixed_seed_runs_stay_green() {
 
     for seed in [1u32, 2] {
         println!("simulated-user run: seed {seed}");
-        match run_sim(seed, 225) {
+        match run_sim_shrinking(seed, 225) {
             Ok(report) => {
                 for (kind, (f, s)) in &report.histogram {
                     *fired.entry(kind).or_default() += f;
@@ -263,7 +264,7 @@ fn hunting_mode_when_requested() {
 
     println!("hunting: seed {seed}, {actions} actions");
     let started = std::time::Instant::now();
-    match run_sim(seed, actions) {
+    match run_sim_shrinking(seed, actions) {
         Ok(report) => println!(
             "seed {seed}: {} executed, {} skipped, {:.1}s",
             report.executed,
@@ -271,5 +272,72 @@ fn hunting_mode_when_requested() {
             started.elapsed().as_secs_f64()
         ),
         Err(failure) => panic!("{failure}"),
+    }
+}
+
+// ============================================================================
+// The shrinker and the promotion mechanism.
+//
+// Promoting a finding: paste the shrunk tape a failure prints into a named
+// test here, calling replay_regression(<seed>, <tape>), and assert it stays
+// green once the fix lands. The corpus starts empty — the mechanism below is
+// proven on synthetic input so it is known to work before it is ever needed.
+// A change to the world generator invalidates promoted traces (the world
+// still derives from the seed); re-shrink and say so when that happens.
+// ============================================================================
+
+#[test]
+fn a_tape_serialises_and_parses_back_identically() {
+    let tape = sim::draw_tape(7, 40);
+    let text = serialize_tape(&tape);
+    let parsed = parse_tape(&text);
+    assert_eq!(tape.len(), parsed.len());
+    for (a, b) in tape.iter().zip(parsed.iter()) {
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.args, b.args);
+    }
+}
+
+/// The shrinker proven on a synthetic failure: a "bug" that needs one
+/// export after one drop-cache. It must cut everything else and keep both
+/// involved kinds — answering "is that action involved, or merely present".
+#[test]
+fn the_shrinker_isolates_the_involved_actions() {
+    use sim::Kind;
+    let tape = sim::draw_tape(11, 120);
+    let fails = |t: &[sim::Slot]| {
+        let drop_at = t.iter().position(|s| s.kind == Kind::DropCache);
+        match drop_at {
+            Some(at) => t[at..].iter().any(|s| s.kind == Kind::Export),
+            None => false,
+        }
+    };
+    if !fails(&tape) {
+        panic!("the synthetic bug must be reachable in this tape; widen it");
+    }
+    let shrunk = shrink_with(fails, &tape);
+    assert!(fails(&shrunk), "the shrunk tape must still fail");
+    assert!(
+        shrunk.len() <= 4,
+        "expected a near-minimal tape, got {} steps",
+        shrunk.len()
+    );
+    let kinds: HashSet<sim::Kind> = shrunk.iter().map(|s| s.kind).collect();
+    assert!(kinds.contains(&Kind::DropCache) && kinds.contains(&Kind::Export));
+}
+
+/// The replay path a promoted regression uses, proven green on a hand-written
+/// tape so the first real promotion lands on a known-working mechanism.
+#[test]
+fn a_promoted_trace_replays_through_the_executor() {
+    let trace = "\
+        # a hand-written miniature: toggle, settle, export, reload
+        toggle 5 0 0 0
+        resettle 0 0 0 0
+        export 0 0 0 0
+        reload 0 0 0 0
+    ";
+    if let Err(failure) = replay_regression(21, trace) {
+        panic!("{failure}");
     }
 }
