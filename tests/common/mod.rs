@@ -331,8 +331,21 @@ impl Tree {
     /// Asks the tree about ports whose options have just changed, exactly as
     /// the interface does off its event loop. Returns the ports that arrived.
     pub fn resettle(&mut self, graph: &mut DependencyGraph, touched: &[String]) -> Vec<String> {
+        self.resettle_with(graph, touched, &SystemOptions::default())
+            .arrived
+    }
+
+    /// As [`Tree::resettle`], under a saved configuration — the shape a port
+    /// arriving mid-session with non-default saved options takes — and with
+    /// the full outcome, failures included.
+    pub fn resettle_with(
+        &mut self,
+        graph: &mut DependencyGraph,
+        touched: &[String],
+        sys_opts: &SystemOptions,
+    ) -> bgone::graph::ResettleOutcome {
         let oracle = self.oracle();
-        graph.resettle(&oracle, &SystemOptions::default(), touched)
+        graph.resettle(&oracle, sys_opts, touched)
     }
 }
 

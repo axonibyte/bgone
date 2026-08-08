@@ -186,7 +186,7 @@ fn configure(cli: &Cli, config: Option<&bgone::config::Config>, oracle: &Oracle)
     let settle: ui::Settle = Box::new(move |graph: &mut graph::DependencyGraph| {
         let changed = graph.changed_ports();
         if changed.is_empty() {
-            return Vec::new();
+            return graph::ResettleOutcome::default();
         }
         let oracle = Oracle::new(settle_env.clone(), settle_db.clone());
         graph.resettle(&oracle, &settle_opts, &changed)
@@ -213,13 +213,16 @@ fn configure(cli: &Cli, config: Option<&bgone::config::Config>, oracle: &Oracle)
             let changed = dep_graph.changed_ports();
             if !changed.is_empty() {
                 let oracle = Oracle::new(make_env(cli), cli.db_path.clone());
-                let arrived = dep_graph.resettle(&oracle, &sys_opts, &changed);
-                if !arrived.is_empty() {
+                let outcome = dep_graph.resettle(&oracle, &sys_opts, &changed);
+                if !outcome.arrived.is_empty() {
                     println!(
                         "[*] {} port(s) pulled in by your changes: {}",
-                        arrived.len(),
-                        arrived.join(", ")
+                        outcome.arrived.len(),
+                        outcome.arrived.join(", ")
                     );
+                }
+                for (origin, why) in &outcome.failed {
+                    eprintln!("[!] {origin} could not be re-evaluated: {why}");
                 }
             }
 

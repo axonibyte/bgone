@@ -297,6 +297,17 @@ struct Collected {
     states: HashMap<String, bool>,
 }
 
+/// What a [`DependencyGraph::resettle`] did: which ports arrived, and which
+/// could not be re-asked.
+#[derive(Debug, Default)]
+pub struct ResettleOutcome {
+    /// Ports that were not in the build until the resettle ran.
+    pub arrived: Vec<String>,
+    /// Ports whose re-evaluation failed, with the reason. Their entries are
+    /// marked unevaluated rather than left silently holding stale dependencies.
+    pub failed: Vec<(String, String)>,
+}
+
 impl Collected {
     /// A port `make` could not read. It still exists and is still depended on,
     /// so it is kept and marked rather than dropped — a silently optionless port
@@ -611,7 +622,18 @@ impl DependencyGraph {
                     }
                 };
 
-                let entry = self.collect_port(oracle, &facts, sys_opts)?;
+                // The second evaluation — under the options in force — can
+                // fail on its own, and one port's failure must not abort the
+                // walk any more than a first-evaluation failure does. The two
+                // paths record the same way.
+                let entry = match self.collect_port(oracle, &facts, sys_opts) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        failures.push((origin.clone(), e.to_string()));
+                        collected.insert(origin, Collected::unevaluated());
+                        continue;
+                    }
+                };
                 for dep in entry.dependencies() {
                     if seen.insert(dep.clone()) {
                         next.push(dep);
@@ -861,9 +883,6 @@ impl DependencyGraph {
     /// Asks the tree about every port in `origins` under the options now set,
     /// folds the answers in, and keeps going until nothing new turns up.
     ///
-    /// Returns the ports that arrived, which are the ones that were not in the
-    /// build until this ran.
-    ///
     /// The interface does the same thing a batch at a time off the event loop,
     /// so a keystroke is never waiting on `make`; this is the blocking form, for
     /// the places that need the graph settled before they can act on it — saving,
@@ -873,8 +892,8 @@ impl DependencyGraph {
         oracle: &Oracle,
         sys_opts: &SystemOptions,
         origins: &[String],
-    ) -> Vec<String> {
-        let mut arrived = Vec::new();
+    ) -> ResettleOutcome {
+        let mut outcome = ResettleOutcome::default();
         let mut asking: Vec<Question> = origins
             .iter()
             .filter_map(|o| {
@@ -892,10 +911,48 @@ impl DependencyGraph {
             let mut next: Vec<Question> = Vec::new();
 
             for (origin, answer) in answers {
-                let Ok(facts) = answer else { continue };
+                let facts = match answer {
+                    Ok(facts) => facts,
+                    Err(e) => {
+                        // Recorded, not swallowed: the caller is about to
+                        // write files, and a port whose dependencies could not
+                        // be refreshed has to be said out loud. Its entry is
+                        // marked unevaluated so the list says so too, rather
+                        // than showing dependencies that may have moved on.
+                        if let Some(id) = self.port_index(&origin) {
+                            self.ports[id].resolved = false;
+                        }
+                        outcome.failed.push((origin, e.to_string()));
+                        continue;
+                    }
+                };
                 if self.port_index(&origin).is_none() {
                     self.add_port(&facts, sys_opts);
-                    arrived.push(origin.clone());
+                    outcome.arrived.push(origin.clone());
+
+                    // The port arrived evaluated as it ships, but `add_port`
+                    // seeded its options from the saved configuration — and a
+                    // dependency added by `${opt}_USES` or an `.if` block only
+                    // exists under the options actually in force. Where the
+                    // two differ, it is re-asked exactly as `collect_port`
+                    // does on the first walk; without this, a port arriving
+                    // mid-session got the as-shipped dependencies, which is
+                    // the very gap this module exists to close.
+                    let in_force: Vec<String> = facts
+                        .options
+                        .iter()
+                        .filter(|o| sys_opts.get_state(&facts.origin, &o.name, o.default_on))
+                        .map(|o| o.name.clone())
+                        .collect();
+                    let as_shipped: Vec<String> = facts
+                        .options
+                        .iter()
+                        .filter(|o| o.default_on)
+                        .map(|o| o.name.clone())
+                        .collect();
+                    if in_force != as_shipped {
+                        next.push((origin.clone(), Options::Exactly(in_force)));
+                    }
                 }
                 for unknown in self.apply_resolution(&origin, &facts) {
                     if asked.insert(unknown.clone()) {
@@ -911,7 +968,7 @@ impl DependencyGraph {
         }
 
         self.rebuild_visible_rows();
-        arrived
+        outcome
     }
 
     /// Adds a port the walk had not reached, with its options set the way the

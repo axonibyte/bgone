@@ -1,7 +1,7 @@
 use crate::config::save_groups;
 use crate::graph::{
-    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, RowAnchor, RowKind,
-    SectionKind,
+    next_sibling_index, prev_sibling_index, DependencyGraph, Provenance, ResettleOutcome,
+    RowAnchor, RowKind, SectionKind,
 };
 use crate::oracle::{Options, Oracle, Question};
 use crate::reader::SystemOptions;
@@ -724,8 +724,9 @@ pub type Saver = Box<dyn Fn(&DependencyGraph) -> Result<String>>;
 /// worker, and a port pulled in by that toggle would otherwise be left out of
 /// the files — which is the failure this whole design exists to fix.
 ///
-/// Returns the ports that arrived.
-pub type Settle = Box<dyn Fn(&mut DependencyGraph) -> Vec<String>>;
+/// Returns what the resettle did — the ports that arrived, and any it could
+/// not re-ask.
+pub type Settle = Box<dyn Fn(&mut DependencyGraph) -> ResettleOutcome>;
 
 struct App {
     input_mode: InputMode,
@@ -1283,13 +1284,20 @@ impl App {
                         // Settled first: what is written is what is in the
                         // build, so the build has to be up to date with the
                         // options as they now stand.
+                        let mut failed = 0;
                         if let Some(settle) = &self.settle {
                             let anchor = graph.anchor_at(selected_index);
-                            settle(graph);
+                            failed = settle(graph).failed.len();
                             self.restore_anchor(graph, anchor);
                         }
                         self.status_msg = match &self.saver {
                             Some(save) => match save(graph) {
+                                // A port that could not be re-asked may have
+                                // been written stale — said next to the save,
+                                // not swallowed by it.
+                                Ok(what) if failed > 0 => {
+                                    format!("{what}; {failed} port(s) could not be re-evaluated")
+                                }
                                 Ok(what) => what,
                                 Err(e) => format!("Could not save: {e}"),
                             },

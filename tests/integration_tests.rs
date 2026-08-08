@@ -2926,3 +2926,113 @@ fn turning_it_off_again_takes_the_port_back_out() {
         "a port outside the build must not be written"
     );
 }
+
+/// A port arriving mid-session is seeded from the saved configuration, so it
+/// has to be *asked* under that configuration too: a dependency added by
+/// `${opt}_USES` exists only under the options in force, and the as-shipped
+/// answer cannot see it. This is the second evaluation `load_ports` performs,
+/// mirrored into `resettle`.
+#[test]
+fn a_port_arriving_mid_session_is_asked_under_its_saved_options() {
+    let mut tree = common::Tree::new("resettle_saved_opts");
+    // A pulls in B only once OPT goes on; B's saved configuration turns X on,
+    // and X hides a dependency on C that only a second evaluation can see.
+    tree.add_option("www/a", "OPT", false, "", "DEFINE", "");
+    tree.add_hidden_dep("www/a", "OPT", "www/b");
+    tree.add_option("www/b", "X", false, "", "DEFINE", "");
+    tree.add_hidden_dep("www/b", "X", "www/c");
+    tree.add_port("www/c");
+
+    let mut sys_opts = SystemOptions::default();
+    sys_opts
+        .port_overrides
+        .entry("www/b".to_string())
+        .or_default()
+        .insert("X".to_string(), true);
+
+    let mut graph = tree
+        .build(&["www/a".to_string()], &sys_opts, false)
+        .unwrap();
+    graph.expand_all();
+    assert!(graph.port_index("www/b").is_none());
+
+    let touched = toggle(&mut graph, "www/a", "OPT");
+    let outcome = tree.resettle_with(&mut graph, &touched, &sys_opts);
+
+    assert!(outcome.arrived.contains(&"www/b".to_string()));
+    assert!(
+        outcome.arrived.contains(&"www/c".to_string()),
+        "www/b arrived with X saved on, so X's hidden dependency has to arrive too"
+    );
+    assert!(graph.is_live("www/c"));
+}
+
+/// A re-ask that fails is reported and the port marked unevaluated — the
+/// caller is about to write files, and stale dependencies shown as current
+/// are exactly what a resettle exists to prevent.
+#[test]
+fn a_failed_re_ask_is_reported_and_marked_rather_than_swallowed() {
+    let mut tree = common::Tree::new("resettle_failure");
+    tree.add_option("www/a", "OPT", false, "", "DEFINE", "");
+
+    let mut graph = tree.graph(&["www/a"]);
+    graph.expand_all();
+
+    let touched = toggle(&mut graph, "www/a", "OPT");
+    // The tree moves out from under the session: the re-ask cannot answer.
+    fs::remove_file(tree.root().join("www/a/.port")).unwrap();
+    let outcome = tree.resettle_with(&mut graph, &touched, &SystemOptions::default());
+
+    assert_eq!(outcome.failed.len(), 1, "the failure must be reported");
+    assert_eq!(outcome.failed[0].0, "www/a");
+    assert!(
+        graph.unevaluated_ports().contains(&"www/a"),
+        "the port must be marked rather than left showing stale dependencies"
+    );
+}
+
+/// One port's *second* evaluation failing is tolerated the way its first
+/// failing is: recorded, marked, and walked past. It used to abort the whole
+/// load, killing the run over one deep dependency that only failed under the
+/// user's saved options.
+#[test]
+fn one_ports_second_evaluation_failing_does_not_abort_the_load() {
+    let mut tree = common::Tree::new("second_eval_failure");
+    tree.add_option("www/a", "X", false, "", "DEFINE", "");
+    tree.add_port("www/other");
+
+    // Warm the as-shipped replies, then take one description away: the second
+    // evaluation — needed because X is saved on — has nothing left to ask.
+    let oracle = tree.oracle();
+    oracle
+        .facts("www/a", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    oracle
+        .facts("www/other", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    fs::remove_file(tree.root().join("www/a/.port")).unwrap();
+
+    let mut sys_opts = SystemOptions::default();
+    sys_opts
+        .port_overrides
+        .entry("www/a".to_string())
+        .or_default()
+        .insert("X".to_string(), true);
+
+    let graph = tree
+        .build(
+            &["www/a".to_string(), "www/other".to_string()],
+            &sys_opts,
+            false,
+        )
+        .unwrap();
+
+    assert!(
+        graph.unevaluated_ports().contains(&"www/a"),
+        "the port whose second evaluation failed is marked, not fatal"
+    );
+    assert!(
+        graph.port_index("www/other").is_some(),
+        "the rest of the build must survive"
+    );
+}
