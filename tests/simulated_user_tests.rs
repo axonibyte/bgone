@@ -275,6 +275,45 @@ fn hunting_mode_when_requested() {
     }
 }
 
+/// The real-stack answer: hunt against an actual ports tree with the real
+/// make. BGONE_SIM_TREE names the tree (usually /usr/ports), BGONE_SIM_ROOTS
+/// the origins to configure (comma-separated, default ports-mgmt/pkg),
+/// BGONE_SIM_ACTIONS the length (default 40 — every cache miss is a real make
+/// run). History-independent invariants only; not part of CI.
+#[test]
+fn real_tree_hunting_mode_when_requested() {
+    let Some(tree) = std::env::var_os("BGONE_SIM_TREE").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let roots: Vec<String> = std::env::var("BGONE_SIM_ROOTS")
+        .unwrap_or_else(|_| "ports-mgmt/pkg".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let actions = std::env::var("BGONE_SIM_ACTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(40);
+    let seed = std::env::var("BGONE_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+
+    println!(
+        "real-tree hunt: {} {roots:?}, {actions} actions, seed {seed}",
+        tree.display()
+    );
+    let started = std::time::Instant::now();
+    match sim::run_real_tree(&tree, &roots, actions, seed) {
+        Ok(executed) => println!(
+            "real-tree seed {seed}: {executed} executed, {:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        Err(message) => panic!("{message}"),
+    }
+}
+
 // ============================================================================
 // The shrinker and the promotion mechanism.
 //

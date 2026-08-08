@@ -1018,18 +1018,7 @@ impl Engine {
     }
 
     fn views(&self) -> Vec<OptView> {
-        self.graph
-            .real_options()
-            .map(|o| OptView {
-                port: o.port_origin.clone(),
-                name: o.name.clone(),
-                enabled: o.enabled,
-                group_type: o.group_type.clone(),
-                group_name: o.group_name.clone(),
-                implies: o.implies.clone(),
-                prevents: o.prevents.clone(),
-            })
-            .collect()
+        views_of(&self.graph)
     }
 
     fn read_new_log_pairs(&mut self) -> Vec<String> {
@@ -1845,6 +1834,177 @@ impl Engine {
             .map_err(|e| format!("could not read make.conf: {e}"))?;
         check_make_conf(&make_conf, SENTINEL)
     }
+}
+
+pub fn views_of(graph: &DependencyGraph) -> Vec<OptView> {
+    graph
+        .real_options()
+        .map(|o| OptView {
+            port: o.port_origin.clone(),
+            name: o.name.clone(),
+            enabled: o.enabled,
+            group_type: o.group_type.clone(),
+            group_name: o.group_name.clone(),
+            implies: o.implies.clone(),
+            prevents: o.prevents.clone(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------- real tree
+
+/// The hunting mode against a real ports tree — the doc's "confirm there is a
+/// real stack to run against", answered directly. Real `make`, a read-only
+/// tree, and a temp home for the options dir, make.conf and cache.
+///
+/// No spec exists for a real tree, so this runs the history-independent
+/// invariants only, and the relation/group checks only for ports this session
+/// has toggled: real shipped defaults may themselves violate closure (the
+/// framework tolerates that and fixes it up at build time), which is input,
+/// not this program's doing. There is no stub log either, so the eval oracle
+/// does not run here — both narrowings stated rather than silent.
+pub fn run_real_tree(
+    ports_dir: &std::path::Path,
+    roots: &[String],
+    actions: usize,
+    seed: u32,
+) -> Result<usize, String> {
+    use bgone::oracle::Oracle;
+    use bgone::resolve::MakeEnv;
+
+    let io = TempDir::new(&format!("sim_real_{seed}"));
+    let options_dir = io.join("options");
+    fs::create_dir_all(&options_dir).map_err(|e| e.to_string())?;
+    let make_conf = io.join("make.conf");
+    fs::write(&make_conf, format!("{SENTINEL}\n")).map_err(|e| e.to_string())?;
+
+    let oracle = Oracle::new(MakeEnv::new(ports_dir), io.join("cache.db"));
+    let mut session_opts =
+        SystemOptions::load(&options_dir, Some(&make_conf)).map_err(|e| e.to_string())?;
+    let mut graph = DependencyGraph::resolve(&oracle, roots, &session_opts, false)
+        .map_err(|e| format!("initial resolve failed: {e:#}"))?;
+    graph.expand_all();
+
+    let mut rng = Rng::new(seed);
+    let mut exported: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    let mut touched_ports: BTreeSet<String> = BTreeSet::new();
+    let mut executed = 0usize;
+
+    for step in 0..actions {
+        let fail = |what: String| format!("real-tree seed {seed} step {step}: {what}");
+
+        match rng.below(10) {
+            0..=4 => {
+                let rows: Vec<usize> = graph
+                    .visible_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| match r.node_id {
+                        NodeId::Option(_) => Some(i),
+                        _ => None,
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let row = rows[rng.below(rows.len())];
+                let touched = graph.toggle_option(row);
+                touched_ports.extend(touched);
+            }
+            5 => {
+                let changed = graph.changed_ports();
+                if changed.is_empty() {
+                    continue;
+                }
+                let outcome = graph.resettle(&oracle, &session_opts, &changed);
+                if !outcome.failed.is_empty() {
+                    return Err(fail(format!(
+                        "resettle failed on an intact tree: {:?}",
+                        outcome.failed
+                    )));
+                }
+                touched_ports.extend(outcome.arrived);
+            }
+            6 => {
+                let changed = graph.changed_ports();
+                if !changed.is_empty() {
+                    let outcome = graph.resettle(&oracle, &session_opts, &changed);
+                    if !outcome.failed.is_empty() {
+                        return Err(fail(format!("settle-for-export: {:?}", outcome.failed)));
+                    }
+                }
+                exporter::export_options(&graph, &options_dir, false, Some(&make_conf))
+                    .map_err(|e| fail(format!("export: {e:#}")))?;
+                for o in graph.real_options() {
+                    if graph.is_live(&o.port_origin) {
+                        exported
+                            .entry(o.port_origin.clone())
+                            .or_default()
+                            .insert(o.name.clone(), o.enabled);
+                    }
+                }
+                for (origin, states) in &exported {
+                    let path = options_dir.join(origin.replace('/', "_")).join("options");
+                    let content = fs::read_to_string(&path)
+                        .map_err(|e| fail(format!("read back {origin}: {e}")))?;
+                    let defined: BTreeSet<String> = states.keys().cloned().collect();
+                    check_options_file(&content, &defined)
+                        .map_err(|e| fail(format!("{origin}: {e}")))?;
+                }
+                let conf = fs::read_to_string(&make_conf).map_err(|e| e.to_string())?;
+                check_make_conf(&conf, SENTINEL).map_err(fail)?;
+            }
+            7 => {
+                let sys = SystemOptions::load(&options_dir, Some(&make_conf))
+                    .map_err(|e| fail(e.to_string()))?;
+                for (origin, states) in &exported {
+                    for (name, &expected) in states {
+                        if sys.get_state(origin, name, !expected) != expected {
+                            return Err(fail(format!("reload lost {origin}/{name}")));
+                        }
+                    }
+                }
+            }
+            8 => {
+                session_opts = SystemOptions::load(&options_dir, Some(&make_conf))
+                    .map_err(|e| fail(e.to_string()))?;
+                graph = DependencyGraph::resolve(&oracle, roots, &session_opts, false)
+                    .map_err(|e| fail(format!("session rebuild: {e:#}")))?;
+                graph.expand_all();
+                touched_ports.clear();
+                for (origin, states) in &exported {
+                    for (name, &expected) in states {
+                        if let Some(actual) = graph
+                            .real_options()
+                            .find(|o| o.port_origin == *origin && o.name == *name)
+                            .map(|o| o.enabled)
+                        {
+                            if actual != expected {
+                                return Err(fail(format!(
+                                    "new session loaded {origin}/{name} as {actual}, disk says {expected}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                graph.hide_optionless = !graph.hide_optionless;
+                graph.rebuild_visible_rows();
+            }
+        }
+        executed += 1;
+
+        let ports: Vec<String> = graph.ports.iter().map(|p| p.origin.clone()).collect();
+        check_no_duplicates(&ports, "the port list").map_err(fail)?;
+        let touched_views: Vec<OptView> = views_of(&graph)
+            .into_iter()
+            .filter(|v| touched_ports.contains(&v.port))
+            .collect();
+        check_group_rules(&touched_views).map_err(fail)?;
+        check_relations(&touched_views).map_err(fail)?;
+    }
+    Ok(executed)
 }
 
 /// The unanimity fold the exporter documents: a name goes global only where
