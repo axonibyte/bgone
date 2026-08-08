@@ -1,4 +1,7 @@
-image: rust:latest
+# Pinned rather than :latest so a tag build today and a rebuild next year use
+# the same compiler. Bump deliberately, together with rust-version in
+# Cargo.toml and the nightly pin in ci/build-target.sh.
+image: rust:1.97
 
 definitions:
   caches:
@@ -19,12 +22,17 @@ definitions:
           - git push --mirror git@github.com:${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}.git
 
     - step: &doFetchAndTest
-        name: Fetch dependencies and run tests
+        name: Fetch dependencies, lint and run tests
         caches:
           - cargo
         script:
           - export CARGO_HOME="$BITBUCKET_CLONE_DIR/.cargo_cache"
+          - rustup component add rustfmt clippy
           - cargo fetch --locked
+          # The repository is kept fmt-clean and clippy-clean; the gate is what
+          # keeps it that way.
+          - cargo fmt --check
+          - cargo clippy --all-targets --locked -- -D warnings
           - cargo test --release --locked
 
     - step: &buildLinuxAmd64
@@ -44,15 +52,6 @@ definitions:
           - dist/*
         script:
           - bash ci/build-target.sh aarch64-unknown-linux-gnu
-
-    - step: &buildWindowsAmd64
-        name: Build x86_64-pc-windows-gnu
-        caches:
-          - cargo
-        artifacts:
-          - dist/*
-        script:
-          - bash ci/build-target.sh x86_64-pc-windows-gnu
 
     - step: &buildFreebsdAmd64
         name: Build x86_64-unknown-freebsd
@@ -95,11 +94,12 @@ pipelines:
     main:
       - step: *doMirror
       - step: *doFetchAndTest
+      # No Windows target: the tool spawns make and reads /var/db/ports and
+      # poudriere.d, none of which exist there — the binary was dead weight.
       - parallel: &buildAll
           steps:
             - step: *buildLinuxAmd64
             - step: *buildLinuxArm64
-            - step: *buildWindowsAmd64
             - step: *buildFreebsdAmd64
             - step: *buildFreebsdArm64
 

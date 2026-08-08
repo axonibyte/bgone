@@ -8,6 +8,11 @@ set -euo pipefail
 TARGET="${1:?usage: build-target.sh <target-triple>}"
 export CARGO_HOME="${CARGO_HOME:-$BITBUCKET_CLONE_DIR/.cargo_cache}"
 
+# Pinned: -Z build-std against a floating nightly breaks spontaneously and
+# makes tag builds unreproducible. Bump deliberately, together with the image
+# pin in bitbucket-pipelines.yml.
+NIGHTLY="nightly-2026-08-01"
+
 apt_install() {
     apt-get update
     apt-get install -y --no-install-recommends "$@"
@@ -40,13 +45,6 @@ case "$TARGET" in
         build
         ;;
 
-    x86_64-pc-windows-gnu)
-        apt_install gcc-mingw-w64-x86-64
-        rustup target add "$TARGET"
-        export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
-        build
-        ;;
-
     x86_64-unknown-freebsd)
         # Tier 2: prebuilt std exists; stable toolchain + zig linker.
         install_zigbuild
@@ -57,8 +55,8 @@ case "$TARGET" in
     aarch64-unknown-freebsd)
         # Tier 3: no prebuilt std, so compile it with nightly -Z build-std.
         install_zigbuild
-        rustup toolchain install nightly --profile minimal --component rust-src
-        cargo +nightly zigbuild --target "$TARGET" --release --locked -Z build-std=std,panic_abort
+        rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+        cargo "+$NIGHTLY" zigbuild --target "$TARGET" --release --locked -Z build-std=std,panic_abort
         ;;
 
     *)

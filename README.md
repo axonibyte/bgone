@@ -45,10 +45,10 @@ The classic `dialog`-based `make config` interface has served FreeBSD well for d
 
 ### From Source
 
-Requirements: **Rust 1.75+** and **Cargo**.
+Requirements: **Rust 1.85+** and **Cargo**.
 
 ```bash
-git clone https://bitbucket.org/your-username/bgone.git
+git clone https://bitbucket.org/axonibyte/bgone.git
 cd bgone
 cargo build --release
 
@@ -591,14 +591,21 @@ This is a workaround for a real limitation rather than a stylistic choice. Termi
 
 ## Testing
 
-171 tests across three suites: unit tests beside the code they cover, an integration suite, and a command-line suite.
+254 tests across four suites: unit tests beside the code they cover, an integration suite, a command-line suite, and a poudriere suite.
 
-Between them they cover dependency-entry resolution against `bsd.port.mk`'s own grammar, turning a `make` reply into rows, SQLite caching, graph building, live reachability, file exporting, shared state across repeated ports, group synchronisation, search filtering, key handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
+Between them they cover dependency-entry resolution against `bsd.port.mk`'s own grammar, turning a `make` reply into rows, SQLite caching (memoisation, framework-age invalidation, busy-cache tolerance), graph building, live reachability, mid-session re-evaluation under saved options, implication and conflict handling against SINGLE/RADIO groups, file exporting (including the managed make.conf block round-trip), shared state across repeated ports, group synchronisation, search filtering, key and paste handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
 
 Tests run inside isolated temporary directories and clean up automatically on completion:
 
 ```bash
 cargo test
+
+```
+
+The suites above validate the resolver against a stub `make` that re-implements the framework's behaviour, which is what lets them run anywhere — including the Linux CI runners. The stub itself is validated separately: on a FreeBSD machine with a real ports tree, a differential suite asks the actual framework to disagree:
+
+```bash
+BGONE_PORTS_TREE=/usr/ports cargo test --test freebsd_tree_tests
 
 ```
 
@@ -616,4 +623,4 @@ cargo test
 
 ## License
 
-Distributed under the [BSD 2-Clause License](https://www.google.com/search?q=LICENSE).
+Distributed under the [BSD 2-Clause License](LICENSE).
