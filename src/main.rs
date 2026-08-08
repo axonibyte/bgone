@@ -118,7 +118,7 @@ fn configure(cli: &Cli, config: Option<&bgone::config::Config>, oracle: &Oracle)
     }
 
     println!("[*] Loading existing system options...");
-    let sys_opts = reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref());
+    let sys_opts = reader::SystemOptions::load(&cli.options_dir, cli.make_conf.as_deref())?;
 
     println!("[*] Resolving dependencies with make; the first run over a set is the slow part.");
     let start = Instant::now();

@@ -91,7 +91,16 @@ impl Config {
 /// A file that does not exist yet is created holding just the groups. Passing no
 /// groups removes the table rather than leaving an empty one behind.
 pub fn save_groups(path: &Path, groups: &Groups) -> Result<()> {
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    // Only a file that is genuinely absent starts from nothing. Reading an
+    // existing file can fail too — permissions, invalid UTF-8 — and treating
+    // that as absence would rewrite the user's config as groups-only.
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("could not read config file {}", path.display()))
+        }
+    };
     let mut doc: toml_edit::DocumentMut = existing
         .parse()
         .with_context(|| format!("Config file {} is not valid TOML", path.display()))?;

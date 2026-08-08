@@ -1,6 +1,20 @@
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
+
+/// Reads `path`, treating a missing file as empty and any other failure as the
+/// error it is. Absence is normal — a fresh system has nothing saved — but an
+/// unreadable file is not: loading defaults in its place would have the next
+/// save overwrite the user's real choices with them.
+fn read_or_absent(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
+    }
+}
 
 /// Strips the assignment operator following a variable name, leaving the
 /// whitespace-separated values. Returns `None` when what follows the name is
@@ -23,12 +37,19 @@ pub struct SystemOptions {
 }
 
 impl SystemOptions {
-    pub fn load(options_dir: &Path, make_conf: Option<&Path>) -> Self {
+    /// Reads the system's saved option state: `make.conf` overrides, then the
+    /// per-port options files.
+    ///
+    /// A path that does not exist is an empty state. A path that exists but
+    /// cannot be read is an error rather than an empty state: the choices are
+    /// there and unknown, and a session loaded at defaults in their place
+    /// would overwrite them on its first save.
+    pub fn load(options_dir: &Path, make_conf: Option<&Path>) -> Result<Self> {
         let mut sys_opts = SystemOptions::default();
 
         // 1. Read global make.conf overrides if provided
         if let Some(m_path) = make_conf {
-            if let Ok(content) = fs::read_to_string(m_path) {
+            if let Some(content) = read_or_absent(m_path)? {
                 for line in content.lines() {
                     let line = line.trim();
                     if line.starts_with('#') || line.is_empty() {
@@ -53,8 +74,22 @@ impl SystemOptions {
         }
 
         // 2. Read per-port /var/db/ports/<cat>_<port>/options
-        if let Ok(entries) = fs::read_dir(options_dir) {
-            for entry in entries.flatten() {
+        let entries = match fs::read_dir(options_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "could not read the options directory {}",
+                        options_dir.display()
+                    )
+                })
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("could not list {}", options_dir.display()))?;
                 let path = entry.path();
                 if !path.is_dir() {
                     continue;
@@ -71,7 +106,7 @@ impl SystemOptions {
                 };
 
                 let opts_file = path.join("options");
-                if let Ok(content) = fs::read_to_string(opts_file) {
+                if let Some(content) = read_or_absent(&opts_file)? {
                     let mut map = HashMap::new();
                     for line in content.lines() {
                         let line = line.trim();
@@ -117,7 +152,7 @@ impl SystemOptions {
             }
         }
 
-        sys_opts
+        Ok(sys_opts)
     }
 
     pub fn get_state(&self, origin: &str, opt_name: &str, default_state: bool) -> bool {

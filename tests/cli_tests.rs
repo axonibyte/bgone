@@ -737,6 +737,35 @@ fn test_saving_groups_creates_a_config_from_nothing() {
     assert!(reloaded.options_dir.is_none(), "nothing else invented");
 }
 
+/// An existing config that cannot be read must not be rewritten as
+/// groups-only: what is there is unknown, not absent. Only a genuinely
+/// missing file starts from nothing.
+#[test]
+fn saving_groups_refuses_an_unreadable_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("config_unreadable");
+    let path = temp.path.join("bgone.toml");
+    std::fs::write(&path, "options_dir = \"/somewhere\"\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root ignores mode bits; there is nothing to observe in that case.
+    if std::fs::read_to_string(&path).is_ok() {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
+    let result = save_groups(&path, &groups_of(&[("db", &["databases/redis"])]));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(result.is_err(), "an unreadable config must refuse the save");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "options_dir = \"/somewhere\"\n",
+        "the user's config must survive untouched"
+    );
+}
+
 /// Re-saving replaces the groups rather than accumulating them, and dropping the
 /// last group takes the table with it.
 #[test]

@@ -43,7 +43,7 @@ fn test_reader_precedence_and_parsing() {
     )
     .unwrap();
 
-    let sys_opts = SystemOptions::load(&ports_dir, Some(&make_conf));
+    let sys_opts = SystemOptions::load(&ports_dir, Some(&make_conf)).unwrap();
 
     // 1. Per-port overrides
     assert!(sys_opts.get_state("www/apache24", "HTTP2", false));
@@ -73,7 +73,7 @@ fn test_reader_accepts_legacy_with_without_format() {
     )
     .unwrap();
 
-    let sys_opts = SystemOptions::load(&ports_dir, None);
+    let sys_opts = SystemOptions::load(&ports_dir, None).unwrap();
 
     assert!(sys_opts.get_state("www/apache24", "HTTP2", false));
     assert!(!sys_opts.get_state("www/apache24", "DOCS", true));
@@ -92,10 +92,57 @@ fn test_reader_ignores_prefixed_lookalike_variables() {
     )
     .unwrap();
 
-    let sys_opts = SystemOptions::load(&temp.path.join("nonexistent"), Some(&make_conf));
+    let sys_opts = SystemOptions::load(&temp.path.join("nonexistent"), Some(&make_conf)).unwrap();
 
     assert!(sys_opts.get_state("www/apache24", "PLAIN", false));
     assert!(!sys_opts.get_state("www/apache24", "FORCED", false));
+}
+
+/// A missing path is an empty state; an unreadable one is an error. Loading
+/// defaults over choices that exist but cannot be read would have the next
+/// save overwrite them with those defaults.
+#[test]
+fn an_unreadable_options_dir_is_an_error_not_an_empty_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("reader_unreadable");
+    let ports_dir = temp.path.join("ports");
+    fs::create_dir_all(&ports_dir).unwrap();
+    fs::set_permissions(&ports_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root ignores mode bits; there is nothing to observe in that case.
+    if fs::read_dir(&ports_dir).is_ok() {
+        fs::set_permissions(&ports_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = SystemOptions::load(&ports_dir, None);
+    fs::set_permissions(&ports_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "unreadable saved state must not load empty"
+    );
+}
+
+/// `--make-conf` naming a directory is a mistake to report, not an empty
+/// state.
+#[test]
+fn a_make_conf_that_is_a_directory_is_an_error() {
+    let temp = TempDir::new("reader_eisdir");
+    let dir = temp.path.join("make.conf");
+    fs::create_dir_all(&dir).unwrap();
+
+    assert!(SystemOptions::load(&temp.path.join("ports"), Some(&dir)).is_err());
+}
+
+/// A make.conf that is not there yet is fine: the exporter may be about to
+/// create it, and a fresh system has nothing saved.
+#[test]
+fn a_missing_make_conf_is_an_empty_state() {
+    let temp = TempDir::new("reader_missing_conf");
+    let sys =
+        SystemOptions::load(&temp.path.join("ports"), Some(&temp.path.join("make.conf"))).unwrap();
+    assert!(sys.global_overrides.is_empty());
 }
 
 // ============================================================================
@@ -250,7 +297,7 @@ fn test_exported_options_round_trip_through_the_reader() {
     exporter::export_options(&graph, &options_dir, false, None).unwrap();
 
     // Defaults inverted, so anything not genuinely read back flips state
-    let reloaded = SystemOptions::load(&options_dir, None);
+    let reloaded = SystemOptions::load(&options_dir, None).unwrap();
     assert!(reloaded.get_state("www/apache24", "HTTP2", false));
     assert!(!reloaded.get_state("www/apache24", "DOCS", true));
 
