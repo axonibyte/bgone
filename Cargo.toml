@@ -1,6 +1,6 @@
 [package]
 name = "bgone"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # Set by what the lockfile already requires (clap 4.6, hashbrown 0.17), so a
 # too-old toolchain fails with a clear message instead of a resolver error.
