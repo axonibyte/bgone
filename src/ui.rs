@@ -4269,6 +4269,282 @@ mod tests {
         TerminalGuard::restore();
     }
 
+    // ------------------------------------------------------- sequence fuzzing
+    //
+    // Tier B of the simulated-user stage (tests/sim/ is tier A): seeded random
+    // key and paste sequences over the whole vocabulary, interleaved with
+    // synthesized resolver answers — stale ones included — and the
+    // dead-resolver nemesis. It lives in this module because on_key and merge
+    // are deliberately private; the render smoke runs on a TestBackend. The
+    // seed prints in every failure; replay one with BGONE_UI_SIM_SEED.
+
+    /// The same xorshift32 the tier A engine uses; duplicated because tests/
+    /// cannot be imported from here, and eight lines are cheaper than a
+    /// visibility hole.
+    struct FuzzRng(u32);
+
+    impl FuzzRng {
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() as usize) % n.max(1)
+        }
+    }
+
+    /// Ports with a SINGLE group, an implication, a shared dependency and an
+    /// option-conditional edge — enough structure for cascades, jumps and
+    /// arrivals to mean something.
+    fn fuzz_graph() -> DependencyGraph {
+        let mut a = fixture_port("www/alpha");
+        fixture_option(&mut a, "MYSQL", true, "SINGLE", "BACKEND");
+        fixture_option(&mut a, "PGSQL", false, "SINGLE", "BACKEND");
+        fixture_option(&mut a, "NJS", false, "DEFINE", "");
+        fixture_option(&mut a, "STREAM", false, "DEFINE", "");
+        a.options[2].implies = vec!["STREAM".to_string()];
+        fixture_edge(&mut a, "devel/shared", Some("NJS"));
+        let mut b = fixture_port("databases/beta");
+        fixture_option(&mut b, "DOCS", true, "DEFINE", "");
+        fixture_edge(&mut b, "devel/shared", None);
+        let s = fixture_port("devel/shared");
+        built(vec![a, b, s], &["www/alpha", "databases/beta"])
+    }
+
+    /// The fuzz App carries a config path in a temp directory: with none, the
+    /// group manager's save opens the path prompt, and the fuzzer's random
+    /// typing plus Enter wrote group files to relative paths — straight into
+    /// the working tree on the first landing of this test.
+    fn fuzz_app(seed: u32) -> App {
+        let dir = std::env::temp_dir().join(format!("bgone_ui_fuzz_{}_{seed}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        App::with_saver(
+            Some(dir.join("bgone.toml")),
+            Box::new(|_| Ok(String::from("Saved"))),
+        )
+    }
+
+    fn fuzz_event(r: &mut FuzzRng) -> KeyEvent {
+        let plain = [
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Esc,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Char('q'),
+            KeyCode::Char('c'),
+            KeyCode::Char('o'),
+            KeyCode::Char('s'),
+            KeyCode::Char('d'),
+            KeyCode::Char('/'),
+            KeyCode::Char('='),
+            KeyCode::Char('-'),
+            KeyCode::Char('+'),
+            KeyCode::Char('_'),
+            KeyCode::Char('H'),
+            KeyCode::Char('x'),
+            KeyCode::Char('ü'),
+            KeyCode::F(5),
+            KeyCode::Null,
+            KeyCode::Insert,
+        ];
+        match r.below(10) {
+            0 | 1 => ctrl(['s', 'g', 'l', 'r', 'c', 'f', 'h', 'a'][r.below(8)]),
+            2 => KeyEvent {
+                code: KeyCode::Char('H'),
+                modifiers: KeyModifiers::SHIFT,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            _ => key(plain[r.below(plain.len())]),
+        }
+    }
+
+    /// SINGLE holds exactly one member, RADIO at most one — checked directly
+    /// on the graph, since tier B has no model.
+    fn single_groups_hold(graph: &DependencyGraph) -> Result<(), String> {
+        let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+        for o in graph.real_options() {
+            if o.group_type == "SINGLE" || o.group_type == "RADIO" {
+                let key = (
+                    o.port_origin.clone(),
+                    o.group_type.clone(),
+                    o.group_name.clone(),
+                );
+                *counts.entry(key).or_default() += usize::from(o.enabled);
+            }
+        }
+        for ((port, ty, group), set) in counts {
+            if (ty == "SINGLE" && set != 1) || (ty == "RADIO" && set > 1) {
+                return Err(format!("{ty} {group} on {port} holds {set} set members"));
+            }
+        }
+        Ok(())
+    }
+
+    fn states_snapshot(graph: &DependencyGraph) -> Vec<(String, String, bool)> {
+        graph
+            .real_options()
+            .map(|o| (o.port_origin.clone(), o.name.clone(), o.enabled))
+            .collect()
+    }
+
+    fn ui_fuzz(seed: u32, steps: usize) {
+        let mut rng = FuzzRng(if seed == 0 { 0x9e37_79b9 } else { seed });
+        let mut graph = fuzz_graph();
+        let mut app = fuzz_app(seed);
+        let sys = SystemOptions::default();
+        let mut resolver_dead = false;
+        let mut arrivals = 0usize;
+
+        for step in 0..steps {
+            let check = |what: &str, result: Result<(), String>| {
+                if let Err(e) = result {
+                    panic!("ui fuzz seed {seed} step {step} ({what}): {e}");
+                }
+            };
+
+            match rng.below(12) {
+                // Synthesized resolver answers, the way the event loop folds
+                // them in.
+                9 if !resolver_dead => {
+                    match rng.below(3) {
+                        // A stale answer: computed for an option set that is
+                        // not the port's current one. Folding it in must
+                        // change nothing (the e6ea64f property).
+                        0 => {
+                            let mut facts = fixture_port("www/alpha");
+                            fixture_option(&mut facts, "GHOST", true, "DEFINE", "");
+                            fixture_edge(&mut facts, "devel/ghost-dep", None);
+                            let before = states_snapshot(&graph);
+                            let answers = vec![(
+                                (
+                                    "www/alpha".to_string(),
+                                    Options::Exactly(vec!["GHOST".to_string()]),
+                                ),
+                                Ok(facts),
+                            )];
+                            merge(&mut graph, &mut app, &sys, answers);
+                            if states_snapshot(&graph) != before {
+                                panic!(
+                                    "ui fuzz seed {seed} step {step}: a stale answer moved state"
+                                );
+                            }
+                        }
+                        // A fresh arrival, cascading like a real discovery.
+                        1 => {
+                            arrivals += 1;
+                            let origin = format!("devel/arrival{arrivals}");
+                            let mut facts = fixture_port(&origin);
+                            fixture_option(&mut facts, "DOCS", true, "DEFINE", "");
+                            let answers = vec![((origin, Options::AsShipped), Ok(facts))];
+                            merge(&mut graph, &mut app, &sys, answers);
+                        }
+                        // A failure answer: reported, never fatal.
+                        _ => {
+                            let answers = vec![(
+                                ("www/alpha".to_string(), Options::AsShipped),
+                                Err("make exploded".to_string()),
+                            )];
+                            merge(&mut graph, &mut app, &sys, answers);
+                        }
+                    }
+                }
+                // The dead-resolver nemesis: the counter zeroes and nothing
+                // stays pinned (the 93acc9e property).
+                10 if !resolver_dead && rng.below(8) == 0 => {
+                    app.outstanding += 3; // as if questions were out
+                    app.mark_resolver_dead();
+                    resolver_dead = true;
+                    assert_eq!(app.outstanding, 0, "a dead resolver must unpin");
+                    assert!(app.pending.is_empty());
+                }
+                // Paste, hostile shapes included (the 057940c/9109fe8 class).
+                11 => {
+                    let payloads = [
+                        "grüße",
+                        "s q o c",
+                        "php83\nrm -rf /\n",
+                        "tab\there",
+                        "",
+                        "ß",
+                    ];
+                    app.on_paste(payloads[rng.below(payloads.len())], &mut graph);
+                }
+                _ => {
+                    let event = fuzz_event(&mut rng);
+                    match app.on_key(event, &mut graph) {
+                        KeyOutcome::SaveInPlace => app.perform_save(&mut graph),
+                        KeyOutcome::Finish(_) => {
+                            // The session ended; a new one starts, as the
+                            // binary would.
+                            app = fuzz_app(seed);
+                        }
+                        KeyOutcome::Continue | KeyOutcome::Redraw => {}
+                    }
+                }
+            }
+
+            check("groups", single_groups_hold(&graph));
+            for (i, q) in app.pending.iter().enumerate() {
+                if app.pending[i + 1..].contains(q) {
+                    panic!("ui fuzz seed {seed} step {step}: duplicate pending question {q:?}");
+                }
+            }
+            if app.pending.len() > 64 {
+                panic!(
+                    "ui fuzz seed {seed} step {step}: pending grew to {} — a queue that only grows is the loop signature",
+                    app.pending.len()
+                );
+            }
+
+            if step % 7 == 0 {
+                // The render smoke: every frame must draw without panicking,
+                // whatever the state machine got itself into.
+                let _ = draw(|f| render(f, &graph, &mut app));
+            }
+        }
+    }
+
+    /// The always-on tier B runs. Two seeds, a few hundred steps each; no
+    /// processes are spawned, so this stays well under a second.
+    #[test]
+    fn ui_fuzz_fixed_seeds_stay_green() {
+        ui_fuzz(5, 400);
+        ui_fuzz(6, 400);
+    }
+
+    /// Hunting mode for this tier: BGONE_UI_SIM_SEED replays exactly one
+    /// seed, BGONE_SIM_ACTIONS scales it.
+    #[test]
+    fn ui_fuzz_hunting_mode_when_requested() {
+        let Some(seed) = std::env::var("BGONE_UI_SIM_SEED")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let steps = std::env::var("BGONE_SIM_ACTIONS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5000);
+        println!("ui fuzz hunting: seed {seed}, {steps} steps");
+        ui_fuzz(seed, steps);
+    }
+
     /// Presses and repeats act; releases do not. A terminal reporting releases
     /// would otherwise run every handler twice per keystroke.
     #[test]
