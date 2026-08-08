@@ -1768,11 +1768,54 @@ impl DependencyGraph {
         self.apply_state_respecting_groups(port_id, opt_id, enabled);
 
         if enabled {
+            if self.option_nodes[opt_id].enabled {
+                self.retire_preventers(port_id, opt_id);
+            }
             self.enforce_implications(port_id, opt_id);
         } else if !self.option_nodes[opt_id].enabled {
             // Only when the disable took: a SINGLE's set member refuses, and
             // a refused press must not take its impliers down with it.
             self.retire_impliers(port_id, opt_id);
+        }
+    }
+
+    /// Follows `FOO_PREVENTS` in the other direction, for an option just
+    /// turned on: an enabled option that declares it prevented goes off — the
+    /// declaration is symmetric ("cannot coexist"), even though only one side
+    /// carries it. Enabling the prevented side used to leave both on, a
+    /// combination the framework rejects at build time; the philosophy is the
+    /// same as everywhere else in this family — the press said what the user
+    /// wants, and this is the half of it that follows.
+    ///
+    /// A retired preventer takes its own enabled impliers with it, exactly as
+    /// a direct press on it would. One that cannot lawfully turn off — a
+    /// SINGLE's one set member — keeps its declaration in force, so the
+    /// pressed option goes back off and the press is refused.
+    fn retire_preventers(&mut self, port_id: usize, opt_id: usize) {
+        let name = self.option_nodes[opt_id].name.clone();
+        let preventers: Vec<usize> = self.ports[port_id]
+            .options
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let o = &self.option_nodes[id];
+                id != opt_id && o.enabled && o.prevents.contains(&name)
+            })
+            .collect();
+
+        for id in preventers {
+            self.apply_state_respecting_groups(port_id, id, false);
+            if !self.option_nodes[id].enabled {
+                self.retire_impliers(port_id, id);
+            }
+        }
+
+        let still_prevented = self.ports[port_id].options.iter().copied().any(|id| {
+            let o = &self.option_nodes[id];
+            id != opt_id && o.enabled && o.prevents.contains(&name)
+        });
+        if still_prevented {
+            self.apply_state_respecting_groups(port_id, opt_id, false);
         }
     }
 
@@ -1912,9 +1955,15 @@ impl DependencyGraph {
             }
             // A prevented option is turned off rather than refused: the press
             // said what the user wants, and this is the half of it that follows.
+            // Its own enabled impliers go with it, exactly as a direct press
+            // on it would take them.
             for name in prevents {
                 if let Some(id) = find(self, &name) {
+                    let was_enabled = self.option_nodes[id].enabled;
                     self.apply_state_respecting_groups(port_id, id, false);
+                    if was_enabled && !self.option_nodes[id].enabled {
+                        self.retire_impliers(port_id, id);
+                    }
                 }
             }
         }

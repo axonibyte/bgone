@@ -1490,6 +1490,84 @@ fn an_option_implied_by_a_single_member_cannot_turn_off() {
     assert!(is_on(&graph, "www/app", "MYSQL"));
 }
 
+/// Enabling an option an enabled option declares prevented retires the
+/// declarer: the declaration means "cannot coexist" whichever side gets
+/// pressed, even though only one side carries it. Both-on used to be
+/// reachable this way, and the framework rejects it at build time.
+#[test]
+fn enabling_a_prevented_option_retires_the_preventer() {
+    let mut tree = common::Tree::new("reverse_prevents");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("www/app", "STREAM", false, "", "DEFINE", "");
+    tree.add_prevents("www/app", "DEBUG", "STREAM");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "DEBUG");
+    assert!(is_on(&graph, "www/app", "DEBUG"));
+
+    toggle(&mut graph, "www/app", "STREAM");
+    assert!(is_on(&graph, "www/app", "STREAM"));
+    assert!(
+        !is_on(&graph, "www/app", "DEBUG"),
+        "the preventer cannot coexist with what it prevents"
+    );
+}
+
+/// A retired preventer takes its own enabled impliers with it, exactly as a
+/// direct press on it would.
+#[test]
+fn a_retired_preventer_takes_its_impliers_with_it() {
+    let mut tree = common::Tree::new("reverse_prevents_impliers");
+    tree.add_option("www/app", "TRACE", false, "", "DEFINE", "");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("www/app", "STREAM", false, "", "DEFINE", "");
+    tree.add_implies("www/app", "TRACE", "DEBUG");
+    tree.add_prevents("www/app", "DEBUG", "STREAM");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "TRACE");
+    assert!(is_on(&graph, "www/app", "DEBUG"));
+
+    toggle(&mut graph, "www/app", "STREAM");
+    assert!(is_on(&graph, "www/app", "STREAM"));
+    assert!(!is_on(&graph, "www/app", "DEBUG"));
+    assert!(
+        !is_on(&graph, "www/app", "TRACE"),
+        "TRACE implies DEBUG, so it cannot outlive it"
+    );
+}
+
+/// A preventer that cannot lawfully turn off — a SINGLE's one set member —
+/// keeps its declaration in force, so the press is refused.
+#[test]
+fn a_single_member_preventer_refuses_the_press() {
+    let mut tree = common::Tree::new("reverse_prevents_single");
+    tree.add_option("www/app", "MYSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "PGSQL", false, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_prevents("www/app", "MYSQL", "DEBUG");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "DEBUG");
+    assert!(
+        !is_on(&graph, "www/app", "DEBUG"),
+        "MYSQL prevents DEBUG and cannot turn off, so the press is refused"
+    );
+    assert!(is_on(&graph, "www/app", "MYSQL"));
+}
+
 /// An option naming something the port does not define is ignored rather than
 /// treated as an error — ports do it, and there is nothing to set.
 #[test]
