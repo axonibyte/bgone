@@ -1213,6 +1213,75 @@ fn test_turning_an_option_on_turns_off_what_it_prevents() {
     );
 }
 
+/// An implication that lands inside a SINGLE picks that member the way a press
+/// would: the sibling it displaces clears. Two set members of a SINGLE is a
+/// combination `bsd.options.mk` will not accept, and writing one out would
+/// hand the framework a file it quietly overrides.
+#[test]
+fn an_implication_into_a_single_displaces_the_sibling() {
+    let mut tree = common::Tree::new("implies_single");
+    tree.add_option("www/app", "NJS", false, "", "DEFINE", "");
+    tree.add_option("www/app", "MYSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "PGSQL", false, "", "SINGLE", "BACKEND");
+    tree.add_implies("www/app", "NJS", "PGSQL");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "NJS");
+    assert!(is_on(&graph, "www/app", "PGSQL"));
+    assert!(
+        !is_on(&graph, "www/app", "MYSQL"),
+        "a SINGLE cannot hold two set members"
+    );
+}
+
+/// A PREVENTS aimed at a SINGLE's one set member is refused rather than
+/// followed: the group has to keep one member, exactly as a direct press on it
+/// would be refused. Emptying the SINGLE would write a file the framework
+/// rejects outright.
+#[test]
+fn prevents_cannot_empty_a_single() {
+    let mut tree = common::Tree::new("prevents_single");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("www/app", "MYSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/app", "PGSQL", false, "", "SINGLE", "BACKEND");
+    tree.add_prevents("www/app", "DEBUG", "MYSQL");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "DEBUG");
+    assert!(is_on(&graph, "www/app", "DEBUG"));
+    assert!(
+        is_on(&graph, "www/app", "MYSQL") || is_on(&graph, "www/app", "PGSQL"),
+        "the SINGLE must keep a set member"
+    );
+}
+
+/// A PREVENTS aimed at a RADIO member clears it — the optional form may hold
+/// none, so following the press is allowed there.
+#[test]
+fn prevents_clears_a_radio_member() {
+    let mut tree = common::Tree::new("prevents_radio");
+    tree.add_option("www/app", "DEBUG", false, "", "DEFINE", "");
+    tree.add_option("www/app", "GSSAPI", true, "", "RADIO", "GSSAPI");
+    tree.add_prevents("www/app", "DEBUG", "GSSAPI");
+
+    let mut graph = tree
+        .build(&["www/app".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+    graph.expand_all();
+
+    toggle(&mut graph, "www/app", "DEBUG");
+    assert!(is_on(&graph, "www/app", "DEBUG"));
+    assert!(!is_on(&graph, "www/app", "GSSAPI"));
+}
+
 /// An option naming something the port does not define is ignored rather than
 /// treated as an error — ports do it, and there is nothing to set.
 #[test]

@@ -1597,6 +1597,19 @@ impl DependencyGraph {
             return;
         };
 
+        self.apply_state_respecting_groups(port_id, opt_id, enabled);
+
+        if enabled {
+            self.enforce_implications(port_id, opt_id);
+        }
+    }
+
+    /// Applies one state to one option under its group's rules: turning a
+    /// SINGLE or RADIO member on clears the siblings it displaces, turning a
+    /// SINGLE's set member off is refused (the group has to keep one), and a
+    /// RADIO clears. Nothing more — implications are the caller's to follow,
+    /// which is what keeps a chain of them from recursing through here.
+    fn apply_state_respecting_groups(&mut self, port_id: usize, opt_id: usize, enabled: bool) {
         let (group_type, group_name) = {
             let opt = &self.option_nodes[opt_id];
             (opt.group_type.clone(), opt.group_name.clone())
@@ -1626,10 +1639,6 @@ impl DependencyGraph {
         } else {
             self.option_nodes[opt_id].enabled = enabled;
         }
-
-        if enabled {
-            self.enforce_implications(port_id, opt_id);
-        }
     }
 
     /// Applies `FOO_IMPLIES` and `FOO_PREVENTS` for an option just turned on.
@@ -1644,6 +1653,11 @@ impl DependencyGraph {
     /// others; `seen` is what stops a pair of options implying each other from
     /// looping. Only options the same port defines are touched — a port may name
     /// one it does not define, and there is nothing to set in that case.
+    ///
+    /// Every write goes through the group rules: an implication into a SINGLE
+    /// or RADIO displaces the sibling it outranks rather than leaving two set,
+    /// and a PREVENTS aimed at a SINGLE's one set member is refused rather than
+    /// emptying the group — both combinations the framework will not accept.
     fn enforce_implications(&mut self, port_id: usize, opt_id: usize) {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut queue: VecDeque<usize> = VecDeque::new();
@@ -1666,7 +1680,7 @@ impl DependencyGraph {
 
             for name in implies {
                 if let Some(id) = find(self, &name) {
-                    self.option_nodes[id].enabled = true;
+                    self.apply_state_respecting_groups(port_id, id, true);
                     if seen.insert(id) {
                         queue.push_back(id);
                     }
@@ -1676,7 +1690,7 @@ impl DependencyGraph {
             // said what the user wants, and this is the half of it that follows.
             for name in prevents {
                 if let Some(id) = find(self, &name) {
-                    self.option_nodes[id].enabled = false;
+                    self.apply_state_respecting_groups(port_id, id, false);
                 }
             }
         }
