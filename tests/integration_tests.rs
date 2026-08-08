@@ -1568,6 +1568,46 @@ fn a_single_member_preventer_refuses_the_press() {
     assert!(is_on(&graph, "www/app", "MYSQL"));
 }
 
+/// Joining a group whose source port picked a SINGLE member the joiner does
+/// not define must not empty the joiner's group: the copy turns every shared
+/// sibling off and nothing turns one on. Found by the simulated-user engine
+/// on its first run.
+#[test]
+fn adopting_into_a_group_cannot_empty_a_single() {
+    let mut tree = common::Tree::new("adopt_single");
+    tree.add_option("www/one", "MYSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/one", "PGSQL", false, "", "SINGLE", "BACKEND");
+    tree.add_option("www/two", "PGSQL", true, "", "SINGLE", "BACKEND");
+    tree.add_option("www/two", "SQLITE", false, "", "SINGLE", "BACKEND");
+
+    let mut graph = tree
+        .build(
+            &["www/one".to_string(), "www/two".to_string()],
+            &SystemOptions::default(),
+            false,
+        )
+        .unwrap();
+    graph.expand_all();
+    graph.groups.insert(
+        "backend".into(),
+        vec!["www/one".to_string(), "www/two".to_string()],
+    );
+
+    // www/one's set member is MYSQL, which www/two does not define; copying
+    // its PGSQL=off used to leave www/two's BACKEND with nothing set.
+    graph.adopt_group_options("backend", "www/two");
+    let set: Vec<&str> = graph
+        .real_options()
+        .filter(|o| o.port_origin == "www/two" && o.enabled)
+        .map(|o| o.name.as_str())
+        .collect();
+    assert_eq!(
+        set,
+        vec!["PGSQL"],
+        "the SINGLE must keep its previously set member"
+    );
+}
+
 /// An option naming something the port does not define is ignored rather than
 /// treated as an error — ports do it, and there is nothing to set.
 #[test]

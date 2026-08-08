@@ -1737,7 +1737,12 @@ impl DependencyGraph {
         // Assigned rather than pushed through `set_choice_on`, because the
         // source port is already internally consistent: replaying its choices
         // one at a time would let each radio pick undo the one before it.
-        let mut adopted = 0;
+        let before: Vec<(usize, bool)> = self.ports[target_id]
+            .options
+            .iter()
+            .map(|&id| (id, self.option_nodes[id].enabled))
+            .collect();
+        let mut adopted: usize = 0;
         for &opt_id in &self.ports[target_id].options.clone() {
             let name = self.option_nodes[opt_id].name.clone();
             if let Some((_, enabled)) = source.iter().find(|(n, _)| *n == name) {
@@ -1745,6 +1750,38 @@ impl DependencyGraph {
                     adopted += 1;
                 }
                 self.option_nodes[opt_id].enabled = *enabled;
+            }
+        }
+
+        // The source's consistency is only the target's where they define the
+        // same members. A source whose set SINGLE member the target lacks
+        // copies `off` onto every shared sibling and empties the target's
+        // group — found by the simulated-user engine on its first run. The
+        // previously set member is restored: the target was consistent before
+        // the copy, and a SINGLE has to keep one.
+        let groups: HashSet<(String, String)> = self.ports[target_id]
+            .options
+            .iter()
+            .map(|&id| &self.option_nodes[id])
+            .filter(|o| o.group_type == "SINGLE")
+            .map(|o| (o.group_type.clone(), o.group_name.clone()))
+            .collect();
+        for (group_type, group_name) in groups {
+            let members: Vec<usize> = self.ports[target_id]
+                .options
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let o = &self.option_nodes[id];
+                    o.group_type == group_type && o.group_name == group_name
+                })
+                .collect();
+            if members.iter().all(|&id| !self.option_nodes[id].enabled) {
+                if let Some(&(id, _)) = before.iter().find(|(id, was)| *was && members.contains(id))
+                {
+                    self.option_nodes[id].enabled = true;
+                    adopted = adopted.saturating_sub(1);
+                }
             }
         }
 
