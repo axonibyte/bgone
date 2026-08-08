@@ -225,6 +225,19 @@ impl Tree {
         self.port(origin).unreadable = true;
     }
 
+    /// Undoes [`Tree::make_unreadable`]: the tree was fixed, and the next write
+    /// puts the port's description back.
+    pub fn make_readable(&mut self, origin: &str) {
+        self.port(origin).unreadable = false;
+    }
+
+    /// Every invocation of the stub make, one line each — the simulated-user
+    /// engine's request-rate oracle. Counts cache *misses*, not asks: a hit
+    /// never reaches the stub.
+    pub fn stub_log(&self) -> PathBuf {
+        self.temp.join("stub-make.log")
+    }
+
     /// Writes only when the content differs, so re-running `write` does not
     /// bump mtimes. The framework's age is part of every memo key; rewriting an
     /// unchanged `Mk/bsd.port.mk` between two `oracle()` calls would invalidate
@@ -378,10 +391,12 @@ pub fn stub_make(dir: &Path) -> PathBuf {
              \x20 esac\n\
              \x20 shift\n\
              done\n\
+             printf '%s|%s|%s\\n' \"$portdir\" \"$has_override\" \"$override\" >> {log}\n\
              [ -f \"$portdir/.port\" ] || exit 1\n\
              exec awk -v override=\"$override\" -v has_override=\"$has_override\" \
              -f {awk} \"$portdir/.port\"\n",
-            awk = awk.display()
+            awk = awk.display(),
+            log = dir.join("stub-make.log").display()
         ),
     )
     .unwrap();
