@@ -277,6 +277,51 @@ fn test_the_global_snippet_omits_options_the_ports_disagree_about() {
     assert!(read("www_two").contains("OPTIONS_FILE_UNSET+=DOCS"));
 }
 
+/// Pointing --make-conf at a real, hand-maintained make.conf must be safe:
+/// only the managed block is bgone's to rewrite. Overwriting the whole file
+/// used to destroy CFLAGS, MAKE_JOBS_NUMBER — everything the user kept there.
+#[test]
+fn the_make_conf_block_preserves_the_users_file() {
+    let temp = TempDir::new("exporter_managed_block");
+    let options_dir = temp.path.join("ports");
+    let make_conf = temp.path.join("make.conf");
+
+    fs::write(
+        &make_conf,
+        "# my build settings\nCFLAGS+=-O2 -pipe\nMAKE_JOBS_NUMBER=4\n",
+    )
+    .unwrap();
+
+    let mut tree = common::Tree::new("t");
+    tree.add_option("www/one", "SSL", true, "", "DEFINE", "");
+    tree.add_option("www/one", "NLS", false, "", "DEFINE", "");
+    let graph = tree
+        .build(&["www/one".to_string()], &SystemOptions::default(), false)
+        .unwrap();
+
+    // Exported twice: the second run has to replace its own block, not stack
+    // another, and must leave the user's lines byte-identical both times.
+    exporter::export_options(&graph, &options_dir, false, Some(&make_conf)).unwrap();
+    exporter::export_options(&graph, &options_dir, false, Some(&make_conf)).unwrap();
+
+    let content = fs::read_to_string(&make_conf).unwrap();
+    assert!(content.contains("# my build settings"));
+    assert!(content.contains("CFLAGS+=-O2 -pipe"));
+    assert!(content.contains("MAKE_JOBS_NUMBER=4"));
+    assert!(content.contains("OPTIONS_SET+=SSL"));
+    assert!(content.contains("OPTIONS_UNSET+=NLS"));
+    assert_eq!(
+        content.matches("# BEGIN bgone").count(),
+        1,
+        "repeated exports must replace the block, not accumulate:\n{content}"
+    );
+
+    // ...and what was written still reads back as the same overrides.
+    let reloaded = SystemOptions::load(&options_dir, Some(&make_conf)).unwrap();
+    assert!(reloaded.get_state("dns/other", "SSL", false));
+    assert!(!reloaded.get_state("dns/other", "NLS", true));
+}
+
 /// What the exporter writes must be what the reader reads back, otherwise a
 /// second run silently discards the previous session's choices.
 #[test]
