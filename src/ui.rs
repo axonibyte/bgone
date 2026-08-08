@@ -9,7 +9,7 @@ use crate::resolve::PortFacts;
 use anyhow::Result;
 use crossterm::{
     cursor::{MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::ResetColor,
     // Aliased: ratatui has a `Clear` widget of its own, and both are in use here
@@ -1953,6 +1953,17 @@ pub fn run_tui(
     )
 }
 
+/// Whether a key event is one the interface should act on.
+///
+/// Terminals speaking the kitty keyboard protocol, and the Windows console,
+/// report key releases as events of their own; acting on those runs every
+/// handler twice per press — Space toggling an option straight back off, or a
+/// quit confirmation answered by the release of the key that opened it.
+/// Repeats stay: a held arrow key has to keep moving.
+fn key_acts(kind: KeyEventKind) -> bool {
+    kind != KeyEventKind::Release
+}
+
 /// Puts the terminal into the interface's mode — raw, on the alternate screen —
 /// and guarantees it comes back out: on return, on any `?`, and on panic.
 ///
@@ -2062,12 +2073,14 @@ pub fn run_tui_with(
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                match app.on_key(key, graph) {
-                    KeyOutcome::Continue => {}
-                    KeyOutcome::Redraw => terminal.clear()?,
-                    KeyOutcome::Finish(finished) => {
-                        action = finished;
-                        break;
+                if key_acts(key.kind) {
+                    match app.on_key(key, graph) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::Redraw => terminal.clear()?,
+                        KeyOutcome::Finish(finished) => {
+                            action = finished;
+                            break;
+                        }
                     }
                 }
             }
@@ -2103,7 +2116,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use crate::graph::NodeId;
-    use crossterm::event::{KeyEventKind, KeyEventState};
+    use crossterm::event::KeyEventState;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -3660,5 +3673,14 @@ mod tests {
     fn restoring_the_terminal_twice_is_harmless() {
         TerminalGuard::restore();
         TerminalGuard::restore();
+    }
+
+    /// Presses and repeats act; releases do not. A terminal reporting releases
+    /// would otherwise run every handler twice per keystroke.
+    #[test]
+    fn only_key_releases_are_ignored() {
+        assert!(key_acts(KeyEventKind::Press));
+        assert!(key_acts(KeyEventKind::Repeat));
+        assert!(!key_acts(KeyEventKind::Release));
     }
 }
