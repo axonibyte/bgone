@@ -4424,12 +4424,20 @@ mod tests {
                     match rng.below(3) {
                         // A stale answer: computed for an option set that is
                         // not the port's current one. Folding it in must
-                        // change nothing (the e6ea64f property).
+                        // change nothing — neither option states nor the
+                        // dependency structure, which is where the original
+                        // bug (e6ea64f) actually showed: the answer repainted
+                        // `requires` for a set no longer in force. The first
+                        // rediscovery run watched only states and sailed past
+                        // the reverted fix; this is the sharpened oracle.
                         0 => {
                             let mut facts = fixture_port("www/alpha");
                             fixture_option(&mut facts, "GHOST", true, "DEFINE", "");
                             fixture_edge(&mut facts, "devel/ghost-dep", None);
                             let before = states_snapshot(&graph);
+                            let requires_before = graph
+                                .port_index("www/alpha")
+                                .map(|id| graph.ports[id].requires.clone());
                             let answers = vec![(
                                 (
                                     "www/alpha".to_string(),
@@ -4441,6 +4449,15 @@ mod tests {
                             if states_snapshot(&graph) != before {
                                 panic!(
                                     "ui fuzz seed {seed} step {step}: a stale answer moved state"
+                                );
+                            }
+                            let requires_after = graph
+                                .port_index("www/alpha")
+                                .map(|id| graph.ports[id].requires.clone());
+                            if requires_after != requires_before {
+                                panic!(
+                                    "ui fuzz seed {seed} step {step}: a stale answer repainted \
+                                     dependencies: {requires_before:?} -> {requires_after:?}"
                                 );
                             }
                         }

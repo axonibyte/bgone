@@ -200,9 +200,12 @@ fn fixed_seed_runs_stay_green() {
     let mut fired: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut skipped_total = 0usize;
 
-    for seed in [1u32, 2] {
+    // Three seeds at 400 actions: rediscovery showed the [1, 2] x 225 set
+    // blind to the reverse-prevents class, which seed 3 reaches at this
+    // depth. Sensitivity set the budget, not the other way round.
+    for seed in [1u32, 2, 3] {
         println!("simulated-user run: seed {seed}");
-        match run_sim_shrinking(seed, 225) {
+        match run_sim_shrinking(seed, 400) {
             Ok(report) => {
                 for (kind, (f, s)) in &report.histogram {
                     *fired.entry(kind).or_default() += f;

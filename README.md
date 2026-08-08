@@ -591,7 +591,7 @@ This is a workaround for a real limitation rather than a stylistic choice. Termi
 
 ## Testing
 
-254 tests across four suites: unit tests beside the code they cover, an integration suite, a command-line suite, and a poudriere suite.
+280 tests across five suites: unit tests beside the code they cover, an integration suite, a command-line suite, a poudriere suite, and a simulated-user suite.
 
 Between them they cover dependency-entry resolution against `bsd.port.mk`'s own grammar, turning a `make` reply into rows, SQLite caching (memoisation, framework-age invalidation, busy-cache tolerance), graph building, live reachability, mid-session re-evaluation under saved options, implication and conflict handling against SINGLE/RADIO groups, file exporting (including the managed make.conf block round-trip), shared state across repeated ports, group synchronisation, search filtering, key and paste handling driven event by event (scope escalation, focus cycling, sibling navigation, field editing, unsaved-change detection), config-file precedence, and every documented command-line switch.
 
@@ -608,6 +608,21 @@ The suites above validate the resolver against a stub `make` that re-implements 
 BGONE_PORTS_TREE=/usr/ports cargo test --test freebsd_tree_tests
 
 ```
+
+### Simulated users
+
+Scripted tests miss the bugs that need *history* — where no single operation is wrong but the accumulation is. The simulated-user suite (`tests/sim/`, plus a key-sequence tier inside `src/ui.rs`) runs seeded random action sequences against the real resolver stack: toggles, resettles, exports, session rebuilds, group operations, and adversarial interleavings — files edited behind the program's back, saved state pre-seeded for ports not yet in the build, the tree changing mid-session, a port whose `Makefile` stops answering, the cache dropped outright. A deliberately partial model and a set of history-independent invariants (each traceable to a real past defect, and each self-tested against canned broken input before the engine runs) check every step; failures print the seed and the full trace, then shrink to a minimal action tape ready to promote into a named regression.
+
+Three fixed seeds run in every `cargo test` (a few seconds). For hunting:
+
+```bash
+BGONE_SIM_SEED=7 BGONE_SIM_ACTIONS=5000 cargo test --test simulated_user_tests   # tier A, one exact seed
+BGONE_UI_SIM_SEED=7 cargo test --lib ui_fuzz                                     # key-sequence tier
+BGONE_SIM_TREE=/usr/ports BGONE_SIM_ROOTS=ports-mgmt/pkg \
+  cargo test --test simulated_user_tests real_tree                               # against a real tree
+```
+
+The engine's acceptance test was rediscovery: with five recent fixes individually reverted in a scratch worktree, the invariants caught every one and shrank each failure to a handful of steps. Its first honest runs also found (and led to fixing) a real adoption bug, and surfaced a set of load-time enforcement edges recorded in `tests/sim/mod.rs`'s module notes.
 
 ---
 
