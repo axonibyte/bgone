@@ -760,6 +760,60 @@ fn test_graph_glob_pattern_resolution() {
     assert!(graph.root_origin.contains("2 ports matched"));
 }
 
+/// `[` has been advertised as a metacharacter since patterns were routed by
+/// it, but the matcher treated it literally — a class pattern matched nothing.
+#[test]
+fn glob_character_classes_resolve_ports() {
+    let mut tree = common::Tree::new("glob_classes");
+    tree.add_port("www/py-django");
+    tree.add_port("www/py-requests");
+    tree.add_port("www/py-abc");
+
+    let sys_opts = SystemOptions::default();
+
+    let graph = tree
+        .build(&["www/py-[dr]*".to_string()], &sys_opts, false)
+        .unwrap();
+    assert!(graph.port_index("www/py-django").is_some());
+    assert!(graph.port_index("www/py-requests").is_some());
+    assert!(graph.port_index("www/py-abc").is_none());
+
+    let graph = tree
+        .build(&["www/py-[a-c]*".to_string()], &sys_opts, false)
+        .unwrap();
+    assert!(graph.port_index("www/py-abc").is_some());
+    assert!(graph.port_index("www/py-django").is_none());
+
+    let graph = tree
+        .build(&["www/py-[!dr]*".to_string()], &sys_opts, false)
+        .unwrap();
+    assert!(graph.port_index("www/py-abc").is_some());
+    assert!(graph.port_index("www/py-requests").is_none());
+}
+
+/// A glob against a tree that cannot be listed is its own failure, named as
+/// such — not a misleading "no matching ports found".
+#[test]
+fn a_glob_against_an_unreadable_tree_names_the_real_problem() {
+    let temp = TempDir::new("glob_unreadable_tree");
+    let oracle = bgone::oracle::Oracle::new(
+        bgone::resolve::MakeEnv::new(temp.path.join("no-tree-here")),
+        temp.path.join("cache.db"),
+    );
+
+    let err = DependencyGraph::resolve(
+        &oracle,
+        &["www/*".to_string()],
+        &SystemOptions::default(),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("cannot read ports tree"),
+        "got: {err:#}"
+    );
+}
+
 #[test]
 fn test_pattern_matching_zero_ports_returns_error() {
     let mut tree = common::Tree::new("t");

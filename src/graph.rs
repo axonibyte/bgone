@@ -393,25 +393,135 @@ impl DependencyGraph {
     }
 }
 
+/// Whether a pattern is matched against the tree listing rather than taken as
+/// a literal origin. One predicate, because the routing decision is made in
+/// two places and they drifted once: `[` was routed to the glob path years
+/// before the matcher understood it, so any class pattern matched nothing.
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+/// One matchable element of a glob pattern.
+enum GlobTok {
+    Literal(char),
+    /// `?` — any one character.
+    Any,
+    /// `*` — any run of characters, `/` included.
+    Star,
+    /// `[...]` — one character from a set, `[!...]`/`[^...]` its complement.
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
+}
+
+enum ClassItem {
+    Char(char),
+    Range(char, char),
+}
+
+impl GlobTok {
+    fn matches(&self, c: char) -> bool {
+        match self {
+            GlobTok::Literal(l) => *l == c,
+            GlobTok::Any => true,
+            GlobTok::Star => false,
+            GlobTok::Class { negated, items } => {
+                let hit = items.iter().any(|item| match item {
+                    ClassItem::Char(m) => *m == c,
+                    ClassItem::Range(a, b) => (*a..=*b).contains(&c),
+                });
+                hit != *negated
+            }
+        }
+    }
+}
+
+/// Parses a `[...]` starting at `open`, returning the token and the index just
+/// past the closing `]` — or `None` when the class never closes, in which case
+/// the `[` is a literal, as `sh` treats it.
+fn parse_class(chars: &[char], open: usize) -> Option<(GlobTok, usize)> {
+    let mut i = open + 1;
+    let negated = matches!(chars.get(i), Some('!') | Some('^'));
+    if negated {
+        i += 1;
+    }
+    let mut items = Vec::new();
+    let mut first = true;
+    while i < chars.len() {
+        let c = chars[i];
+        // A `]` first in the class is a member, not the close — `[]a]` is
+        // how sh spells "a right bracket or an a".
+        if c == ']' && !first {
+            return Some((GlobTok::Class { negated, items }, i + 1));
+        }
+        first = false;
+        // `a-z` is a range unless the `-` is last in the class, where it is
+        // itself a member.
+        if chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some_and(|&e| e != ']') {
+            items.push(ClassItem::Range(c, chars[i + 2]));
+            i += 3;
+        } else {
+            items.push(ClassItem::Char(c));
+            i += 1;
+        }
+    }
+    None
+}
+
+fn parse_glob(pattern: &str) -> Vec<GlobTok> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                toks.push(GlobTok::Star);
+                i += 1;
+            }
+            '?' => {
+                toks.push(GlobTok::Any);
+                i += 1;
+            }
+            '[' => match parse_class(&chars, i) {
+                Some((tok, next)) => {
+                    toks.push(tok);
+                    i = next;
+                }
+                None => {
+                    toks.push(GlobTok::Literal('['));
+                    i += 1;
+                }
+            },
+            c => {
+                toks.push(GlobTok::Literal(c));
+                i += 1;
+            }
+        }
+    }
+    toks
+}
+
 /// Matches a glob pattern against a port origin.
 ///
-/// `*` spans anything including `/`, so `www/py-*` and `*postgres*` both work,
-/// and `?` is one character. Applied to the tree listing rather than handed to
-/// SQLite, now that there is no table of ports to run `GLOB` against.
+/// `*` spans anything including `/`, so `www/py-*` and `*postgres*` both work;
+/// `?` is one character; `[dr]`, `[a-c]` and `[!x]` are sh-style classes.
+/// Applied to the tree listing rather than handed to SQLite, now that there is
+/// no table of ports to run `GLOB` against.
 fn glob_matches(pattern: &str, text: &str) -> bool {
     // Iterative rather than recursive: `star` remembers where the last `*` was,
     // so a mismatch backtracks to just after what that `*` had consumed instead
     // of unwinding a call stack.
-    let p: Vec<char> = pattern.chars().collect();
+    let p = parse_glob(pattern);
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut resume) = (None, 0usize);
 
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len() && p[pi].matches(t[ti]) {
             pi += 1;
             ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < p.len() && matches!(p[pi], GlobTok::Star) {
             star = Some(pi);
             resume = ti;
             pi += 1;
@@ -424,7 +534,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
 
-    p[pi..].iter().all(|&c| c == '*')
+    p[pi..].iter().all(|tok| matches!(tok, GlobTok::Star))
 }
 
 impl DependencyGraph {
@@ -444,11 +554,12 @@ impl DependencyGraph {
         let mut seen = HashSet::new();
         let mut unmatched_patterns = Vec::new();
 
-        let needs_listing = patterns
-            .iter()
-            .any(|p| p.contains('*') || p.contains('?') || p.contains('['));
+        // An unreadable tree is its own error, not "no matching ports": a glob
+        // against a listing that could not be read matches nothing for a
+        // reason the message has to name.
+        let needs_listing = patterns.iter().any(|p| is_glob(p));
         let listing = if needs_listing {
-            oracle.enumerate().unwrap_or_default()
+            oracle.enumerate()?
         } else {
             Vec::new()
         };
@@ -456,7 +567,7 @@ impl DependencyGraph {
         for pat in patterns {
             let mut matched = false;
 
-            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+            if is_glob(pat) {
                 for origin in listing.iter().filter(|o| glob_matches(pat, o)) {
                     matched = true;
                     if seen.insert(origin.clone()) {
@@ -1949,5 +2060,50 @@ impl DependencyGraph {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob_matches;
+
+    /// The two metacharacters that have always worked.
+    #[test]
+    fn stars_and_question_marks_match_as_before() {
+        assert!(glob_matches("www/py-*", "www/py-django"));
+        assert!(glob_matches("*postgres*", "databases/postgresql16-server"));
+        assert!(glob_matches("www/py-?ango", "www/py-dango"));
+        assert!(!glob_matches("www/py-?", "www/py-django"));
+    }
+
+    /// `[` was routed to the glob path but matched literally, so a class
+    /// pattern could never match anything.
+    #[test]
+    fn character_classes_match_sets_ranges_and_complements() {
+        assert!(glob_matches("www/py-[dr]*", "www/py-django"));
+        assert!(glob_matches("www/py-[dr]*", "www/py-requests"));
+        assert!(!glob_matches("www/py-[dr]*", "www/py-abc"));
+
+        assert!(glob_matches("www/py-[a-c]*", "www/py-abc"));
+        assert!(!glob_matches("www/py-[a-c]*", "www/py-django"));
+
+        assert!(glob_matches("www/py-[!dr]*", "www/py-abc"));
+        assert!(!glob_matches("www/py-[!dr]*", "www/py-django"));
+        assert!(glob_matches("www/py-[^dr]*", "www/py-abc"));
+    }
+
+    /// The sh corner cases: a `]` first in a class is a member, a trailing `-`
+    /// is a member, and an unclosed `[` is a literal bracket.
+    #[test]
+    fn class_corner_cases_follow_sh() {
+        assert!(glob_matches("a[]x]b", "a]b"));
+        assert!(glob_matches("a[]x]b", "axb"));
+        assert!(!glob_matches("a[]x]b", "ayb"));
+
+        assert!(glob_matches("a[x-]b", "a-b"));
+        assert!(glob_matches("a[x-]b", "axb"));
+
+        assert!(glob_matches("a[b", "a[b"));
+        assert!(!glob_matches("a[b", "acb"));
     }
 }
