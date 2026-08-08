@@ -1909,6 +1909,12 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
 /// about in turn, so a dependency that appears three levels down from a toggle
 /// still arrives. That cascade is what makes the list match what poudriere will
 /// compute, rather than what the port looked like at its maintainer's defaults.
+///
+/// An answer is folded in only if it still describes the port as it now
+/// stands. Toggling an option twice while `make` is out produces two
+/// questions; applying the first answer would show dependencies for an option
+/// set no longer in force until the second landed. The superseded answer is
+/// dropped instead — its successor is already in flight.
 fn merge(
     graph: &mut DependencyGraph,
     app: &mut App,
@@ -1917,7 +1923,7 @@ fn merge(
 ) -> Vec<String> {
     let mut arrived = Vec::new();
 
-    for ((origin, _), reply) in answers {
+    for ((origin, asked), reply) in answers {
         let facts = match reply {
             Ok(facts) => facts,
             Err(e) => {
@@ -1926,9 +1932,42 @@ fn merge(
             }
         };
 
-        if graph.port_index(&origin).is_none() {
-            graph.add_port(&facts, sys_opts);
-            arrived.push(origin.clone());
+        match graph.port_index(&origin) {
+            None => {
+                let id = graph.add_port(&facts, sys_opts);
+                arrived.push(origin.clone());
+
+                // Seeded from the saved configuration but answered as it
+                // ships — and a dependency behind `${opt}_USES` or an `.if`
+                // block exists only under the options in force. Where the two
+                // differ the port is asked again, exactly; `resettle` and
+                // `load_ports` make the same second ask.
+                let in_force = graph.option_set(id);
+                let mut sorted_in_force = in_force.clone();
+                sorted_in_force.sort();
+                let mut shipped: Vec<String> = facts
+                    .options
+                    .iter()
+                    .filter(|o| o.default_on)
+                    .map(|o| o.name.clone())
+                    .collect();
+                shipped.sort();
+                if sorted_in_force != shipped {
+                    let question = (origin.clone(), Options::Exactly(in_force));
+                    if !app.pending.contains(&question) {
+                        app.pending.push(question);
+                    }
+                }
+            }
+            Some(port_id) => match &asked {
+                // A duplicate as-shipped ask for a port that has since been
+                // added, and possibly touched; the first answer did the work.
+                Options::AsShipped => continue,
+                // Superseded: the toggle that changed the set queued a fresh
+                // question, so this answer describes options no longer set.
+                Options::Exactly(set) if graph.option_set(port_id) != *set => continue,
+                Options::Exactly(_) => {}
+            },
         }
 
         for unknown in graph.apply_resolution(&origin, &facts) {
@@ -2209,6 +2248,138 @@ mod tests {
             })
             .collect();
         built(ports, &["lang/php83-extensions", "lang/php84-extensions"])
+    }
+
+    /// A stale answer — one computed for an option set no longer in force —
+    /// must be dropped, not folded in. Its successor is already in flight, and
+    /// folding the stale one in would show its dependencies until then.
+    #[test]
+    fn merge_drops_an_answer_for_options_no_longer_set() {
+        let mut p = fixture_port("www/app");
+        fixture_option(&mut p, "X", false, "DEFINE", "");
+        let mut graph = built(vec![p], &["www/app"]);
+        let mut app = App::new(None);
+        let sys = SystemOptions::default();
+
+        // Computed while X was on; the user has since turned X back off.
+        let mut facts = fixture_port("www/app");
+        fixture_option(&mut facts, "X", false, "DEFINE", "");
+        fixture_edge(&mut facts, "www/newdep", None);
+        let answers = vec![(
+            (
+                "www/app".to_string(),
+                Options::Exactly(vec!["X".to_string()]),
+            ),
+            Ok(facts),
+        )];
+
+        let arrived = merge(&mut graph, &mut app, &sys, answers);
+        assert!(arrived.is_empty());
+        assert!(
+            app.pending.is_empty(),
+            "a superseded answer must not queue work for its dependencies"
+        );
+    }
+
+    /// The gate must not drop legitimate answers: one matching the current
+    /// option set applies, and its dependencies get asked about.
+    #[test]
+    fn merge_applies_an_answer_for_the_options_in_force() {
+        let mut p = fixture_port("www/app");
+        fixture_option(&mut p, "X", true, "DEFINE", "");
+        let mut graph = built(vec![p], &["www/app"]);
+        let mut app = App::new(None);
+        let sys = SystemOptions::default();
+
+        let mut facts = fixture_port("www/app");
+        fixture_option(&mut facts, "X", true, "DEFINE", "");
+        fixture_edge(&mut facts, "www/newdep", None);
+        let answers = vec![(
+            (
+                "www/app".to_string(),
+                Options::Exactly(vec!["X".to_string()]),
+            ),
+            Ok(facts),
+        )];
+
+        merge(&mut graph, &mut app, &sys, answers);
+        assert!(
+            app.pending
+                .contains(&("www/newdep".to_string(), Options::AsShipped)),
+            "the dependency the answer names has to be asked about"
+        );
+    }
+
+    /// A second as-shipped answer for a port that already arrived did its work
+    /// the first time; re-applying it would overwrite state the user may have
+    /// touched since.
+    #[test]
+    fn merge_skips_a_duplicate_as_shipped_answer_for_a_known_port() {
+        let mut graph = built(vec![fixture_port("www/app")], &["www/app"]);
+        let mut app = App::new(None);
+        let sys = SystemOptions::default();
+
+        let mut facts = fixture_port("www/app");
+        fixture_edge(&mut facts, "www/newdep", None);
+        let answers = vec![(("www/app".to_string(), Options::AsShipped), Ok(facts))];
+
+        merge(&mut graph, &mut app, &sys, answers);
+        assert!(app.pending.is_empty());
+    }
+
+    /// A port that arrives mid-session with saved options differing from its
+    /// defaults is queued to be asked again under the saved set — the second
+    /// evaluation, mirrored from load_ports and resettle.
+    #[test]
+    fn merge_asks_an_arrived_port_under_its_saved_options() {
+        let mut graph = built(vec![fixture_port("www/app")], &["www/app"]);
+        let mut app = App::new(None);
+        let mut sys = SystemOptions::default();
+        sys.port_overrides
+            .entry("www/b".to_string())
+            .or_default()
+            .insert("X".to_string(), true);
+
+        let mut facts = fixture_port("www/b");
+        fixture_option(&mut facts, "X", false, "DEFINE", "");
+        let answers = vec![(("www/b".to_string(), Options::AsShipped), Ok(facts))];
+
+        let arrived = merge(&mut graph, &mut app, &sys, answers);
+        assert_eq!(arrived, vec!["www/b".to_string()]);
+        assert!(
+            app.pending
+                .contains(&("www/b".to_string(), Options::Exactly(vec!["X".to_string()]))),
+            "saved configuration differs from shipped, so the port must be re-asked"
+        );
+    }
+
+    /// A toggle that fires implications queues the port's question with the
+    /// post-implication set. The staleness gate depends on every mutation's
+    /// question describing the state it left behind — an implied option
+    /// missing from the question would make the graph drop its own answer.
+    #[test]
+    fn a_toggled_ports_question_carries_its_implied_options() {
+        let mut p = fixture_port("www/app");
+        fixture_option(&mut p, "NJS", false, "DEFINE", "");
+        fixture_option(&mut p, "STREAM", false, "DEFINE", "");
+        p.options[0].implies = vec!["STREAM".to_string()];
+        let mut graph = built(vec![p], &["www/app"]);
+        let mut app = App::new(None);
+
+        let row = row_of_option(&graph, "www/app", "NJS");
+        let touched = graph.toggle_option(row);
+        app.ask_about(&graph, &touched);
+
+        let Some((_, Options::Exactly(set))) =
+            app.pending.iter().find(|(origin, _)| origin == "www/app")
+        else {
+            panic!("the toggled port must have a question queued");
+        };
+        assert!(set.contains(&"NJS".to_string()));
+        assert!(
+            set.contains(&"STREAM".to_string()),
+            "the implied option is part of the state the question describes"
+        );
     }
 
     /// Documented in --help, the README and the footer: Ctrl+G once to add,
