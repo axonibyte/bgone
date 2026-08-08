@@ -107,8 +107,9 @@ KEYBINDINGS:
    Enter              Press the highlighted button. In the list it presses
                       < OK >, unless the cursor is on a relationship entry,
                       which it follows instead.
-   o  /  c            Press < OK > / < Cancel > from anywhere
-   s                  Save the options and exit (same as < OK >)
+   o  /  s            Ask to save and exit, with < Save and exit > already
+                      highlighted — Enter confirms
+   c                  Ask to leave, via the same confirmation
    Ctrl + S           Write the options out and carry on. A long session's
                       picking should not be riding on getting out cleanly at
                       the end of it.

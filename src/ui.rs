@@ -9,7 +9,10 @@ use crate::resolve::PortFacts;
 use anyhow::Result;
 use crossterm::{
     cursor::{MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     style::ResetColor,
     // Aliased: ratatui has a `Clear` widget of its own, and both are in use here
@@ -975,6 +978,49 @@ impl App {
         ));
     }
 
+    /// Folds pasted text into whichever field is being typed into. Only the
+    /// first line is taken — a pasted newline must not act as Enter — and
+    /// control characters are dropped. Everywhere without a field (Normal,
+    /// the dialogs) a paste is ignored outright: before bracketed paste, a
+    /// paste there arrived as keystrokes, and any `s` in it saved and exited.
+    fn on_paste(&mut self, pasted: &str, graph: &mut DependencyGraph) {
+        let line = pasted.lines().next().unwrap_or("");
+        let chars = line.chars().filter(|c| !c.is_control());
+
+        match self.input_mode {
+            InputMode::Search => {
+                for c in chars {
+                    edit_field(
+                        &mut graph.search_query,
+                        &mut self.text_cursor,
+                        KeyCode::Char(c),
+                        false,
+                    );
+                }
+                // The same refresh a typed character gets: results narrow as
+                // the query grows, anchored to the row being looked at.
+                let selected = self.list_state.selected().unwrap_or(0);
+                let anchor = graph.anchor_at(selected);
+                graph.rebuild_visible_rows();
+                self.restore_anchor_or(graph, anchor, 0);
+            }
+            InputMode::GroupNewName | InputMode::ConfigPath => {
+                for c in chars {
+                    edit_field(
+                        &mut self.text_buffer,
+                        &mut self.text_cursor,
+                        KeyCode::Char(c),
+                        false,
+                    );
+                }
+            }
+            InputMode::Normal
+            | InputMode::ConfirmQuit
+            | InputMode::GroupAssign
+            | InputMode::GroupManage => {}
+        }
+    }
+
     /// Folds one keystroke into the state, reporting anything the event loop
     /// has to act on. Pure with respect to the terminal, so it can be driven
     /// directly by tests.
@@ -1359,10 +1405,15 @@ impl App {
                         return KeyOutcome::SaveInPlace;
                     }
 
-                    // Letter hotkeys work from any focus
-                    KeyCode::Char('o') | KeyCode::Char('O') => save_requested = true,
+                    // Letter hotkeys work from any focus. `s` and `o` go
+                    // through the confirmation like `q`, with Save already
+                    // highlighted — ending the session and writing files is
+                    // one slip of a finger otherwise, and dialog(1) commits
+                    // only from a focused button. Enter on < OK > stays
+                    // immediate, because focusing the button is deliberate.
+                    KeyCode::Char('o') | KeyCode::Char('O') => quit_requested = true,
 
-                    KeyCode::Char('s') | KeyCode::Char('S') => save_requested = true,
+                    KeyCode::Char('s') | KeyCode::Char('S') => quit_requested = true,
 
                     KeyCode::Char('c') | KeyCode::Char('C') => quit_requested = true,
 
@@ -1446,13 +1497,16 @@ impl App {
                         self.status_msg = String::from("Jumped to previous sibling");
                     }
 
-                    // Navigation: Top & Bottom
-                    KeyCode::Home | KeyCode::Char('g') if has_ctrl || code == KeyCode::Home => {
+                    // Navigation: Top & Bottom. Only the real keys: the
+                    // `Char('g')`/`Char('G')` alternatives that used to sit
+                    // here were unreachable — their guard required Ctrl, and
+                    // Ctrl+G is consumed by the group arm above.
+                    KeyCode::Home => {
                         self.list_state.select(Some(0));
                         self.status_msg = String::from("Jumped to top");
                     }
 
-                    KeyCode::End | KeyCode::Char('G') if has_ctrl || code == KeyCode::End => {
+                    KeyCode::End => {
                         let last = total_rows.saturating_sub(1);
                         self.list_state.select(Some(last));
                         self.status_msg = String::from("Jumped to bottom");
@@ -2088,7 +2142,11 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        // Bracketed paste makes a paste arrive as one Event::Paste instead of
+        // a burst of keystrokes — without it, pasted text containing a hotkey
+        // letter acts on the list, and pasting `s` anywhere used to write the
+        // options out.
+        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
 
         // Restore before the default hook prints, so the panic message lands on
         // the main screen in cooked mode instead of vanishing with the
@@ -2109,7 +2167,7 @@ impl TerminalGuard {
     /// them on. Deliberately no once-flag: one would wrongly suppress the
     /// restore if the interface were ever entered twice in one process.
     fn restore() {
-        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
         let _ = disable_raw_mode();
     }
 }
@@ -2204,25 +2262,25 @@ pub fn run_tui_with(
         }
 
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key_acts(key.kind) {
-                    match app.on_key(key, graph) {
-                        KeyOutcome::Continue => {}
-                        KeyOutcome::Redraw => terminal.clear()?,
-                        KeyOutcome::SaveInPlace => {
-                            // One frame of feedback before make blocks the
-                            // loop: settling can take seconds, and a frozen
-                            // interface with no message reads as a hang.
-                            app.important_msg = Some(String::from("Settling and saving..."));
-                            terminal.draw(|f| render(f, graph, &mut app))?;
-                            app.perform_save(graph);
-                        }
-                        KeyOutcome::Finish(finished) => {
-                            action = finished;
-                            break;
-                        }
+            match event::read()? {
+                Event::Key(key) if key_acts(key.kind) => match app.on_key(key, graph) {
+                    KeyOutcome::Continue => {}
+                    KeyOutcome::Redraw => terminal.clear()?,
+                    KeyOutcome::SaveInPlace => {
+                        // One frame of feedback before make blocks the
+                        // loop: settling can take seconds, and a frozen
+                        // interface with no message reads as a hang.
+                        app.important_msg = Some(String::from("Settling and saving..."));
+                        terminal.draw(|f| render(f, graph, &mut app))?;
+                        app.perform_save(graph);
                     }
-                }
+                    KeyOutcome::Finish(finished) => {
+                        action = finished;
+                        break;
+                    }
+                },
+                Event::Paste(text) => app.on_paste(&text, graph),
+                _ => {}
             }
         }
     }
@@ -3580,12 +3638,89 @@ mod tests {
             "the result must go where the header cannot hide it"
         );
 
-        // Plain `s` is still the OK button: write and leave
+        // Plain `s` asks first now, with < Save and exit > preselected, so
+        // ending the session is never one unguarded letter; Enter confirms.
         assert_eq!(
             app.on_key(key(KeyCode::Char('s')), &mut graph),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+        assert_eq!(app.confirm_choice, ConfirmChoice::Save);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter), &mut graph),
             KeyOutcome::Finish(TuiAction::SaveAndQuit)
         );
         assert_eq!(*calls.borrow(), 1, "leaving must not save twice");
+    }
+
+    /// `o` matches `s`: the confirmation opens on < Save and exit >.
+    #[test]
+    fn bare_o_asks_before_saving_and_exiting() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('o')), &mut graph),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+        assert_eq!(app.confirm_choice, ConfirmChoice::Save);
+    }
+
+    // ------------------------------------------------------------------ paste
+
+    /// Pasting where there is no field must do nothing. Before bracketed
+    /// paste, pasted text arrived as keystrokes, and any `s` in it ended the
+    /// session and wrote the options files.
+    #[test]
+    fn pasting_outside_a_field_is_ignored() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+
+        app.on_paste("notes with an s and a q in them", &mut graph);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    /// A paste into the search bar types its first line — a pasted newline
+    /// must not act as Enter — with control characters dropped, and the
+    /// filter narrows exactly as if it had been typed.
+    #[test]
+    fn pasting_into_search_types_the_first_line() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.on_key(key(KeyCode::Char('/')), &mut graph);
+        assert_eq!(app.input_mode, InputMode::Search);
+
+        app.on_paste("php83\nsecond line", &mut graph);
+        assert_eq!(graph.search_query, "php83");
+        assert_eq!(app.input_mode, InputMode::Search, "no Enter smuggled in");
+        assert!(
+            !listed_test_rows(&graph).iter().any(|o| o.contains("php84")),
+            "the filter must have narrowed"
+        );
+    }
+
+    /// The prompt fields take a paste through the same editing seam as typing.
+    #[test]
+    fn pasting_into_a_prompt_fills_the_buffer() {
+        let mut graph = test_graph();
+        let mut app = App::new(None);
+        app.input_mode = InputMode::GroupNewName;
+
+        app.on_paste("php\tset", &mut graph);
+        assert_eq!(app.text_buffer, "phpset", "control characters are dropped");
+    }
+
+    /// Origins of the ports visible in the current row list.
+    fn listed_test_rows(graph: &DependencyGraph) -> Vec<String> {
+        graph
+            .visible_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::Port { origin, .. } => Some(origin.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A failing write is reported rather than swallowed or fatal.

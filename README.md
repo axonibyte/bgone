@@ -519,12 +519,12 @@ did not mean to keep it.
 | **`Tab`** / **`Shift + Tab`** | Move focus between the list and the `OK` / `Cancel` buttons |
 | **`Left` / `Right`** | Move between buttons while the button row has focus |
 | **`Enter`** (elsewhere) | Press the focused button (`OK` while the list has focus) |
-| **`o`** / **`c`** | Press `OK` / `Cancel` directly |
+| **`o`** / **`c`** | Ask to save-and-exit / to leave, via the confirmation |
 | **`/`** or **`Ctrl + F`** | Open search / filter bar |
 | **`Ctrl + L`** | Recenter the cursor row and repaint (see below) |
 | **`Ctrl + R`** | Repaint without moving the view |
 | **`Shift + H`** | Hide the ports that define no options, and show them again |
-| **`s`** | Save configuration files and exit |
+| **`s`** | Ask to save and exit, with `Save and exit` already highlighted |
 | **`Ctrl + S`** | Write the configuration files out and carry on |
 | **`q`** / **`Esc`** / **`Ctrl + C`** | Leave, always confirming first |
 
@@ -536,9 +536,9 @@ The bottom of the screen carries a `dialog`-style button row:
               <  OK  >        < Cancel >
 ```
 
-`Tab` cycles focus between the list and each button; `Left` / `Right` move between the buttons once the row has focus; `Enter` or `Space` presses the focused one. Each button's highlighted first character is its **letter hotkey**—press `o` for `OK` or `c` for `Cancel` from anywhere, no focus change needed. That is the same convention `dialog` uses, and it is derived from the label, so a button named `Help` would answer to `h`.
+`Tab` cycles focus between the list and each button; `Left` / `Right` move between the buttons once the row has focus; `Enter` or `Space` presses the focused one — pressing a focused button is deliberate, so it acts immediately. The letter hotkeys `o`, `s` and `c` work from anywhere but go through the leaving confirmation instead, with `Save and exit` already highlighted for `o` and `s`: ending a session and writing files should never be one unguarded letter from the list.
 
-`OK` saves and exits. `Cancel`, `q`, `Esc` and `Ctrl + C` all ask on the way out:
+`OK` saves and exits. `Cancel`, `q`, `Esc`, `Ctrl + C` and the letter hotkeys all ask on the way out:
 
 ```text
    ┌ Leaving bgone ───────────────────────────────────┐

@@ -349,7 +349,7 @@ fn test_help_documents_every_switch() {
         "=  /  -",
         "+  /  _",
         "++ /  __",
-        "o  /  c",
+        "o  /  s",
         "Backspace",
     ] {
         assert!(help.contains(binding), "`--help` is missing {binding}");
