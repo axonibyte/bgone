@@ -760,6 +760,13 @@ struct App {
     pending: Vec<Question>,
     /// How many questions are out with the worker, for the "resolving" note.
     outstanding: usize,
+    /// A message that must not be hidden behind the "resolving" note — a save
+    /// result, the worker dying. Cleared by the next keystroke, which is the
+    /// acknowledgement.
+    important_msg: Option<String>,
+    /// True once the worker's channel is gone. Nothing further is posted, no
+    /// more `outstanding` accrues, and the header says so.
+    resolver_dead: bool,
 }
 
 impl App {
@@ -785,6 +792,8 @@ impl App {
             text_cursor: 0,
             pending: Vec::new(),
             outstanding: 0,
+            important_msg: None,
+            resolver_dead: false,
         }
     }
 
@@ -803,6 +812,9 @@ enum KeyOutcome {
     /// Repaint from scratch. Returned rather than performed so that key handling
     /// never touches the terminal.
     Redraw,
+    /// Settle and write without leaving. Returned rather than performed so the
+    /// event loop can draw a "saving" frame before `make` blocks the thread.
+    SaveInPlace,
     Finish(TuiAction),
 }
 
@@ -906,6 +918,63 @@ impl App {
         self.list_state.select(Some(row));
     }
 
+    /// What Ctrl+S does: settle, write, and report. Split from the key handler
+    /// so the event loop can draw a "saving" frame first — `make` blocks the
+    /// thread — and so tests can drive it without a terminal. The outcome
+    /// lands in `important_msg`, which the header shows even while answers are
+    /// outstanding; written to `status_msg`, the save message was invisible
+    /// behind the "resolving" note whenever a toggle's question was still out.
+    ///
+    /// `pending` and `outstanding` are deliberately left alone: in-flight
+    /// answers drain normally afterwards, and the staleness gate in [`merge`]
+    /// drops any the settle superseded.
+    fn perform_save(&mut self, graph: &mut DependencyGraph) {
+        let selected_index = self.list_state.selected().unwrap_or(0);
+
+        // Settled first: what is written is what is in the build, so the
+        // build has to be up to date with the options as they now stand.
+        let mut arrived = 0;
+        let mut failed = 0;
+        if let Some(settle) = &self.settle {
+            let anchor = graph.anchor_at(selected_index);
+            let outcome = settle(graph);
+            arrived = outcome.arrived.len();
+            failed = outcome.failed.len();
+            self.restore_anchor(graph, anchor);
+        }
+
+        let mut message = match &self.saver {
+            Some(save) => match save(graph) {
+                Ok(what) => what,
+                Err(e) => format!("Could not save: {e}"),
+            },
+            None => String::from("Nowhere to save to"),
+        };
+        if arrived > 0 {
+            message = format!("{message}; {arrived} port(s) pulled in");
+        }
+        // A port that could not be re-asked may have been written stale —
+        // said next to the save, not swallowed by it.
+        if failed > 0 {
+            message = format!("{message}; {failed} port(s) could not be re-evaluated");
+        }
+        self.important_msg = Some(message);
+    }
+
+    /// Called when the worker's channel reports closed. Its outstanding
+    /// questions will never be answered, so the count is zeroed rather than
+    /// left pinning the header to "resolving" forever — which also hid every
+    /// status message behind it, the saved-files message included. Pending
+    /// questions are dropped: there is nothing left to answer them.
+    fn mark_resolver_dead(&mut self) {
+        self.resolver_dead = true;
+        self.outstanding = 0;
+        self.pending.clear();
+        self.important_msg = Some(String::from(
+            "resolver died; new dependencies will not appear, but Ctrl+S still settles and saves",
+        ));
+    }
+
     /// Folds one keystroke into the state, reporting anything the event loop
     /// has to act on. Pure with respect to the terminal, so it can be driven
     /// directly by tests.
@@ -919,6 +988,10 @@ impl App {
         let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let page_size = self.viewport_height.max(1);
+
+        // Any keystroke acknowledges an important message, the way status
+        // messages have always been overwritten rather than expired.
+        self.important_msg = None;
 
         // Runs of the same key drive the recenter cycle and the tree
         // scope escalation; anything else breaks the run
@@ -1280,29 +1353,10 @@ impl App {
                     // Write the options out and carry on. Distinct from the
                     // < OK > button, which writes and leaves: keeping a long
                     // session's work safe should not cost the session.
+                    // Returned to the loop rather than performed, so a frame
+                    // of feedback can go up before `make` blocks it.
                     KeyCode::Char('s') | KeyCode::Char('S') if has_ctrl => {
-                        // Settled first: what is written is what is in the
-                        // build, so the build has to be up to date with the
-                        // options as they now stand.
-                        let mut failed = 0;
-                        if let Some(settle) = &self.settle {
-                            let anchor = graph.anchor_at(selected_index);
-                            failed = settle(graph).failed.len();
-                            self.restore_anchor(graph, anchor);
-                        }
-                        self.status_msg = match &self.saver {
-                            Some(save) => match save(graph) {
-                                // A port that could not be re-asked may have
-                                // been written stale — said next to the save,
-                                // not swallowed by it.
-                                Ok(what) if failed > 0 => {
-                                    format!("{what}; {failed} port(s) could not be re-evaluated")
-                                }
-                                Ok(what) => what,
-                                Err(e) => format!("Could not save: {e}"),
-                            },
-                            None => String::from("Nowhere to save to"),
-                        };
+                        return KeyOutcome::SaveInPlace;
                     }
 
                     // Letter hotkeys work from any focus
@@ -1604,11 +1658,23 @@ fn render(f: &mut Frame, graph: &DependencyGraph, app: &mut App) {
     };
     // Said while make runs, because a toggle can take the better part of a
     // second on a large port and silence reads as nothing having happened.
-    let status = if app.outstanding > 0 {
+    // An important message — a save result, the worker dying — outranks the
+    // note instead of hiding behind it: Ctrl+S while a toggle's question was
+    // still out used to report the save invisibly.
+    let mut status = if let Some(msg) = &app.important_msg {
+        if app.outstanding > 0 {
+            format!("{msg} | resolving {} port(s)... ", app.outstanding)
+        } else {
+            format!("{msg} ")
+        }
+    } else if app.outstanding > 0 {
         format!("resolving {} port(s)... ", app.outstanding)
     } else {
         format!("{} ", app.status_msg)
     };
+    if app.resolver_dead {
+        status = format!("[resolver stopped] {status}");
+    }
     let gap = (chunks[0].width.saturating_sub(2) as usize)
         .saturating_sub(target.chars().count() + status.chars().count())
         .max(1);
@@ -2090,28 +2156,47 @@ pub fn run_tui_with(
         // Post whatever the last keystroke raised. Batched rather than sent one
         // at a time so a round runs in parallel across cores.
         if let Some(resolver) = &resolver {
-            if !app.pending.is_empty() {
+            if !app.pending.is_empty() && !app.resolver_dead {
                 let batch = std::mem::take(&mut app.pending);
-                app.outstanding += batch.len();
-                let _ = resolver.tx.send(batch);
+                let posted = batch.len();
+                // Counted only once the send succeeds: incrementing before a
+                // send into a dead worker left the count stuck above zero
+                // forever, pinning the header to "resolving" and hiding every
+                // message after it.
+                if resolver.tx.send(batch).is_ok() {
+                    app.outstanding += posted;
+                } else {
+                    app.mark_resolver_dead();
+                }
             }
 
             // Answers are collected here rather than waited for, so the poll
             // above keeps the interface responsive while make runs.
-            while let Ok(answers) = resolver.rx.try_recv() {
-                app.outstanding = app.outstanding.saturating_sub(answers.len());
-                let anchor = app
-                    .list_state
-                    .selected()
-                    .and_then(|row| graph.anchor_at(row));
-                let arrived = merge(graph, &mut app, sys_opts, answers);
-                app.restore_anchor(graph, anchor);
+            loop {
+                match resolver.rx.try_recv() {
+                    Ok(answers) => {
+                        app.outstanding = app.outstanding.saturating_sub(answers.len());
+                        let anchor = app
+                            .list_state
+                            .selected()
+                            .and_then(|row| graph.anchor_at(row));
+                        let arrived = merge(graph, &mut app, sys_opts, answers);
+                        app.restore_anchor(graph, anchor);
 
-                if !arrived.is_empty() {
-                    app.status_msg = match arrived.len() {
-                        1 => format!("{} pulled in", arrived[0]),
-                        n => format!("{} and {} more pulled in", arrived[0], n - 1),
-                    };
+                        if !arrived.is_empty() {
+                            app.status_msg = match arrived.len() {
+                                1 => format!("{} pulled in", arrived[0]),
+                                n => format!("{} and {} more pulled in", arrived[0], n - 1),
+                            };
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !app.resolver_dead {
+                            app.mark_resolver_dead();
+                        }
+                        break;
+                    }
                 }
             }
         } else {
@@ -2124,6 +2209,14 @@ pub fn run_tui_with(
                     match app.on_key(key, graph) {
                         KeyOutcome::Continue => {}
                         KeyOutcome::Redraw => terminal.clear()?,
+                        KeyOutcome::SaveInPlace => {
+                            // One frame of feedback before make blocks the
+                            // loop: settling can take seconds, and a frozen
+                            // interface with no message reads as a hang.
+                            app.important_msg = Some(String::from("Settling and saving..."));
+                            terminal.draw(|f| render(f, graph, &mut app))?;
+                            app.perform_save(graph);
+                        }
                         KeyOutcome::Finish(finished) => {
                             action = finished;
                             break;
@@ -3477,10 +3570,15 @@ mod tests {
             }),
         );
 
-        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::Continue);
+        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::SaveInPlace);
+        app.perform_save(&mut graph);
         assert_eq!(*calls.borrow(), 1, "Ctrl+S must write the options out");
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.status_msg, "Saved 3 options across 2 files");
+        assert_eq!(
+            app.important_msg.as_deref(),
+            Some("Saved 3 options across 2 files"),
+            "the result must go where the header cannot hide it"
+        );
 
         // Plain `s` is still the OK button: write and leave
         assert_eq!(
@@ -3499,12 +3597,56 @@ mod tests {
             Box::new(|_| Err(anyhow::anyhow!("read-only file system"))),
         );
 
-        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::Continue);
+        assert_eq!(app.on_key(ctrl('s'), &mut graph), KeyOutcome::SaveInPlace);
+        app.perform_save(&mut graph);
         assert!(
-            app.status_msg.contains("read-only file system"),
-            "status said {:?}",
-            app.status_msg
+            app.important_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only file system"),
+            "message said {:?}",
+            app.important_msg
         );
+    }
+
+    /// The save result has to be readable even while questions are still out.
+    /// This was the field report: Ctrl+S during a resolve showed only
+    /// "resolving N port(s)...", and the saved message never appeared.
+    #[test]
+    fn the_save_message_shows_even_while_resolving() {
+        // A short origin keeps the header's target brief: the 90-column frame
+        // truncates from the right, and what matters here is precedence, not
+        // packing.
+        let graph = built(vec![fixture_port("www/a")], &["www/a"]);
+        let mut app = App::new(None);
+        app.outstanding = 2;
+        app.important_msg = Some(String::from("Saved 3 options across 2 files"));
+
+        let out = draw(|f| render(f, &graph, &mut app));
+        assert!(
+            out.contains("Saved 3 options across 2 files"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("resolving 2 port(s)"), "got:\n{out}");
+    }
+
+    /// A dead worker zeroes the outstanding count — left non-zero it pinned
+    /// the header to "resolving" forever, hiding every message behind it —
+    /// and the header says the resolver stopped.
+    #[test]
+    fn a_dead_resolver_unpins_the_header() {
+        let graph = test_graph();
+        let mut app = App::new(None);
+        app.outstanding = 3;
+        app.pending
+            .push(("www/gone".to_string(), Options::AsShipped));
+
+        app.mark_resolver_dead();
+        assert_eq!(app.outstanding, 0, "nothing will ever answer these");
+        assert!(app.pending.is_empty(), "there is nothing left to ask");
+
+        let out = draw(|f| render(f, &graph, &mut app));
+        assert!(out.contains("[resolver stopped]"), "got:\n{out}");
     }
 
     /// Being in a group changes what a keystroke does — Space here also moves
