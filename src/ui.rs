@@ -8,7 +8,7 @@ use crate::reader::SystemOptions;
 use crate::resolve::PortFacts;
 use anyhow::Result;
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::ResetColor,
@@ -1953,6 +1953,49 @@ pub fn run_tui(
     )
 }
 
+/// Puts the terminal into the interface's mode — raw, on the alternate screen —
+/// and guarantees it comes back out: on return, on any `?`, and on panic.
+///
+/// Restoration has to be unconditional, because every failure between setup and
+/// teardown otherwise leaves the shell in raw mode on the alternate screen,
+/// where even the message explaining the failure is invisible.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen)?;
+
+        // Restore before the default hook prints, so the panic message lands on
+        // the main screen in cooked mode instead of vanishing with the
+        // alternate screen. The guard's own Drop runs again while unwinding;
+        // restore() is idempotent, so the double call is harmless.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            TerminalGuard::restore();
+            prev(info);
+        }));
+
+        Ok(Self)
+    }
+
+    /// Every step is safe to repeat and safe to run when setup half-failed:
+    /// leaving the main screen and disabling raw mode on a cooked terminal are
+    /// both no-ops. Errors are dropped — there is no better terminal to report
+    /// them on. Deliberately no once-flag: one would wrongly suppress the
+    /// restore if the interface were ever entered twice in one process.
+    fn restore() {
+        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+        let _ = disable_raw_mode();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        Self::restore();
+    }
+}
+
 /// As [`run_tui`], with an oracle to answer questions raised while it runs.
 ///
 /// Without one the interface still works and still writes; it simply cannot
@@ -1968,10 +2011,8 @@ pub fn run_tui_with(
 ) -> Result<TuiAction> {
     let resolver = oracle.map(Resolver::spawn);
 
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let guard = TerminalGuard::new()?;
+    let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     // The alternate screen keeps whatever was last on it, and the first draw
@@ -2033,9 +2074,9 @@ pub fn run_tui_with(
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // The guard leaves the alternate screen here, so the wipe below paints the
+    // main screen and not the interface's.
+    drop(guard);
 
     // Leaving the alternate screen puts back whatever the shell had on screen
     // before bgone started, with the cursor dropped wherever that left it —
@@ -2043,18 +2084,13 @@ pub fn run_tui_with(
     // What comes next, this program's own output or the prompt, then starts
     // mid-line against a screenful of unrelated scrollback.
     //
-    // So the screen is wiped to the terminal's own background and the cursor
-    // put at the top of it, colours reset first so a style left over from the
-    // interface cannot tint what is painted. The newline after that is what
-    // separates the summary from the top edge.
+    // So the visible screen is wiped to the terminal's own background and the
+    // cursor put at the top of it, colours reset first so a style left over
+    // from the interface cannot tint what is painted. Only the visible screen:
+    // the scrollback is the user's history, not this program's to clear. The
+    // newline after that is what separates the summary from the top edge.
     let mut out = std::io::stdout();
-    execute!(
-        out,
-        ResetColor,
-        ClearScreen(ClearType::All),
-        ClearScreen(ClearType::Purge),
-        MoveTo(0, 0)
-    )?;
+    execute!(out, ResetColor, ClearScreen(ClearType::All), MoveTo(0, 0))?;
     writeln!(out)?;
     out.flush()?;
 
@@ -3616,5 +3652,13 @@ mod tests {
         assert!(out.contains("New group"));
         assert!(out.contains("Name a group:"));
         assert!(out.contains("php-ext"));
+    }
+
+    /// The guard restores from Drop and again from the panic hook, so restoring
+    /// twice — and outside the interface's mode altogether — has to be safe.
+    #[test]
+    fn restoring_the_terminal_twice_is_harmless() {
+        TerminalGuard::restore();
+        TerminalGuard::restore();
     }
 }
