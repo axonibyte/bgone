@@ -405,6 +405,48 @@ pub fn newest_makefile_mtime(port_dir: &Path) -> Option<i64> {
     newest
 }
 
+/// Newest mtime of anything under the tree's `Mk/`, recursively.
+///
+/// `bsd.port.mk`, `bsd.options.mk`, `Uses/*.mk` and the scripts they run decide
+/// what any port evaluates to — `COMPLETE_OPTIONS_LIST` and whole dependency
+/// classes live there — so a framework change has to age memoised replies the
+/// way a port's own Makefile does. A tree update that touches only `Mk/` moves
+/// no port Makefile, and would otherwise serve stale replies for every
+/// unchanged port indefinitely.
+///
+/// About two hundred files, walked once per [`crate::oracle::Oracle`].
+/// Unreadable entries are skipped rather than zeroing the whole answer: a
+/// partial newest still ages the memo better than nothing.
+pub fn newest_framework_mtime(ports_dir: &Path) -> Option<i64> {
+    let mut newest = None;
+    let mut stack = vec![ports_dir.join("Mk")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            let Some(mtime) = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+            else {
+                continue;
+            };
+            newest = Some(newest.map_or(mtime, |n: i64| n.max(mtime)));
+        }
+    }
+    newest
+}
+
 /// Splits make's reply into the tagged fields it was asked for.
 ///
 /// make prints one line per `-V`, but a variable holding a newline would break

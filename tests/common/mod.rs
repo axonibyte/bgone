@@ -225,12 +225,23 @@ impl Tree {
         self.port(origin).unreadable = true;
     }
 
+    /// Writes only when the content differs, so re-running `write` does not
+    /// bump mtimes. The framework's age is part of every memo key; rewriting an
+    /// unchanged `Mk/bsd.port.mk` between two `oracle()` calls would invalidate
+    /// the whole memo and quietly turn every remembered-reply test into a
+    /// re-evaluation.
+    fn write_if_changed(path: &Path, content: &str) {
+        if fs::read(path).ok().as_deref() != Some(content.as_bytes()) {
+            fs::write(path, content).unwrap();
+        }
+    }
+
     fn write(&mut self) {
         let root = self.root();
         for (origin, port) in &self.ports {
             let dir = root.join(origin);
             fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("Makefile"), "# read by the stub make\n").unwrap();
+            Self::write_if_changed(&dir.join("Makefile"), "# read by the stub make\n");
 
             if port.unreadable {
                 let _ = fs::remove_file(dir.join(".port"));
@@ -263,13 +274,21 @@ impl Tree {
             for (class, opt, entry) in &port.hidden {
                 out.push_str(&format!("hidden\t{class}\t{opt}\t{entry}\n"));
             }
-            fs::write(dir.join(".port"), out).unwrap();
+            Self::write_if_changed(&dir.join(".port"), &out);
         }
         // `Mk/bsd.port.mk` is what the oracle looks for to decide the tree is
         // readable, so the fixture has to have one.
         fs::create_dir_all(root.join("Mk")).unwrap();
-        fs::write(root.join("Mk").join("bsd.port.mk"), "# stub\n").unwrap();
+        Self::write_if_changed(&root.join("Mk").join("bsd.port.mk"), "# stub\n");
         self.written = true;
+    }
+
+    /// Forces the tree onto disk without building an oracle, for tests that
+    /// need to age files before the first session starts.
+    pub fn write_out(&mut self) {
+        if !self.written {
+            self.write();
+        }
     }
 
     pub fn oracle(&mut self) -> Oracle {

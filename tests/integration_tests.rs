@@ -371,6 +371,87 @@ fn a_changed_makefile_is_evaluated_again() {
     );
 }
 
+/// `Mk/` decides what any port evaluates to, so a framework update has to miss
+/// the memo even though no port's own Makefile moved — a tree update that
+/// touches only the framework used to serve stale replies forever.
+#[test]
+fn a_framework_change_is_evaluated_again() {
+    let mut tree = common::Tree::new("oracle_framework_mtime");
+    tree.add_option("www/app", "ALPHA", true, "", "DEFINE", "");
+
+    let oracle = tree.oracle();
+    let before = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    assert_eq!(before.options.len(), 1);
+
+    // The port grows an option without its own Makefile moving; only the
+    // framework's age says anything changed.
+    fs::write(
+        tree.root().join("www/app/.port"),
+        "pkgname\tapp-1.0\nopt\tALPHA\t1\tDEFINE\t\t\nopt\tBETA\t0\tDEFINE\t\t\n",
+    )
+    .unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    let handle = fs::File::options()
+        .write(true)
+        .open(tree.root().join("Mk/bsd.port.mk"))
+        .unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_modified(later))
+        .unwrap();
+
+    // A fresh oracle, as a new session after a tree update would build one.
+    let oracle = tree.oracle();
+    let after = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    assert_eq!(
+        after.options.len(),
+        2,
+        "an older answer must not survive the framework changing"
+    );
+}
+
+/// With nothing changed, a second session answers from the memo. Guards two
+/// regressions at once: the fixture bumping `Mk/`'s age on every rebuild, and
+/// the write path storing rows under an unfolded age no later read computes.
+#[test]
+fn an_unchanged_tree_still_hits_the_memo_across_sessions() {
+    let mut tree = common::Tree::new("oracle_framework_hit");
+    tree.add_option("www/app", "ALPHA", true, "", "DEFINE", "");
+    tree.write_out();
+
+    // Age the framework ahead of the port, so the folded age differs from the
+    // port's own — the shape that catches a row written unfolded.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    let handle = fs::File::options()
+        .write(true)
+        .open(tree.root().join("Mk/bsd.port.mk"))
+        .unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_modified(later))
+        .unwrap();
+
+    let oracle = tree.oracle();
+    let before = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+
+    // Take the port description away: a re-evaluation would now fail, so a
+    // successful answer can only be a memo hit.
+    fs::remove_file(tree.root().join("www/app/.port")).unwrap();
+
+    let oracle = tree.oracle();
+    let after = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "the second session must answer from the memo"
+    );
+}
+
 /// A port make cannot read is an error rather than a port with no options.
 #[test]
 fn a_port_make_cannot_read_is_an_error() {

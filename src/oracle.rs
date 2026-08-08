@@ -66,6 +66,11 @@ pub struct Oracle {
     /// False when the ports tree could not be read. Memoised replies still
     /// answer; anything else fails, and says why.
     tree_readable: bool,
+    /// Newest mtime under the tree's `Mk/`, folded into every memo key —
+    /// the framework decides what a port evaluates to, so its age has to
+    /// invalidate replies the way the port's own Makefile does. `None` when
+    /// the tree cannot be read.
+    framework_mtime: Option<i64>,
 }
 
 impl Oracle {
@@ -73,6 +78,11 @@ impl Oracle {
         let tree_readable = env.ports_dir.join("Mk").join("bsd.port.mk").is_file();
         let target = env.describe_target();
         let db_path = db_path.into();
+        let framework_mtime = if tree_readable {
+            resolve::newest_framework_mtime(&env.ports_dir)
+        } else {
+            None
+        };
 
         // The memo makes itself. Left to the caller, a forgotten `init_db` turned
         // every write into an error and so every port into one make could not
@@ -86,7 +96,15 @@ impl Oracle {
             db_path,
             target,
             tree_readable,
+            framework_mtime,
         }
+    }
+
+    /// The memo age for a port: its own Makefiles or the framework, whichever
+    /// moved last.
+    fn fold_mtime(&self, port_mtime: i64) -> i64 {
+        self.framework_mtime
+            .map_or(port_mtime, |f| port_mtime.max(f))
     }
 
     pub fn ports_dir(&self) -> &Path {
@@ -132,7 +150,7 @@ impl Oracle {
         // age; fall back to whatever age is remembered, which is the only thing
         // that lets a session run from the memo alone.
         let mtime = match resolve::newest_makefile_mtime(&port_dir) {
-            Some(mtime) => mtime,
+            Some(mtime) => self.fold_mtime(mtime),
             None if !self.tree_readable => {
                 return self.remembered_reply(conn, origin, &key);
             }
@@ -152,7 +170,11 @@ impl Oracle {
             );
         }
 
-        let (reply, mtime) = resolve::evaluate(&self.env, origin, options.as_slice())?;
+        let (reply, port_mtime) = resolve::evaluate(&self.env, origin, options.as_slice())?;
+        // Folded again, because `evaluate` re-stats the port's own age: a row
+        // written under the unfolded age would never be read back — every
+        // lookup folds — and the port would re-evaluate on every ask.
+        let mtime = self.fold_mtime(port_mtime);
         // A reply that cannot be parsed is not remembered: storing it would make
         // the failure permanent until the tree changed.
         let facts = resolve::parse_reply(origin, &reply, mtime)?;
