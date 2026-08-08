@@ -318,6 +318,27 @@ fn a_remembered_reply_is_not_asked_for_again() {
     assert_eq!(second, first, "the reply must come from the memo");
 }
 
+/// A successful evaluation is the answer; failing to memoise it only costs the
+/// next asker a re-evaluation. A busy or read-only cache used to turn a port
+/// make had just described perfectly well into "could not be read".
+#[test]
+fn a_cache_that_cannot_be_written_does_not_fail_the_evaluation() {
+    let mut tree = common::Tree::new("oracle_readonly_cache");
+    tree.add_option("www/app", "ALPHA", true, "", "DEFINE", "");
+
+    let oracle = tree.oracle();
+    // Break the memo's table out from under the oracle: the cheapest
+    // deterministic stand-in for a write that fails mid-session.
+    let conn = rusqlite::Connection::open(tree.db_path()).unwrap();
+    conn.execute_batch("DROP TABLE reply;").unwrap();
+    drop(conn);
+
+    let facts = oracle
+        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .expect("the evaluation succeeded; the failed memo write must not undo it");
+    assert_eq!(facts.options.len(), 1);
+}
+
 /// The Makefile's age is part of the key, so a tree update simply misses.
 #[test]
 fn a_changed_makefile_is_evaluated_again() {

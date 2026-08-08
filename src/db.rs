@@ -21,6 +21,23 @@ use rusqlite::{params, Connection};
 /// there is nothing to migrate — the table is dropped and refills itself.
 const CURRENT_SCHEMA_VERSION: i32 = 9;
 
+/// Per-connection tuning, run on every connection that touches the memo.
+///
+/// `journal_mode = WAL` lives in the database file, but `busy_timeout` and
+/// `synchronous` die with the connection that set them — so setting them in
+/// [`init_db`] alone tunes only the connection that created the schema, and
+/// every parallel worker after it would get an immediate `SQLITE_BUSY` instead
+/// of waiting its turn for the write lock.
+pub fn tune_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000;
+        ",
+    )?;
+    Ok(())
+}
+
 /// Opens the memo, creating or resetting it as needed.
 pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
     let on_disk_version: i32 = conn
@@ -50,11 +67,10 @@ pub fn init_db(conn: &Connection, force_reset: bool) -> Result<()> {
         )?;
     }
 
+    tune_connection(conn)?;
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA busy_timeout = 5000;
 
         -- One make reply, against the question that produced it.
         --

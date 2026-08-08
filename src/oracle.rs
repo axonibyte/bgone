@@ -111,8 +111,10 @@ impl Oracle {
     }
 
     fn open(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("could not open the cache at {:?}", self.db_path))
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("could not open the cache at {:?}", self.db_path))?;
+        db::tune_connection(&conn)?;
+        Ok(conn)
     }
 
     /// Answers one question, consulting the tree only on a miss.
@@ -154,7 +156,10 @@ impl Oracle {
         // A reply that cannot be parsed is not remembered: storing it would make
         // the failure permanent until the tree changed.
         let facts = resolve::parse_reply(origin, &reply, mtime)?;
-        db::put_reply(conn, origin, &self.target, mtime, &key, &reply)?;
+        // Remembering is worth attempting but not worth failing over: the
+        // evaluation already succeeded, and a busy or read-only cache only
+        // costs the next asker a re-evaluation.
+        let _ = db::put_reply(conn, origin, &self.target, mtime, &key, &reply);
         Ok(facts)
     }
 
@@ -192,9 +197,7 @@ impl Oracle {
     /// across cores, and large enough that the open amortises over a preheat of
     /// thousands.
     pub fn facts_many(&self, want: &[Question]) -> Vec<(String, Result<PortFacts>)> {
-        const CHUNK: usize = 8;
-
-        want.par_chunks(CHUNK.max(want.len().div_ceil(rayon::current_num_threads().max(1))))
+        want.par_chunks(Self::chunk_size(want.len(), rayon::current_num_threads()))
             .flat_map(|chunk| {
                 let conn = self.open();
                 chunk
@@ -209,6 +212,14 @@ impl Oracle {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// How many questions each worker takes at once: an even split across the
+    /// threads, capped so a preheat of thousands still amortises its connection
+    /// opens without a level of a dozen ports collapsing onto one core.
+    fn chunk_size(len: usize, threads: usize) -> usize {
+        const CHUNK: usize = 8;
+        len.div_ceil(threads.max(1)).clamp(1, CHUNK)
     }
 }
 
@@ -231,5 +242,43 @@ mod tests {
         // and they must not share a row
         assert_ne!(Options::AsShipped.key(), set(&[]).key());
         assert_eq!(Options::AsShipped.key(), "");
+    }
+
+    /// A dozen ports must spread across a dozen threads, not sit eight-deep on
+    /// one core while the rest idle — a cache-miss chunk is a make invocation
+    /// per port, and the interactive resettle path feels every serialised one.
+    #[test]
+    fn small_batches_spread_across_threads() {
+        // A level of a dozen on eight threads: two per chunk, all cores busy
+        assert_eq!(Oracle::chunk_size(12, 8), 2);
+        // Fewer questions than threads: one each
+        assert_eq!(Oracle::chunk_size(3, 8), 1);
+        // A preheat of thousands still amortises the connection opens
+        assert_eq!(Oracle::chunk_size(10_000, 8), 8);
+        // Degenerate inputs stay valid chunk sizes
+        assert_eq!(Oracle::chunk_size(0, 8), 1);
+        assert_eq!(Oracle::chunk_size(5, 0), 5);
+    }
+
+    /// `busy_timeout` is a per-connection pragma. Only the connection that ran
+    /// `init_db` used to get one; the parallel workers all opened bare
+    /// connections that answered a locked cache with an immediate SQLITE_BUSY.
+    #[test]
+    fn every_connection_waits_out_a_busy_cache() {
+        let dir = std::env::temp_dir().join(format!("bgone_oracle_busy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let oracle = Oracle::new(MakeEnv::new(&dir), dir.join("cache.db"));
+        let conn = oracle.open().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            timeout > 0,
+            "a worker connection would not wait for the lock"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
