@@ -760,7 +760,7 @@ impl Resolver {
                     // The error is flattened to a string because `anyhow::Error`
                     // is not `Send` in every shape it can take, and nothing on
                     // the far side does anything with it but show it.
-                    .map(|(q, (_, r))| (q, r.map_err(|e| e.to_string())))
+                    .map(|(q, (_, _, r))| (q, r.map_err(|e| e.to_string())))
                     .collect();
                 if answers.send(out).is_err() {
                     break;
@@ -957,7 +957,11 @@ impl App {
             let Some(port_id) = graph.port_index(origin) else {
                 continue;
             };
-            let question = (origin.clone(), Options::Exactly(graph.option_set(port_id)));
+            let question = (
+                origin.clone(),
+                graph.port_flavour(port_id),
+                Options::Exactly(graph.option_set(port_id)),
+            );
             if !self.pending.contains(&question) {
                 self.pending.push(question);
             }
@@ -2117,7 +2121,7 @@ fn merge(
 ) -> Vec<String> {
     let mut arrived = Vec::new();
 
-    for ((origin, asked), reply) in answers {
+    for ((origin, flavour, asked), reply) in answers {
         let facts = match reply {
             Ok(facts) => facts,
             Err(e) => {
@@ -2147,7 +2151,7 @@ fn merge(
                     .collect();
                 shipped.sort();
                 if sorted_in_force != shipped {
-                    let question = (origin.clone(), Options::Exactly(in_force));
+                    let question = (origin.clone(), flavour.clone(), Options::Exactly(in_force));
                     if !app.pending.contains(&question) {
                         app.pending.push(question);
                     }
@@ -2164,10 +2168,10 @@ fn merge(
             },
         }
 
-        for unknown in graph.apply_resolution(&origin, &facts) {
+        for (unknown, unknown_flavour) in graph.apply_resolution(&origin, &facts) {
             // Asked as the port ships, because nothing is known about its
             // options yet — what they default to is part of the answer.
-            let question = (unknown, Options::AsShipped);
+            let question = (unknown, unknown_flavour, Options::AsShipped);
             if !app.pending.contains(&question) {
                 app.pending.push(question);
             }
@@ -2418,6 +2422,7 @@ mod tests {
         let name = origin.split('/').nth(1).unwrap_or(origin);
         PortFacts {
             origin: origin.to_string(),
+            flavour: None,
             pkgname: format!("{name}-1.0"),
             pkgbase: name.to_string(),
             flavours: Vec::new(),
@@ -2493,6 +2498,7 @@ mod tests {
         let answers = vec![(
             (
                 "www/app".to_string(),
+                None,
                 Options::Exactly(vec!["X".to_string()]),
             ),
             Ok(facts),
@@ -2522,6 +2528,7 @@ mod tests {
         let answers = vec![(
             (
                 "www/app".to_string(),
+                None,
                 Options::Exactly(vec!["X".to_string()]),
             ),
             Ok(facts),
@@ -2530,7 +2537,7 @@ mod tests {
         merge(&mut graph, &mut app, &sys, answers);
         assert!(
             app.pending
-                .contains(&("www/newdep".to_string(), Options::AsShipped)),
+                .contains(&("www/newdep".to_string(), None, Options::AsShipped)),
             "the dependency the answer names has to be asked about"
         );
     }
@@ -2546,7 +2553,7 @@ mod tests {
 
         let mut facts = fixture_port("www/app");
         fixture_edge(&mut facts, "www/newdep", None);
-        let answers = vec![(("www/app".to_string(), Options::AsShipped), Ok(facts))];
+        let answers = vec![(("www/app".to_string(), None, Options::AsShipped), Ok(facts))];
 
         merge(&mut graph, &mut app, &sys, answers);
         assert!(app.pending.is_empty());
@@ -2567,13 +2574,16 @@ mod tests {
 
         let mut facts = fixture_port("www/b");
         fixture_option(&mut facts, "X", false, "DEFINE", "");
-        let answers = vec![(("www/b".to_string(), Options::AsShipped), Ok(facts))];
+        let answers = vec![(("www/b".to_string(), None, Options::AsShipped), Ok(facts))];
 
         let arrived = merge(&mut graph, &mut app, &sys, answers);
         assert_eq!(arrived, vec!["www/b".to_string()]);
         assert!(
-            app.pending
-                .contains(&("www/b".to_string(), Options::Exactly(vec!["X".to_string()]))),
+            app.pending.contains(&(
+                "www/b".to_string(),
+                None,
+                Options::Exactly(vec!["X".to_string()])
+            )),
             "saved configuration differs from shipped, so the port must be re-asked"
         );
     }
@@ -2595,8 +2605,10 @@ mod tests {
         let touched = graph.toggle_option(row);
         app.ask_about(&graph, &touched);
 
-        let Some((_, Options::Exactly(set))) =
-            app.pending.iter().find(|(origin, _)| origin == "www/app")
+        let Some((_, _, Options::Exactly(set))) = app
+            .pending
+            .iter()
+            .find(|(origin, _, _)| origin == "www/app")
         else {
             panic!("the toggled port must have a question queued");
         };
@@ -3912,7 +3924,7 @@ mod tests {
         let mut app = App::new(None);
         app.outstanding = 3;
         app.pending
-            .push(("www/gone".to_string(), Options::AsShipped));
+            .push(("www/gone".to_string(), None, Options::AsShipped));
 
         app.mark_resolver_dead();
         assert_eq!(app.outstanding, 0, "nothing will ever answer these");
@@ -4441,6 +4453,7 @@ mod tests {
                             let answers = vec![(
                                 (
                                     "www/alpha".to_string(),
+                                    None,
                                     Options::Exactly(vec!["GHOST".to_string()]),
                                 ),
                                 Ok(facts),
@@ -4467,13 +4480,13 @@ mod tests {
                             let origin = format!("devel/arrival{arrivals}");
                             let mut facts = fixture_port(&origin);
                             fixture_option(&mut facts, "DOCS", true, "DEFINE", "");
-                            let answers = vec![((origin, Options::AsShipped), Ok(facts))];
+                            let answers = vec![((origin, None, Options::AsShipped), Ok(facts))];
                             merge(&mut graph, &mut app, &sys, answers);
                         }
                         // A failure answer: reported, never fatal.
                         _ => {
                             let answers = vec![(
-                                ("www/alpha".to_string(), Options::AsShipped),
+                                ("www/alpha".to_string(), None, Options::AsShipped),
                                 Err("make exploded".to_string()),
                             )];
                             merge(&mut graph, &mut app, &sys, answers);

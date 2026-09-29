@@ -55,14 +55,17 @@ fn preheat(cli: &Cli, oracle: &Oracle, all: bool, origins: &[String]) -> Result<
 
     let want: Vec<_> = targets
         .iter()
-        .map(|o| (o.clone(), Options::AsShipped))
+        .map(|t| {
+            let (origin, flavour) = bgone::resolve::split_target(t);
+            (origin, flavour, Options::AsShipped)
+        })
         .collect();
     let answers = oracle.facts_many(&want);
 
-    let failed: Vec<&str> = answers
+    let failed: Vec<String> = answers
         .iter()
-        .filter(|(_, r)| r.is_err())
-        .map(|(o, _)| o.as_str())
+        .filter(|(_, _, r)| r.is_err())
+        .map(|(o, f, _)| bgone::resolve::describe(o, f.as_deref()))
         .collect();
 
     println!(
@@ -71,8 +74,11 @@ fn preheat(cli: &Cli, oracle: &Oracle, all: bool, origins: &[String]) -> Result<
         failed.len(),
         start.elapsed()
     );
-    for origin in failed.iter().take(5) {
-        if let Some((_, Err(e))) = answers.iter().find(|(o, _)| o == origin) {
+    for named in failed.iter().take(5) {
+        if let Some((_, _, Err(e))) = answers
+            .iter()
+            .find(|(o, f, _)| &bgone::resolve::describe(o, f.as_deref()) == named)
+        {
             eprintln!("[!] {e}");
         }
     }

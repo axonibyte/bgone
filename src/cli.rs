@@ -192,7 +192,10 @@ pub struct Cli {
     #[arg(short = 'i', long)]
     pub ignore_missing: bool,
 
-    /// Read target port origins/patterns from a file (space, tab, newline, or comma-delimited)
+    /// Read target port origins/patterns from a file (space, tab, newline, or comma-delimited).
+    ///
+    /// The same file `poudriere bulk -f` reads: an entry may carry a flavour,
+    /// `archivers/py-brotli@py312`, and is then evaluated as that build.
     #[arg(short = 'f', long, value_name = "FILE")]
     pub file: Option<PathBuf>,
 
@@ -228,7 +231,14 @@ pub struct Cli {
     #[arg(long, value_name = "NAME", global = true)]
     pub poudriere_optionsdir: Option<String>,
 
-    /// Target port origin(s) or glob pattern(s) (e.g. www/apache24 "www/py-*")
+    /// Target port origin(s) or glob pattern(s) (e.g. www/apache24 "www/py-*").
+    ///
+    /// An origin or pattern may name a flavour, as `poudriere bulk` lists do:
+    /// `www/py-foo@py312` asks for that build, so its package name and its
+    /// dependency closure are the ones `bulk` will build rather than the
+    /// default flavour's. A bare origin is the default flavour. Options are
+    /// per port whatever the flavour, so a port named under two flavours is
+    /// listed once and written once.
     #[arg(value_name = "ORIGIN")]
     pub origins: Vec<String>,
 }

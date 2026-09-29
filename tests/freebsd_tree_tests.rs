@@ -61,7 +61,7 @@ fn facts_agree_with_the_real_framework() {
     let oracle = Oracle::new(MakeEnv::new(&tree), tmp.join("cache.db"));
 
     let facts = oracle
-        .facts(ORIGIN, &Options::AsShipped)
+        .facts(ORIGIN, None, &Options::AsShipped)
         .expect("the resolver must be able to evaluate a real port");
 
     assert_eq!(

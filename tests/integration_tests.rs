@@ -398,14 +398,14 @@ fn a_remembered_reply_is_not_asked_for_again() {
 
     let oracle = tree.oracle();
     let first = oracle
-        .facts("www/nginx", &bgone::oracle::Options::AsShipped)
+        .facts("www/nginx", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(first.options.len(), 1);
 
     // Take the tree away. The answer is remembered, so it still comes back.
     fs::remove_file(tree.root().join("www/nginx/.port")).unwrap();
     let second = oracle
-        .facts("www/nginx", &bgone::oracle::Options::AsShipped)
+        .facts("www/nginx", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(second, first, "the reply must come from the memo");
 }
@@ -426,7 +426,7 @@ fn a_cache_that_cannot_be_written_does_not_fail_the_evaluation() {
     drop(conn);
 
     let facts = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .expect("the evaluation succeeded; the failed memo write must not undo it");
     assert_eq!(facts.options.len(), 1);
 }
@@ -439,7 +439,7 @@ fn a_changed_makefile_is_evaluated_again() {
 
     let oracle = tree.oracle();
     let before = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(before.options.len(), 1);
 
@@ -454,7 +454,7 @@ fn a_changed_makefile_is_evaluated_again() {
         .unwrap();
 
     let after = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(
         after.options.len(),
@@ -473,7 +473,7 @@ fn a_framework_change_is_evaluated_again() {
 
     let oracle = tree.oracle();
     let before = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(before.options.len(), 1);
 
@@ -496,7 +496,7 @@ fn a_framework_change_is_evaluated_again() {
     // A fresh oracle, as a new session after a tree update would build one.
     let oracle = tree.oracle();
     let after = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(
         after.options.len(),
@@ -527,7 +527,7 @@ fn an_unchanged_tree_still_hits_the_memo_across_sessions() {
 
     let oracle = tree.oracle();
     let before = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
 
     // Take the port description away: a re-evaluation would now fail, so a
@@ -536,7 +536,7 @@ fn an_unchanged_tree_still_hits_the_memo_across_sessions() {
 
     let oracle = tree.oracle();
     let after = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert_eq!(
         after, before,
@@ -553,7 +553,7 @@ fn a_port_make_cannot_read_is_an_error() {
 
     let oracle = tree.oracle();
     assert!(oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .is_err());
 }
 
@@ -573,7 +573,7 @@ fn a_dependency_that_only_exists_with_an_option_on_is_found_by_asking_again() {
     let oracle = tree.oracle();
 
     let off = oracle
-        .facts("mail/sqlgrey", &bgone::oracle::Options::AsShipped)
+        .facts("mail/sqlgrey", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     assert!(
         !off.deps.iter().any(|d| d.origin.contains("mysql")),
@@ -584,6 +584,7 @@ fn a_dependency_that_only_exists_with_an_option_on_is_found_by_asking_again() {
     let on = oracle
         .facts(
             "mail/sqlgrey",
+            None,
             &bgone::oracle::Options::Exactly(vec!["MYSQL".to_string()]),
         )
         .unwrap();
@@ -607,7 +608,7 @@ fn a_set_options_dependency_is_recorded_against_the_option_only() {
 
     let oracle = tree.oracle();
     let facts = oracle
-        .facts("www/app", &bgone::oracle::Options::AsShipped)
+        .facts("www/app", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
 
     let openssl: Vec<_> = facts
@@ -3331,10 +3332,10 @@ fn one_ports_second_evaluation_failing_does_not_abort_the_load() {
     // evaluation — needed because X is saved on — has nothing left to ask.
     let oracle = tree.oracle();
     oracle
-        .facts("www/a", &bgone::oracle::Options::AsShipped)
+        .facts("www/a", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     oracle
-        .facts("www/other", &bgone::oracle::Options::AsShipped)
+        .facts("www/other", None, &bgone::oracle::Options::AsShipped)
         .unwrap();
     fs::remove_file(tree.root().join("www/a/.port")).unwrap();
 
@@ -3361,4 +3362,196 @@ fn one_ports_second_evaluation_failing_does_not_abort_the_load() {
         graph.port_index("www/other").is_some(),
         "the rest of the build must survive"
     );
+}
+
+// ============================================================================
+// FLAVOURS: `origin@flavour` as a target and along a depends entry
+// ============================================================================
+//
+// `poudriere bulk -f` reads `origin@flavour`; so does bgone now, and the same
+// file serves both. What the flavour changes is the EVALUATION — `FLAVOR=` on
+// make's command line, so the closure is the one that will be built — and not
+// the port's identity: one origin is one row and one options file
+// (`OPTIONS_NAME` is the origin), whatever flavours it is asked under.
+
+/// Two flavours of one port, each pulling in a different port: asked under
+/// `qt6`, the build has `x/six` and not `x/five`; under `qt5`, the reverse;
+/// bare, the default — which `bsd.port.mk` defines as the first of `FLAVORS`.
+#[test]
+fn a_flavoured_target_walks_that_flavours_closure() {
+    let mut tree = common::Tree::new("flavour-closure");
+    tree.add_flavours("x/app", &["qt5", "qt6"]);
+    tree.add_flavour_dep("x/app", "qt5", "x/five");
+    tree.add_flavour_dep("x/app", "qt6", "x/six");
+
+    let graph = tree.graph(&["x/app@qt6"]);
+    assert!(
+        graph.port_index("x/six").is_some(),
+        "qt6's dependency missing"
+    );
+    assert!(
+        graph.port_index("x/five").is_none(),
+        "qt5's dependency walked under qt6"
+    );
+
+    let graph = tree.graph(&["x/app@qt5"]);
+    assert!(graph.port_index("x/five").is_some());
+    assert!(graph.port_index("x/six").is_none());
+
+    // A bare origin is the default flavour, the first one listed.
+    let graph = tree.graph(&["x/app"]);
+    assert!(
+        graph.port_index("x/five").is_some(),
+        "the default flavour is the first listed"
+    );
+    assert!(graph.port_index("x/six").is_none());
+}
+
+/// One port asked under two flavours is one row carrying both closures — the
+/// union is what `bulk` builds, and the options file is written once.
+#[test]
+fn two_flavours_of_one_port_are_one_row_with_the_union_of_their_closures() {
+    let mut tree = common::Tree::new("flavour-union");
+    tree.add_flavours("x/app", &["qt5", "qt6"]);
+    tree.add_flavour_dep("x/app", "qt5", "x/five");
+    tree.add_flavour_dep("x/app", "qt6", "x/six");
+    tree.add_option("x/app", "DOCS", true, "", "DEFINE", "");
+
+    let graph = tree.graph(&["x/app@qt5", "x/app@qt6"]);
+    assert_eq!(
+        graph.ports.iter().filter(|p| p.origin == "x/app").count(),
+        1,
+        "a port asked under two flavours must be listed once"
+    );
+    assert!(graph.port_index("x/five").is_some());
+    assert!(graph.port_index("x/six").is_some());
+    let app = &graph.ports[graph.port_index("x/app").unwrap()];
+    assert_eq!(app.provenance, Provenance::Requested);
+    let mut requires = app.requires.clone();
+    requires.sort();
+    assert_eq!(requires, vec!["x/five".to_string(), "x/six".to_string()]);
+}
+
+/// A flavour the port does not have is refused by name, with the ones that
+/// exist — not as a missing directory, which is what `x/app@qt7` used to be
+/// read as. The refusal is bgone's: `bsd.port.mk` answers `-V` for an
+/// unknown flavour with exit 0 and IGNORE set, so trusting make's exit
+/// status would memoise and walk a build that bulk will never make.
+#[test]
+fn an_unknown_flavour_is_refused_by_name_with_the_possible_ones() {
+    let mut tree = common::Tree::new("flavour-unknown");
+    tree.add_flavours("x/app", &["qt5", "qt6"]);
+
+    let Err(err) = tree.build(&["x/app@qt7".to_string()], &SystemOptions::default(), false) else {
+        panic!("an unknown flavour must not resolve");
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("x/app@qt7"),
+        "the refusal must name the evaluation: {text}"
+    );
+    assert!(text.contains("unknown flavor 'qt7'"), "{text}");
+    assert!(
+        text.contains("qt5 qt6"),
+        "the possible flavours must be listed: {text}"
+    );
+
+    // And a flavour on a port that has none is the other refusal.
+    tree.add_port("x/plain");
+    let Err(err) = tree.build(
+        &["x/plain@qt5".to_string()],
+        &SystemOptions::default(),
+        false,
+    ) else {
+        panic!("a flavour on a flavourless port must not resolve");
+    };
+    assert!(err.to_string().contains("has no FLAVORS"), "{err}");
+}
+
+/// A depends entry that names a flavour — `libfoo.so:x/lib@py311` — wants that
+/// build, so the walk evaluates `x/lib` as `FLAVOR=py311`: its closure is
+/// py311's, and the stub's log shows the flavour on make's command line.
+#[test]
+fn a_flavoured_depends_entry_is_evaluated_under_its_flavour() {
+    let mut tree = common::Tree::new("flavour-edge");
+    tree.add_port_dep_flavoured("x/top", "x/lib", "py311");
+    tree.add_flavours("x/lib", &["py312", "py311"]);
+    tree.add_flavour_dep("x/lib", "py311", "x/python311");
+    tree.add_flavour_dep("x/lib", "py312", "x/python312");
+
+    let graph = tree.graph(&["x/top"]);
+    assert!(graph.port_index("x/lib").is_some());
+    assert!(
+        graph.port_index("x/python311").is_some(),
+        "the edge asked for py311, so py311's closure must be walked"
+    );
+    assert!(
+        graph.port_index("x/python312").is_none(),
+        "the default flavour's closure was walked instead of the edge's"
+    );
+    let lib = &graph.ports[graph.port_index("x/lib").unwrap()];
+    assert_eq!(lib.flavour.as_deref(), Some("py311"));
+
+    let log = fs::read_to_string(tree.stub_log()).unwrap();
+    let lib_calls: Vec<&str> = log.lines().filter(|l| l.contains("/x/lib|")).collect();
+    assert!(!lib_calls.is_empty(), "x/lib was never evaluated: {log}");
+    assert!(
+        lib_calls.iter().all(|l| l.ends_with("|py311")),
+        "every evaluation of x/lib must carry FLAVOR=py311: {lib_calls:?}"
+    );
+}
+
+/// A glob keeps its flavour: `x/py-*@py312` matches the origins and asks for
+/// every one of them under `py312`.
+#[test]
+fn a_glob_target_carries_its_flavour_to_every_match() {
+    let mut tree = common::Tree::new("flavour-glob");
+    for name in ["x/py-a", "x/py-b"] {
+        tree.add_flavours(name, &["py311", "py312"]);
+        tree.add_flavour_dep(name, "py311", "x/python311");
+        tree.add_flavour_dep(name, "py312", "x/python312");
+    }
+
+    let graph = tree.graph(&["x/py-*@py312"]);
+    assert!(graph.port_index("x/py-a").is_some());
+    assert!(graph.port_index("x/py-b").is_some());
+    assert!(
+        graph.port_index("x/python312").is_some(),
+        "the glob's flavour was dropped"
+    );
+    assert!(
+        graph.port_index("x/python311").is_none(),
+        "the default flavour was walked"
+    );
+}
+
+/// The same file, unchanged, that `poudriere bulk -f` takes.
+#[test]
+fn a_bulk_list_with_flavours_is_read_as_is() {
+    let temp = TempDir::new("flavour-list");
+    let list = temp.path.join("list.txt");
+    fs::write(
+        &list,
+        "archivers/py-brotli@py312\nmultimedia/phonon-vlc@qt5, multimedia/phonon-vlc@qt6\n# a comment\nwww/nginx\n",
+    )
+    .unwrap();
+    let targets = parse_ports_file(&list).unwrap();
+    assert_eq!(
+        targets,
+        vec![
+            "archivers/py-brotli@py312",
+            "multimedia/phonon-vlc@qt5",
+            "multimedia/phonon-vlc@qt6",
+            "www/nginx",
+        ]
+    );
+    let split: Vec<_> = targets
+        .iter()
+        .map(|t| bgone::resolve::split_target(t))
+        .collect();
+    assert_eq!(
+        split[0],
+        ("archivers/py-brotli".to_string(), Some("py312".to_string()))
+    );
+    assert_eq!(split[3], ("www/nginx".to_string(), None));
 }

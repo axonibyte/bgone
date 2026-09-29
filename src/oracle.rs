@@ -55,8 +55,40 @@ impl Options {
     }
 }
 
-/// One question: which port, under which options.
-pub type Question = (String, Options);
+/// The memo key for one question: the flavour, then the option set. A
+/// flavoured evaluation is a different question from the default one — a
+/// different `PKGNAME`, a different closure — and its key says so in a form no
+/// unflavoured key can collide with, because an [`Options`] key never starts
+/// with `@`. Rows written before flavours existed keep their meaning: the
+/// default flavour, as they always were.
+fn memo_key(flavour: Option<&str>, options: &Options) -> String {
+    match flavour {
+        Some(f) => format!("@{f}{}", options.key()),
+        None => options.key(),
+    }
+}
+
+/// Refuses a flavour the port does not define, the way `bsd.port.mk` words
+/// it when it IGNOREs the build. `None` is always the default and never
+/// refused; a port without flavours takes no flavour at all.
+fn check_flavour(named: &str, flavour: Option<&str>, flavours: &[String]) -> Result<()> {
+    let Some(wanted) = flavour else {
+        return Ok(());
+    };
+    if flavours.is_empty() {
+        anyhow::bail!("{named}: FLAVOR '{wanted}' asked of a port that has no FLAVORS");
+    }
+    if !flavours.iter().any(|f| f == wanted) {
+        anyhow::bail!(
+            "{named}: unknown flavor '{wanted}', possible flavors: {}",
+            flavours.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// One question: which port, under which flavour, under which options.
+pub type Question = (String, Option<String>, Options);
 
 pub struct Oracle {
     env: MakeEnv,
@@ -136,13 +168,25 @@ impl Oracle {
     }
 
     /// Answers one question, consulting the tree only on a miss.
-    pub fn facts(&self, origin: &str, options: &Options) -> Result<PortFacts> {
+    pub fn facts(
+        &self,
+        origin: &str,
+        flavour: Option<&str>,
+        options: &Options,
+    ) -> Result<PortFacts> {
         let conn = self.open()?;
-        self.facts_with(&conn, origin, options)
+        self.facts_with(&conn, origin, flavour, options)
     }
 
-    fn facts_with(&self, conn: &Connection, origin: &str, options: &Options) -> Result<PortFacts> {
-        let key = options.key();
+    fn facts_with(
+        &self,
+        conn: &Connection,
+        origin: &str,
+        flavour: Option<&str>,
+        options: &Options,
+    ) -> Result<PortFacts> {
+        let key = memo_key(flavour, options);
+        let named = resolve::describe(origin, flavour);
         let port_dir = self.env.ports_dir.join(origin);
 
         // The age of the Makefiles is part of the question, so it has to be
@@ -152,32 +196,45 @@ impl Oracle {
         let mtime = match resolve::newest_makefile_mtime(&port_dir) {
             Some(mtime) => self.fold_mtime(mtime),
             None if !self.tree_readable => {
-                return self.remembered_reply(conn, origin, &key);
+                let mut facts = self.remembered_reply(conn, origin, &key)?;
+                facts.flavour = flavour.map(str::to_string);
+                return Ok(facts);
             }
             None => {
-                anyhow::bail!("{origin}: no Makefile under {port_dir:?}");
+                anyhow::bail!("{named}: no Makefile under {port_dir:?}");
             }
         };
 
         if let Some(reply) = db::get_reply(conn, origin, &self.target, mtime, &key) {
-            return resolve::parse_reply(origin, &reply, mtime);
+            let mut facts = resolve::parse_reply(origin, &reply, mtime)?;
+            facts.flavour = flavour.map(str::to_string);
+            check_flavour(&named, flavour, &facts.flavours)?;
+            return Ok(facts);
         }
 
         if !self.tree_readable {
             anyhow::bail!(
-                "{origin}: not in the cache, and the ports tree at {:?} cannot be read",
+                "{named}: not in the cache, and the ports tree at {:?} cannot be read",
                 self.env.ports_dir
             );
         }
 
-        let (reply, port_mtime) = resolve::evaluate(&self.env, origin, options.as_slice())?;
+        let (reply, port_mtime) =
+            resolve::evaluate(&self.env, origin, flavour, options.as_slice())?;
         // Folded again, because `evaluate` re-stats the port's own age: a row
         // written under the unfolded age would never be read back — every
         // lookup folds — and the port would re-evaluate on every ask.
         let mtime = self.fold_mtime(port_mtime);
         // A reply that cannot be parsed is not remembered: storing it would make
         // the failure permanent until the tree changed.
-        let facts = resolve::parse_reply(origin, &reply, mtime)?;
+        let mut facts = resolve::parse_reply(origin, &reply, mtime)?;
+        facts.flavour = flavour.map(str::to_string);
+        // Checked here and not left to make: `bsd.port.mk` answers `-V` for an
+        // unknown flavour with exit 0 and IGNORE set ("has an unknown flavor
+        // 'py27', possible flavors: ..."), so a walk that trusted the exit
+        // status would memoise and chase a build bulk will never make.
+        // Refused before it is remembered, in the framework's own words.
+        check_flavour(&named, flavour, &facts.flavours)?;
         // Remembering is worth attempting but not worth failing over: the
         // evaluation already succeeded, and a busy or read-only cache only
         // costs the next asker a re-evaluation.
@@ -218,18 +275,21 @@ impl Oracle {
     /// Chunks are small enough that a level of a dozen ports still spreads
     /// across cores, and large enough that the open amortises over a preheat of
     /// thousands.
-    pub fn facts_many(&self, want: &[Question]) -> Vec<(String, Result<PortFacts>)> {
+    pub fn facts_many(
+        &self,
+        want: &[Question],
+    ) -> Vec<(String, Option<String>, Result<PortFacts>)> {
         want.par_chunks(Self::chunk_size(want.len(), rayon::current_num_threads()))
             .flat_map(|chunk| {
                 let conn = self.open();
                 chunk
                     .iter()
-                    .map(|(origin, options)| {
+                    .map(|(origin, flavour, options)| {
                         let answer = match &conn {
-                            Ok(conn) => self.facts_with(conn, origin, options),
+                            Ok(conn) => self.facts_with(conn, origin, flavour.as_deref(), options),
                             Err(e) => Err(anyhow::anyhow!("{e}")),
                         };
-                        (origin.clone(), answer)
+                        (origin.clone(), flavour.clone(), answer)
                     })
                     .collect::<Vec<_>>()
             })
@@ -249,11 +309,51 @@ impl Oracle {
 mod tests {
     use super::*;
 
+    /// The framework IGNOREs an unknown flavour rather than failing `-V`, so
+    /// the refusal is this program's, in the framework's words, and it must
+    /// come before the answer is memoised.
+    #[test]
+    fn a_flavour_the_port_does_not_define_is_refused_by_name() {
+        let have = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_flavour("x/app", None, &have(&[])).is_ok());
+        assert!(check_flavour("x/app", None, &have(&["qt5"])).is_ok());
+        assert!(check_flavour("x/app@qt5", Some("qt5"), &have(&["qt5", "qt6"])).is_ok());
+        let err = check_flavour("x/app@qt7", Some("qt7"), &have(&["qt5", "qt6"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x/app@qt7: unknown flavor 'qt7', possible flavors: qt5 qt6"),
+            "{err}"
+        );
+        let err = check_flavour("x/plain@qt5", Some("qt5"), &have(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no FLAVORS"), "{err}");
+    }
+
     /// The key has to separate every distinct question, and join every identical
     /// one — a set that hashed by insertion order would evaluate the same port
     /// twice and call it a miss.
     #[test]
-    fn the_memo_key_is_the_option_set_and_nothing_else() {
+    fn the_memo_key_is_the_flavour_and_the_option_set_and_nothing_else() {
+        // A flavour is part of the question: the same port under `py311` and
+        // `py312` has two package names and two closures, so one row cannot
+        // answer both. And the default-flavour key is the pre-flavour key
+        // exactly, so every row already in a memo keeps meaning what it meant.
+        assert_ne!(
+            memo_key(Some("py311"), &Options::AsShipped),
+            memo_key(Some("py312"), &Options::AsShipped)
+        );
+        assert_ne!(
+            memo_key(Some("py311"), &Options::AsShipped),
+            memo_key(None, &Options::AsShipped)
+        );
+        assert_eq!(
+            memo_key(None, &Options::AsShipped),
+            Options::AsShipped.key()
+        );
+        assert_eq!(memo_key(Some("qt6"), &Options::AsShipped), "@qt6");
+
         let set = |names: &[&str]| Options::Exactly(names.iter().map(|s| s.to_string()).collect());
 
         assert_eq!(set(&["SSL", "DOCS"]).key(), set(&["DOCS", "SSL"]).key());

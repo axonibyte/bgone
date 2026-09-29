@@ -89,6 +89,11 @@ struct Port {
     /// class, option, dependency entry — contributed procedurally, so it shows
     /// up as an ordinary dependency but only while that option is set
     hidden: Vec<(String, String, String)>,
+    /// `FLAVORS`, in order: the first is the default, as `bsd.port.mk` has it.
+    flavours: Vec<String>,
+    /// flavour, class, dependency entry — a dependency the port has only under
+    /// that flavour, the shape `py-*` and the `qt5`/`qt6` pairs take
+    flavour_deps: Vec<(String, String, String)>,
     /// A port whose directory exists but which make cannot evaluate.
     unreadable: bool,
 }
@@ -214,6 +219,29 @@ impl Tree {
             .push((opt.to_string(), prevents.to_string()));
     }
 
+    /// Gives a port `FLAVORS`, first one default. Asking for a flavour not in
+    /// the list is refused by the stub exactly as `bsd.port.mk` refuses it.
+    pub fn add_flavours(&mut self, origin: &str, flavours: &[&str]) {
+        self.port(origin).flavours = flavours.iter().map(|f| f.to_string()).collect();
+    }
+
+    /// An edge that exists only when `from` is built as `flavour`.
+    pub fn add_flavour_dep(&mut self, from: &str, flavour: &str, to: &str) {
+        self.add_port(to);
+        self.port(from)
+            .flavour_deps
+            .push((flavour.to_string(), "LIB".to_string(), entry_for(to)));
+    }
+
+    /// An unconditional edge that names the flavour it wants `to` built as:
+    /// `libfoo.so:x/lib@py311`, the form a depends entry takes in the tree.
+    pub fn add_port_dep_flavoured(&mut self, from: &str, to: &str, flavour: &str) {
+        self.add_port(to);
+        self.port(from)
+            .deps
+            .push(("LIB".to_string(), format!("{}@{flavour}", entry_for(to))));
+    }
+
     /// Sets the package name make would report.
     pub fn set_pkgname(&mut self, origin: &str, pkgname: &str) {
         self.port(origin).pkgname = Some(pkgname.to_string());
@@ -286,6 +314,12 @@ impl Tree {
             }
             for (class, opt, entry) in &port.hidden {
                 out.push_str(&format!("hidden\t{class}\t{opt}\t{entry}\n"));
+            }
+            if !port.flavours.is_empty() {
+                out.push_str(&format!("flavors\t{}\n", port.flavours.join(" ")));
+            }
+            for (flavour, class, entry) in &port.flavour_deps {
+                out.push_str(&format!("fdep\t{flavour}\t{class}\t{entry}\n"));
             }
             Self::write_if_changed(&dir.join(".port"), &out);
         }
@@ -383,18 +417,19 @@ pub fn stub_make(dir: &Path) -> PathBuf {
         &path,
         format!(
             "#!/bin/sh\n\
-             portdir=''; override=''; has_override=0\n\
+             portdir=''; override=''; has_override=0; flavor=''\n\
              while [ $# -gt 0 ]; do\n\
              \x20 case \"$1\" in\n\
              \x20   -C) shift; portdir=\"$1\" ;;\n\
              \x20   OPTIONS_OVERRIDE=*) override=\"${{1#OPTIONS_OVERRIDE=}}\"; has_override=1 ;;\n\
+             \x20   FLAVOR=*) flavor=\"${{1#FLAVOR=}}\" ;;\n\
              \x20 esac\n\
              \x20 shift\n\
              done\n\
-             printf '%s|%s|%s\\n' \"$portdir\" \"$has_override\" \"$override\" >> {log}\n\
+             printf '%s|%s|%s|%s\\n' \"$portdir\" \"$has_override\" \"$override\" \"$flavor\" >> {log}\n\
              [ -f \"$portdir/.port\" ] || exit 1\n\
              exec awk -v override=\"$override\" -v has_override=\"$has_override\" \
-             -f {awk} \"$portdir/.port\"\n",
+             -v flavor=\"$flavor\" -f {awk} \"$portdir/.port\"\n",
             awk = awk.display(),
             log = dir.join("stub-make.log").display()
         ),
@@ -424,8 +459,17 @@ $1 == "prevents" { prev[$2] = prev[$2] " " $3 }
 $1 == "dep"      { d = ++ndep; dclass[d] = $2; dentry[d] = $3 }
 $1 == "optdep"   { o = ++nod; odclass[o] = $2; odopt[o] = $3; odpol[o] = $4; odentry[o] = $5 }
 $1 == "hidden"   { h = ++nhid; hclass[h] = $2; hopt[h] = $3; hentry[h] = $4 }
+$1 == "flavors"  { flavors = $2; nfl = split($2, fl, " ") }
+$1 == "fdep"     { f = ++nfd; fdflav[f] = $2; fdclass[f] = $3; fdentry[f] = $4 }
 
 END {
+    # FLAVOR, as bsd.port.mk settles it at `-V` time: the default is the
+    # first of FLAVORS, and an unknown one is NOT a failure -- the framework
+    # sets IGNORE and answers anyway, so the refusal is bgone's own, made
+    # against FLAVORS. The stub therefore reports FLAVORS and evaluates as
+    # asked, exactly as the tree does.
+    effective = (flavor != "") ? flavor : ((nfl > 0) ? fl[1] : "")
+    if (effective != "" && pkgname != "") pkgname = effective "-" pkgname
     # Which options are set: the override if one was given, else the defaults.
     if (has_override == "1") {
         split(override, want, " ")
@@ -445,6 +489,7 @@ END {
     }
 
     print "PKGNAME" US pkgname
+    print "FLAVORS" US flavors
     print "OPTIONS" US names
     print "DEFAULTS" US defaults
     print "DESC" US desc
@@ -477,6 +522,8 @@ END {
         }
         for (i = 1; i <= nhid; i++)
             if (hclass[i] == cl && (hopt[i] in on)) all = all " " hentry[i]
+        for (i = 1; i <= nfd; i++)
+            if (fdclass[i] == cl && fdflav[i] == effective) all = all " " fdentry[i]
         print "DEP_" cl US all
 
         for (p = 1; p <= 2; p++) {

@@ -1,6 +1,6 @@
 use crate::oracle::{Options, Oracle, Question};
 use crate::reader::SystemOptions;
-use crate::resolve::{OptionFacts, Polarity, PortFacts};
+use crate::resolve::{describe, split_target, OptionFacts, Polarity, PortFacts};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -210,6 +210,9 @@ pub struct OptionNode {
 pub struct PortEntry {
     pub id: usize,
     pub origin: String,
+    /// The flavour the port was reached under, if one was named — see
+    /// `Collected::flavour`. `None` is the port's default flavour.
+    pub flavour: Option<String>,
     pub provenance: Provenance,
     /// Whether `make` could evaluate this port when the cache was built.
     pub resolved: bool,
@@ -286,6 +289,10 @@ pub struct DependencyGraph {
 /// Everything learned about one port before entries are built.
 struct Collected {
     resolved: bool,
+    /// The flavour this port was first reached under — a root's, or the one a
+    /// depends entry named. What `resettle` re-asks under, and what the entry
+    /// carries into the graph.
+    flavour: Option<String>,
     /// Option metadata, from the evaluation *as the port ships* — the only one
     /// whose `default_on` means what it says.
     options: Vec<OptionFacts>,
@@ -293,6 +300,11 @@ struct Collected {
     option_deps: Vec<(String, String, bool)>,
     /// Pulled in whatever the options say, under the set actually in force.
     requires: Vec<String>,
+    /// The flavour each dependency was named under, by origin. A depends entry
+    /// `libfoo.so:x/lib@py311` wants `x/lib` built as `py311`, and that is the
+    /// evaluation the walk must make of it — under the default flavour, `x/lib`
+    /// has a different closure and possibly a different package name.
+    edge_flavours: HashMap<String, Option<String>>,
     /// The state each option is in, which decides which `option_deps` apply.
     states: HashMap<String, bool>,
 }
@@ -316,10 +328,34 @@ impl Collected {
     fn unevaluated() -> Self {
         Self {
             resolved: false,
+            flavour: None,
             options: Vec::new(),
             option_deps: Vec::new(),
             requires: Vec::new(),
+            edge_flavours: HashMap::new(),
             states: HashMap::new(),
+        }
+    }
+
+    /// Folds a second evaluation of the same port — under another flavour —
+    /// into this one. The port is listed once and its options file is written
+    /// once (`OPTIONS_NAME` is the origin, whatever the flavour), so one node
+    /// carries the union of what every requested flavour pulls in: that union
+    /// is what `bulk` builds. Option metadata and states stay the first
+    /// evaluation's; an unevaluated entry is replaced by an evaluated one.
+    fn merge(&mut self, other: Collected) {
+        if !self.resolved && other.resolved {
+            *self = other;
+            return;
+        }
+        self.requires.extend(other.requires);
+        self.requires.sort();
+        self.requires.dedup();
+        self.option_deps.extend(other.option_deps);
+        self.option_deps.sort();
+        self.option_deps.dedup();
+        for (dep, flavour) in other.edge_flavours {
+            self.edge_flavours.entry(dep).or_insert(flavour);
         }
     }
 
@@ -330,7 +366,7 @@ impl Collected {
     /// nothing is going to write — turning the option on re-resolves and finds
     /// it then. Its name is still recorded, which is all a "not pulled in" row
     /// needs.
-    fn dependencies(&self) -> Vec<String> {
+    fn dependencies(&self) -> Vec<(String, Option<String>)> {
         let mut out = self.requires.clone();
         for (opt, dep, applies_when_off) in &self.option_deps {
             let on = self.states.get(opt).copied().unwrap_or(false);
@@ -340,7 +376,12 @@ impl Collected {
         }
         out.sort();
         out.dedup();
-        out
+        out.into_iter()
+            .map(|dep| {
+                let flavour = self.edge_flavours.get(&dep).cloned().flatten();
+                (dep, flavour)
+            })
+            .collect()
     }
 }
 
@@ -550,39 +591,48 @@ impl DependencyGraph {
         sys_opts: &SystemOptions,
         ignore_missing: bool,
     ) -> Result<Self> {
-        let mut resolved_origins = Vec::new();
+        // (origin, flavour) pairs: the same origin under two flavours is two
+        // evaluations and one port. The pattern's `@flavour` is split off
+        // before the name is matched against the tree — `bulk -f`'s own list
+        // grammar, so one file serves both tools.
+        let mut resolved_origins: Vec<(String, Option<String>)> = Vec::new();
         let mut seen = HashSet::new();
         let mut unmatched_patterns = Vec::new();
+
+        let split: Vec<(String, Option<String>)> =
+            patterns.iter().map(|p| split_target(p)).collect();
 
         // An unreadable tree is its own error, not "no matching ports": a glob
         // against a listing that could not be read matches nothing for a
         // reason the message has to name.
-        let needs_listing = patterns.iter().any(|p| is_glob(p));
+        let needs_listing = split.iter().any(|(p, _)| is_glob(p));
         let listing = if needs_listing {
             oracle.enumerate()?
         } else {
             Vec::new()
         };
 
-        for pat in patterns {
+        for (pat, (bare, flavour)) in patterns.iter().zip(&split) {
             let mut matched = false;
 
-            if is_glob(pat) {
-                for origin in listing.iter().filter(|o| glob_matches(pat, o)) {
+            if is_glob(bare) {
+                for origin in listing.iter().filter(|o| glob_matches(bare, o)) {
                     matched = true;
-                    if seen.insert(origin.clone()) {
-                        resolved_origins.push(origin.clone());
+                    let key = (origin.clone(), flavour.clone());
+                    if seen.insert(key.clone()) {
+                        resolved_origins.push(key);
                     }
                 }
-            } else if oracle.ports_dir().join(pat).join("Makefile").is_file()
+            } else if oracle.ports_dir().join(bare).join("Makefile").is_file()
                 || !oracle.tree_readable()
             {
                 // Without a tree there is nothing to check the name against, so
                 // it is taken as given and fails later if the memo has never
                 // heard of it — with a message that says so.
                 matched = true;
-                if seen.insert(pat.clone()) {
-                    resolved_origins.push(pat.clone());
+                let key = (bare.clone(), flavour.clone());
+                if seen.insert(key.clone()) {
+                    resolved_origins.push(key);
                 }
             }
 
@@ -617,7 +667,7 @@ impl DependencyGraph {
         resolved_origins.sort();
 
         let header_title = if resolved_origins.len() == 1 {
-            resolved_origins[0].clone()
+            describe(&resolved_origins[0].0, resolved_origins[0].1.as_deref())
         } else {
             format!(
                 "{} ports matched ({})",
@@ -650,7 +700,7 @@ impl DependencyGraph {
         // failing is a different thing — the tree is wrong, or unreachable, or
         // the names are — and continuing would show an empty list with no
         // explanation. So the first reason is reported instead of swallowed.
-        let all_unread = resolved_origins.iter().all(|o| {
+        let all_unread = resolved_origins.iter().all(|(o, _)| {
             graph
                 .port_index(o)
                 .map(|id| !graph.ports[id].resolved)
@@ -688,19 +738,21 @@ impl DependencyGraph {
     fn load_ports(
         &mut self,
         oracle: &Oracle,
-        roots: &[String],
+        roots: &[(String, Option<String>)],
         sys_opts: &SystemOptions,
     ) -> Result<Vec<(String, String)>> {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let requested: HashSet<&str> = roots.iter().map(|s| s.as_str()).collect();
+        let requested: HashSet<&str> = roots.iter().map(|(o, _)| o.as_str()).collect();
 
+        // Evaluations are keyed by (origin, flavour); ports by origin. A port
+        // reached under two flavours is asked twice and listed once.
         let mut collected: HashMap<String, Collected> = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut level: Vec<String> = Vec::new();
+        let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
+        let mut level: Vec<(String, Option<String>)> = Vec::new();
 
-        for origin in roots {
-            if seen.insert(origin.clone()) {
-                level.push(origin.clone());
+        for root in roots {
+            if seen.insert(root.clone()) {
+                level.push(root.clone());
             }
         }
 
@@ -713,12 +765,13 @@ impl DependencyGraph {
             let answers = oracle.facts_many(
                 &level
                     .iter()
-                    .map(|o| (o.clone(), Options::AsShipped))
+                    .map(|(o, f)| (o.clone(), f.clone(), Options::AsShipped))
                     .collect::<Vec<_>>(),
             );
 
-            let mut next: Vec<String> = Vec::new();
-            for (origin, answer) in answers {
+            let mut next: Vec<(String, Option<String>)> = Vec::new();
+            for (origin, flavour, answer) in answers {
+                let named = describe(&origin, flavour.as_deref());
                 let facts = match answer {
                     Ok(facts) => facts,
                     Err(e) => {
@@ -726,9 +779,13 @@ impl DependencyGraph {
                         // depended on. It is recorded as unevaluated so the list
                         // can say so, rather than quietly showing a port with no
                         // options — but the reason is kept, because "no options"
-                        // and "could not ask" are different problems.
-                        failures.push((origin.clone(), e.to_string()));
-                        collected.insert(origin, Collected::unevaluated());
+                        // and "could not ask" are different problems. An
+                        // evaluation that succeeded under another flavour is
+                        // not overwritten by one that failed under this one.
+                        failures.push((named, e.to_string()));
+                        collected
+                            .entry(origin)
+                            .or_insert_with(Collected::unevaluated);
                         continue;
                     }
                 };
@@ -740,8 +797,10 @@ impl DependencyGraph {
                 let entry = match self.collect_port(oracle, &facts, sys_opts) {
                     Ok(entry) => entry,
                     Err(e) => {
-                        failures.push((origin.clone(), e.to_string()));
-                        collected.insert(origin, Collected::unevaluated());
+                        failures.push((named, e.to_string()));
+                        collected
+                            .entry(origin)
+                            .or_insert_with(Collected::unevaluated);
                         continue;
                     }
                 };
@@ -751,9 +810,18 @@ impl DependencyGraph {
                     }
                 }
                 if !facts.pkgname.trim().is_empty() {
-                    self.pkg_names.insert(origin.clone(), facts.pkgname.clone());
+                    // The first flavour's name, when there are several: one
+                    // row, one name, and the roots are listed in order.
+                    self.pkg_names
+                        .entry(origin.clone())
+                        .or_insert_with(|| facts.pkgname.clone());
                 }
-                collected.insert(origin, entry);
+                match collected.get_mut(&origin) {
+                    Some(existing) => existing.merge(entry),
+                    None => {
+                        collected.insert(origin, entry);
+                    }
+                }
             }
             level = next;
         }
@@ -859,6 +927,7 @@ impl DependencyGraph {
             self.ports.push(PortEntry {
                 id: port_id,
                 origin: origin.clone(),
+                flavour: entry.flavour,
                 provenance,
                 resolved: entry.resolved,
                 options: option_ids,
@@ -932,10 +1001,21 @@ impl DependencyGraph {
     /// exist until the option is set, so it cannot have been walked in advance —
     /// it arrives here, when the option is turned on and the port is asked
     /// again.
-    pub fn apply_resolution(&mut self, origin: &str, facts: &PortFacts) -> Vec<String> {
+    pub fn apply_resolution(
+        &mut self,
+        origin: &str,
+        facts: &PortFacts,
+    ) -> Vec<(String, Option<String>)> {
         let Some(port_id) = self.port_index(origin) else {
             return Vec::new();
         };
+        // The flavour each dependency was named under, so what is chased is
+        // asked as the build that wants it (see `Collected::edge_flavours`).
+        let edge_flavours: HashMap<String, Option<String>> = facts
+            .deps
+            .iter()
+            .map(|d| (d.origin.clone(), d.flavour.clone()))
+            .collect();
 
         let mut requires: Vec<String> = facts
             .deps
@@ -982,9 +1062,13 @@ impl DependencyGraph {
             wanted.extend(deps.iter().cloned());
         }
 
-        let mut unknown: Vec<String> = wanted
+        let mut unknown: Vec<(String, Option<String>)> = wanted
             .into_iter()
             .filter(|o| !self.by_origin.contains_key(o))
+            .map(|o| {
+                let flavour = edge_flavours.get(&o).cloned().flatten();
+                (o, flavour)
+            })
             .collect();
         unknown.sort();
         unknown.dedup();
@@ -1005,23 +1089,30 @@ impl DependencyGraph {
         origins: &[String],
     ) -> ResettleOutcome {
         let mut outcome = ResettleOutcome::default();
+        // Re-asked under the flavour each port was reached with: the closure
+        // that changes with an option is the closure of that build.
         let mut asking: Vec<Question> = origins
             .iter()
             .filter_map(|o| {
-                self.port_index(o)
-                    .map(|id| (o.clone(), Options::Exactly(self.option_set(id))))
+                self.port_index(o).map(|id| {
+                    (
+                        o.clone(),
+                        self.ports[id].flavour.clone(),
+                        Options::Exactly(self.option_set(id)),
+                    )
+                })
             })
             .collect();
-        let mut asked: HashSet<String> = HashSet::new();
+        let mut asked: HashSet<(String, Option<String>)> = HashSet::new();
 
         while !asking.is_empty() {
-            for (origin, _) in &asking {
-                asked.insert(origin.clone());
+            for (origin, flavour, _) in &asking {
+                asked.insert((origin.clone(), flavour.clone()));
             }
             let answers = oracle.facts_many(&asking);
             let mut next: Vec<Question> = Vec::new();
 
-            for (origin, answer) in answers {
+            for (origin, flavour, answer) in answers {
                 let facts = match answer {
                     Ok(facts) => facts,
                     Err(e) => {
@@ -1033,7 +1124,9 @@ impl DependencyGraph {
                         if let Some(id) = self.port_index(&origin) {
                             self.ports[id].resolved = false;
                         }
-                        outcome.failed.push((origin, e.to_string()));
+                        outcome
+                            .failed
+                            .push((describe(&origin, flavour.as_deref()), e.to_string()));
                         continue;
                     }
                 };
@@ -1062,15 +1155,15 @@ impl DependencyGraph {
                         .map(|o| o.name.clone())
                         .collect();
                     if in_force != as_shipped {
-                        next.push((origin.clone(), Options::Exactly(in_force)));
+                        next.push((origin.clone(), flavour.clone(), Options::Exactly(in_force)));
                     }
                 }
-                for unknown in self.apply_resolution(&origin, &facts) {
-                    if asked.insert(unknown.clone()) {
+                for (unknown, unknown_flavour) in self.apply_resolution(&origin, &facts) {
+                    if asked.insert((unknown.clone(), unknown_flavour.clone())) {
                         // Asked as the port ships: nothing is known about its
                         // options yet, and what they default to is part of the
                         // answer.
-                        next.push((unknown, Options::AsShipped));
+                        next.push((unknown, unknown_flavour, Options::AsShipped));
                     }
                 }
             }
@@ -1138,6 +1231,7 @@ impl DependencyGraph {
         self.ports.push(PortEntry {
             id: port_id,
             origin: facts.origin.clone(),
+            flavour: facts.flavour.clone(),
             provenance: Provenance::Dependency,
             resolved: true,
             options: option_ids,
@@ -1216,9 +1310,17 @@ impl DependencyGraph {
         let effective = if in_force == as_shipped {
             None
         } else {
-            Some(oracle.facts(&shipped.origin, &Options::Exactly(in_force))?)
+            Some(oracle.facts(
+                &shipped.origin,
+                shipped.flavour.as_deref(),
+                &Options::Exactly(in_force),
+            )?)
         };
         let deps = &effective.as_ref().unwrap_or(shipped).deps;
+        let edge_flavours: HashMap<String, Option<String>> = deps
+            .iter()
+            .map(|d| (d.origin.clone(), d.flavour.clone()))
+            .collect();
 
         let mut requires: Vec<String> = deps
             .iter()
@@ -1241,12 +1343,14 @@ impl DependencyGraph {
 
         Ok(Collected {
             resolved: true,
+            flavour: shipped.flavour.clone(),
             // Metadata from the as-shipped evaluation: under an override,
             // `PORT_OPTIONS` is whatever was forced, so `default_on` would
             // report the choice back to us as though it were the default.
             options: shipped.options.clone(),
             option_deps,
             requires,
+            edge_flavours,
             states,
         })
     }
@@ -1450,6 +1554,11 @@ impl DependencyGraph {
     }
 
     /// Index into `ports` for an origin, for resolving a jump.
+    /// The flavour a port was reached under, for asking about it again.
+    pub fn port_flavour(&self, port_id: usize) -> Option<String> {
+        self.ports[port_id].flavour.clone()
+    }
+
     pub fn port_index(&self, origin: &str) -> Option<usize> {
         self.by_origin.get(origin).copied()
     }
