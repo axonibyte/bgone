@@ -639,4 +639,5 @@ The engine's acceptance test was rediscovery: with five recent fixes individuall
 
 ## License
 
-Distributed under the [BSD 2-Clause License](LICENSE).
+Distributed under the [BSD-2-Clause-Patent license](LICENSE), which also
+names the terms covering specifications, documentation and assets.

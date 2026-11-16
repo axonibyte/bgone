@@ -5,7 +5,7 @@ edition = "2021"
 # Set by what the lockfile already requires (clap 4.6, hashbrown 0.17), so a
 # too-old toolchain fails with a clear message instead of a resolver error.
 rust-version = "1.85"
-license = "BSD-2-Clause"
+license = "BSD-2-Clause-Patent"
 description = "Fast reactive TUI tree configuration tool for FreeBSD ports"
 
 [dependencies]
